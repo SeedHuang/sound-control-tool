@@ -1,0 +1,29 @@
+{
+  "name": "@sct/server",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "dev": "cross-env NODE_OPTIONS=\"--experimental-sqlite --disable-warning=ExperimentalWarning\" tsx src/dev.ts",
+    "test": "cross-env NODE_OPTIONS=\"--experimental-sqlite --disable-warning=ExperimentalWarning\" vitest run",
+    "probe:sqlite:node": "node --experimental-sqlite --disable-warning=ExperimentalWarning --input-type=module -e \"const {DatabaseSync}=await import('node:sqlite');const db=new DatabaseSync(':memory:');db.exec('create table t(v)');db.prepare('insert into t values(?)').run('hi');console.log('[probe:sqlite:node] Node 侧 PASS',JSON.stringify(db.prepare('select v from t').get()))\""
+  },
+  "dependencies": {
+    "fastify": "^5.12.4"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.2",
+    "cross-env": "^7.0.3",
+    "tsx": "^4.23.13",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.7"
+  }
+}

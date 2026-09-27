@@ -1,0 +1,16 @@
+packages:
+  - server
+  - desktop
+  - web
+
+nodeLinker: isolated
+
+allowBuilds:
+  core-js: false
+  core-js-pure: false
+  electron: true
+  es5-ext: false
+  esbuild: true
+  '@swc/core': true
+
+minimumReleaseAge: 0

@@ -1,0 +1,11 @@
+node_modules/
+dist/
+*.db
+*.db-journal
+.env
+.sct/
+.superpowers/
+.DS_Store
+web/src/.umi/
+web/src/.umi-production/
+web/src/.umi-test/

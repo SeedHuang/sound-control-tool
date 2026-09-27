@@ -1,0 +1,23 @@
+{
+  "name": "@sct/desktop",
+  "private": true,
+  "version": "0.0.0",
+  "main": "dist/main.js",
+  "dependencies": {
+    "@sct/server": "workspace:*"
+  },
+  "scripts": {
+    "dev": "tsc -p tsconfig.json && electron .",
+    "start:file": "pnpm run build && electron . --load=file",
+    "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "probe:sqlite": "pnpm --filter @sct/server build && pnpm run build && electron dist/probes/sqlite.js"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.2",
+    "electron": "44.4.5",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.7"
+  }
+}

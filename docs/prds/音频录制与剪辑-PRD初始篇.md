@@ -107,7 +107,7 @@
 |---|---|---|
 | ADR-1 | Electron 而非 Chrome 插件 | 剪辑需要 ffmpeg 子进程 + 本地文件管理；插件方案需 ffmpeg.wasm 或 Native Messaging，成本更高。详见启动讨论结论：剪辑环节决定主程序形态 |
 | ADR-2 | 三包 workspace（方案一） | 与参照项目 web/server 结构完全对齐；server 可独立 vitest 测试；web 可脱离 Electron 用浏览器独立开发 |
-| ADR-3 | server 导出 `createServer()` 工厂 | 开发时 tsx 独立跑（与 bfm 一致）；生产时 Electron 主进程直接 import 启动，免去子进程生命周期管理。**原生模块注意：better-sqlite3 按 Node ABI 编译，在 Electron 主进程中加载必须经 `@electron/rebuild` 适配（见风险 R7），M0 即落地** |
+| ADR-3 | server 导出 `createServer()` 工厂 | 开发时 tsx 独立跑（与 bfm 一致）；生产时 Electron 主进程直接 import 启动，免去子进程生命周期管理。**2026-09-26 修订：SQLite 驱动改为 Node 内置 node:sqlite（零原生模块），原生模块 ABI 风险消除；驱动决策见 spec m0-desktop-shell D9** |
 | ADR-4 | 录制走 getDisplayMedia + MediaRecorder | Windows 原生支持系统音频 loopback，无需虚拟声卡/原生模块。**实现要点：主进程 `setDisplayMediaRequestHandler` + 权限处理（见 FR-2.1），渲染进程无法独立完成** |
 | ADR-5 | 剪辑 = EditSpec JSON → ffmpeg 编译 | 前端不碰音频数据；每次剪辑产出新文件（非破坏式）；逻辑全部落在可测试的 server 层 |
 | ADR-6 | 波形库选 wavesurfer.js v7 | 热度最高、维护活跃、TS 原生、官方插件（Regions/Timeline/Record）正好覆盖需求；与 antd 5 组合 |
@@ -348,7 +348,7 @@ UI 组件库：**antd 5**（沿用 bfm 体系）+ **wavesurfer.js v7**（波形/
 | R4 | atempo 单滤镜限 0.5–2.0 | 编译器级联多个 atempo，单元测试覆盖 |
 | R5 | Electron 打包（electron-builder）未定细节 | 推迟到 M3 后，一期先保证开发态顺畅 |
 | R6 | Windows 版本要求（loopback 依赖 Win10+） | 明示系统要求 |
-| R7 | **better-sqlite3 与 Electron ABI 不匹配**（Node ABI 编译的原生模块在 Electron 主进程无法直接加载） | M0 即引入 `@electron/rebuild` 并纳入 pnpm allowBuilds；"内嵌形态下 SQLite 读写成功"列为 M0 验收项 |
+| R7 | ~~better-sqlite3 与 Electron ABI 不匹配~~ **已化解（2026-09-26 spike）**：双副本方案证伪后，SQLite 驱动改为内置 node:sqlite（零原生模块），rebuild 需求消失 | 详见 spec m0-desktop-shell §0.7；"内嵌形态下 SQLite 读写成功"仍为 M0 验收项 |
 
 ---
 
@@ -361,6 +361,7 @@ UI 组件库：**antd 5**（沿用 bfm 体系）+ **wavesurfer.js v7**（波形/
 5. 波形库：**wavesurfer.js v7** + antd 5
 6. 2026-09-26 多透镜评审：P0-1 + P1-1~P1-10 修复方案全部采纳；重叠选区语义与长文件阈值按本篇 §4.2/§7-R3 执行
 7. 2026-09-26 工具链决策：**继续使用 superpowers 流程**（spec → writing-plans → 执行），不引入 OpenSpec。PRD 拆分为 6 个 spec（§6.1 路线图），采用 **JIT 细化**——PRD 阶段只定边界与大纲，规格细节在各 spec 开工时写，避免规格返工
+8. 2026-09-26 Task 1 spike：better-sqlite3 双副本方案**证伪**（pnpm 12 把 npm 别名与原版去重为同一物理实例 + Electron 44 需 ABI 149 而预编译仅到 v146 + 本机无 MSVC），按 spec §0.7 预授权切换**方案 C：SQLite 驱动 = node:sqlite 内置模块**；Node 22 侧经 `NODE_OPTIONS=--experimental-sqlite` 注入（用户拍板 C1，暂不升级 Node；Electron 44.4.5/Node 24.21 侧无 flag）
 
 ---
 
