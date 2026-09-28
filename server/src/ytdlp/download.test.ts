@@ -50,4 +50,36 @@ describe('DownloadManager', () => {
     await m.cancel(2);
     expect(tasks.at(-1)).toMatchObject({ cmd: 'taskkill', args: ['/pid', '1234', '/T', '/F'] });
   });
+  it('spawn 失败:error + close 只发一次终态 error', () => {
+    const events: DownloadEvent[] = [];
+    const child = fakeChild();
+    const m = createDownloadManager({
+      spawn: (() => child) as never,
+      execFile: (() => {}) as never,
+      findLatest: () => null,
+    });
+    m.start({ jobId: 3, binPath: 'yt-dlp', args: [], outDir: 'D:/tmp', onEvent: (_, ev) => events.push(ev) });
+    const onErr = (child.on as ReturnType<typeof vi.fn>).mock.calls.find(([e]) => e === 'error')![1];
+    const onClose = (child.on as ReturnType<typeof vi.fn>).mock.calls.find(([e]) => e === 'close')![1];
+    onErr(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
+    onClose(null, null); // spawn 失败后 Node 必发 close(code 为 null)
+    const terminals = events.filter((e) => e.type === 'status');
+    expect(terminals).toHaveLength(1);
+    expect(terminals[0]).toMatchObject({ type: 'status', state: 'error' });
+  });
+  it('cancel 后 close 发 status cancelled 而非 error', async () => {
+    const events: DownloadEvent[] = [];
+    const child = fakeChild();
+    const m = createDownloadManager({
+      spawn: (() => child) as never,
+      execFile: ((_cmd: string, _args: string[], _o: unknown, cb: () => void) => { cb(); }) as never,
+      findLatest: () => null,
+    });
+    m.start({ jobId: 4, binPath: 'yt-dlp', args: [], outDir: 'D:/tmp', onEvent: (_, ev) => events.push(ev) });
+    const onClose = (child.on as ReturnType<typeof vi.fn>).mock.calls.find(([e]) => e === 'close')![1];
+    await m.cancel(4);
+    onClose(1, null); // taskkill /F 后 close 以非零 code 触发
+    expect(events.at(-1)).toMatchObject({ type: 'status', state: 'cancelled' });
+    expect(events.filter((e) => e.type === 'status')).toHaveLength(1);
+  });
 });
