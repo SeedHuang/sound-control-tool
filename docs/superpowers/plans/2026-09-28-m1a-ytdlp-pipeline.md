@@ -289,6 +289,8 @@ git commit -m "feat(server): yt-dlp 纯函数层(slug/args/progress/errors)"
 
 ### Task 2: repo 层——audio-items 新建 + jobs 增补
 
+> **实施注记（2026-09-28 Task 2 落地）**：brief 三处缺陷已按最小偏离修正，后续 Task 复抄时注意——①audio-items.test 的 beforeEach **必须补 `initSchema(db)`**（brief 漏建表会 `no such table`）；②jobs `update` 的 `vals` 类型用 `(string | number | null)[]`（`unknown[]` 在 strict 下展开进 `run(...)` 无法编译）；③`findActiveByUrl` 断言用 `?.id`（接口返回 `{id:number}|null`，非裸数字）。
+
 **Files:**
 - Create: `server/src/db/repo/audio-items.ts`
 - Create: `server/src/db/repo/audio-items.test.ts`
