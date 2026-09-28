@@ -82,4 +82,25 @@ describe('DownloadManager', () => {
     expect(events.at(-1)).toMatchObject({ type: 'status', state: 'cancelled' });
     expect(events.filter((e) => e.type === 'status')).toHaveLength(1);
   });
+  it('真实时序:cancel 未完成(taskkill 回调未决)时 close 先触发,仍只发一个 cancelled 终态', async () => {
+    const events: DownloadEvent[] = [];
+    const child = fakeChild();
+    let resolveTaskkill: (() => void) | undefined;
+    const m = createDownloadManager({
+      spawn: (() => child) as never,
+      execFile: ((_cmd: string, _args: string[], _o: unknown, cb: () => void) => { resolveTaskkill = cb; }) as never,
+      findLatest: () => null,
+    });
+    m.start({ jobId: 5, binPath: 'yt-dlp', args: [], outDir: 'D:/tmp', onEvent: (_, ev) => events.push(ev) });
+    const onClose = (child.on as ReturnType<typeof vi.fn>).mock.calls.find(([e]) => e === 'close')![1];
+    // 不 await cancel:把 taskkill 回调挂起到 deferred,模拟"被杀的 yt-dlp 子进程 close 先于 taskkill 回调"的真实事件顺序
+    const cancelPromise = m.cancel(5);
+    expect(resolveTaskkill).toBeDefined();
+    onClose(1, null); // taskkill /F 杀掉后子进程以非零 code close
+    resolveTaskkill!(); // 之后才放行 taskkill 回调
+    await cancelPromise;
+    const terminals = events.filter((e) => e.type === 'status');
+    expect(terminals).toHaveLength(1);
+    expect(terminals[0]).toMatchObject({ type: 'status', state: 'cancelled' });
+  });
 });

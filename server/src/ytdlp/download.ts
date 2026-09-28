@@ -91,6 +91,13 @@ export function createDownloadManager(deps?: { spawn?: typeof spawn; execFile?: 
             ? { type: 'status', state: 'done', producedPath: produced }
             : { type: 'status', state: 'error', message: '下载完成但未找到产物文件' });
         } else {
+          // 双保险:taskkill 回调未决时 close 也可能先进 error 分支(通常已被上方 cancelled 分支拦截)
+          if (cancelledJobs.has(jobId)) {
+            cancelledJobs.delete(jobId);
+            activeOutDir.delete(jobId);
+            onEvent(jobId, { type: 'status', state: 'cancelled', message: '用户取消' });
+            return;
+          }
           cleanJobOutputs(jobId, outDir);
           onEvent(jobId, { type: 'status', state: 'error', message: mapYtdlpError({ stderr: stderrBuf, binPath }).message });
         }
@@ -99,6 +106,13 @@ export function createDownloadManager(deps?: { spawn?: typeof spawn; execFile?: 
     cancel: async (jobId) => {
       const child = active.get(jobId);
       const outDir = activeOutDir.get(jobId);
+      // 标记前移(同步):taskkill 是异步的,被杀子进程的 close 几乎必然先于 taskkill 回调触发,
+      // 必须先打标记,否则 close 落入 code!==0 分支会误发 error
+      if (outDir !== undefined) {
+        // 仅当 activeOutDir 还在(close 未发生、error 未发过)才标记 cancelled,
+        // 避免 error 已发后再 cancel 产生第二个终态事件
+        cancelledJobs.add(jobId);
+      }
       // taskkill 杀进程树:yt-dlp 会拉起 ffmpeg,单杀父进程会残留
       if (child?.pid) {
         await new Promise<void>((resolve) => {
@@ -106,10 +120,7 @@ export function createDownloadManager(deps?: { spawn?: typeof spawn; execFile?: 
         });
       }
       active.delete(jobId);
-      if (outDir) {
-        // 仅当 activeOutDir 还在(close 未发生、error 未发过)才标记 cancelled,
-        // 避免 error 已发后再 cancel 产生第二个终态事件
-        cancelledJobs.add(jobId);
+      if (outDir !== undefined) {
         cleanJobOutputs(jobId, outDir); // P2-2:cancel 后清理该 job 的半成品文件
       }
     },
