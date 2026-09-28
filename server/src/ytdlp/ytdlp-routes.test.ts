@@ -109,3 +109,65 @@ describe('POST /api/ytdlp/download', () => {
     expect(startOpts?.outDir).toBe('C:/tmp');
   });
 });
+
+// Task 6:SSE 实时流(真实 listen + fetch 读流)留作 Task 9 端到端手工验证;单测覆盖 401/404 静态分支 + cancel/retry
+describe('GET /api/jobs/:id/events', () => {
+  it('events token 错误 → 401', async () => {
+    makeApp('yt-dlp', 'tok2');
+    const res = await app.inject({ method: 'GET', url: '/api/jobs/1/events?token=bad' });
+    expect(res.statusCode).toBe(401);
+  });
+  it('events job 不存在 → 404', async () => {
+    makeApp('yt-dlp', 'tok2');
+    const res = await app.inject({ method: 'GET', url: '/api/jobs/999/events?token=tok2' });
+    expect(res.statusCode).toBe(404);
+  });
+});
+
+describe('POST /api/jobs/:id/cancel', () => {
+  it('cancel 不存在 job → 404', async () => {
+    makeApp('yt-dlp', 'tok2');
+    const res = await app.inject({ method: 'POST', url: '/api/jobs/999/cancel' });
+    expect(res.statusCode).toBe(404);
+  });
+});
+
+describe('POST /api/jobs/:id/retry', () => {
+  it('retry 非 error job → 409 NOT_RETRYABLE(P1-4)', async () => {
+    const jobsRepo = createJobsRepo(db);
+    const jid = jobsRepo.create('ytdlp_download', { url: 'https://a/1', options: { format: 'mp3' } });
+    jobsRepo.update(jid, { status: 'running' });
+    makeApp('yt-dlp', 'tok2');
+    const res = await app.inject({ method: 'POST', url: `/api/jobs/${jid}/retry` });
+    expect(res.statusCode).toBe(409);
+    expect(res.json().error.code).toBe('NOT_RETRYABLE');
+  });
+  it('retry error job 但同 URL 有 running → 409 BUSY(P1-4)', async () => {
+    const jobsRepo = createJobsRepo(db);
+    const errJid = jobsRepo.create('ytdlp_download', { url: 'https://a/1', options: { format: 'mp3' } });
+    jobsRepo.fail(errJid, '网络失败');
+    const runJid = jobsRepo.create('ytdlp_download', { url: 'https://a/1', options: { format: 'mp3' } });
+    jobsRepo.update(runJid, { status: 'running' });
+    makeApp('yt-dlp', 'tok2');
+    const res = await app.inject({ method: 'POST', url: `/api/jobs/${errJid}/retry` });
+    expect(res.statusCode).toBe(409);
+    expect(res.json().error.code).toBe('BUSY');
+  });
+  it('retry error job 且无并发 → 201 新 jobId', async () => {
+    const jobsRepo = createJobsRepo(db);
+    const errJid = jobsRepo.create('ytdlp_download', { url: 'https://a/1', options: { format: 'mp3' } });
+    jobsRepo.fail(errJid, '网络失败');
+    // 注:偏离 brief 的 createDownloadManager()——同 Task 5,真 dm 会真实拉起本机 yt-dlp
+    // 访问 https://a/1 并写 C:/tmp,测试不封闭;路由契约(201/新 jobId)不依赖真实子进程,故注入假件
+    const dm = {
+      start: vi.fn(),
+      cancel: vi.fn(async () => {}),
+      dispose: vi.fn(async () => {}),
+    };
+    makeApp('yt-dlp', 'tok2', dm as unknown as ReturnType<typeof createDownloadManager>);
+    const res = await app.inject({ method: 'POST', url: `/api/jobs/${errJid}/retry` });
+    expect(res.statusCode).toBe(201);
+    expect(typeof res.json().jobId).toBe('number');
+    expect(res.json().jobId).not.toBe(errJid);
+  });
+});
