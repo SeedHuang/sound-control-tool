@@ -304,7 +304,7 @@ git commit -m "feat(server): yt-dlp 纯函数层(slug/args/progress/errors)"
     - `export function createAudioItemsRepo(db: DB): AudioItemsRepo`
   - `jobs.ts` 增补：`update(id, patch: { status?: JobStatus; progress?: number; message?: string | null }): void`、`finish(id, progress = 100): void`、`fail(id, message: string): void`；`export type JobStatus = 'pending'|'running'|'done'|'error'|'cancelled'`
 
-- [ ] **Step 1: 写 audio-items repo 测试（TDD）**
+- [x] **Step 1: 写 audio-items repo 测试（TDD）**
 
 ```ts
 // server/src/db/repo/audio-items.test.ts
@@ -349,12 +349,12 @@ describe('audio-items repo', () => {
 });
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cd server && pnpm test -- audio-items.test.ts`
 Expected: FAIL（模块不存在）
 
-- [ ] **Step 3: 实现 audio-items repo**
+- [x] **Step 3: 实现 audio-items repo**
 
 ```ts
 // server/src/db/repo/audio-items.ts
@@ -413,12 +413,12 @@ function normalize(r: Record<string, unknown>): AudioItemRow {
 }
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `cd server && pnpm test -- audio-items.test.ts`
 Expected: PASS
 
-- [ ] **Step 5: jobs.ts 增补 update/finish/fail + 测试**
+- [x] **Step 5: jobs.ts 增补 update/finish/fail + 测试**
 
 ```ts
 // jobs.ts 增补(在 JobsRepo 接口与实现上)
@@ -498,12 +498,12 @@ it('findActiveByUrl 命中 running/pending 的同 URL job,finished 不命中', (
 ```
 （`JobRow` 需加 `finished_at: string | null` 字段，get 的 SELECT 增补该列）
 
-- [ ] **Step 6: 全绿 + typecheck**
+- [x] **Step 6: 全绿 + typecheck**
 
 Run: `cd server && pnpm test -- audio-items.test.ts jobs.test.ts && pnpm typecheck`
 Expected: 全部 PASS；typecheck exit 0
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add server/src/db/repo/audio-items.ts server/src/db/repo/audio-items.test.ts server/src/db/repo/jobs.ts server/src/db/repo/jobs.test.ts
