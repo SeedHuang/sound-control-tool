@@ -723,6 +723,8 @@ git commit -m "feat(server): DownloadManager(spawn 进度解析 + taskkill 取�
 
 ### Task 4: parse 集成 + `POST /api/ytdlp/parse`
 
+> **实施注记（2026-09-28 Task 4 落地）**：代码块逐字转录、零偏离（parse 3 测试 + 路由 2 测试全绿，58 用例全量回归绿，typecheck 0 错）。两处观察供后续 Task 留意——①`ytdlp-routes.test.ts` 顶部 import（mkdtempSync/writeFileSync/join/tmpdir/createJobsRepo/createAudioItemsRepo）在 Task 4 仅 2 个用例下未使用，属 brief 为 Task 5/7 预置（tsconfig 未开 noUnusedLocals，不报错），勿删；②`audioDir = path.join(path.dirname(opts.dbPath), 'audio')` 对测试的 `:memory:` dbPath 会在 CWD 产生空 `audio/` 目录（git 不跟踪空目录、无碍提交），生产路径（dev/electron 的 dbPath 为真实文件）行为正确。
+
 **Files:**
 - Create: `server/src/ytdlp/parse.ts`
 - Create: `server/src/ytdlp/ytdlp-routes.ts`
@@ -735,7 +737,7 @@ git commit -m "feat(server): DownloadManager(spawn 进度解析 + taskkill 取�
   - `parse.ts`：`export interface ParseResult { kind: 'single'|'playlist'; title: string; durationSec?: number; thumbnail?: string; entries?: { index: number; title: string }[] }`；`export function parseMetadata(binPath: string, url: string, timeoutMs?: number): Promise<ParseResult>`（失败抛 `YtdlpRunError extends Error`，带 `info: YtdlpErrorInfo`）
   - `ytdlp-routes.ts`：`export function registerYtdlpRoutes(app: FastifyInstance, deps: { db: DB; binProvider: () => Promise<{ path: string | null }>; downloadManager: DownloadManager; audioDir: string; tempDir: string; token: string }): void`
 
-- [ ] **Step 1: 写 parse.ts + 测试（mock execFile）**
+- [x] **Step 1: 写 parse.ts + 测试（mock execFile）**
 
 ```ts
 // server/src/ytdlp/parse.ts
@@ -809,12 +811,12 @@ describe('parseMetadata', () => {
 });
 ```
 
-- [ ] **Step 2: 跑测试确认失败→通过**
+- [x] **Step 2: 跑测试确认失败→通过**
 
 Run: `cd server && pnpm test -- parse.test.ts`
 Expected: 先 FAIL（模块不存在），实现后 PASS
 
-- [ ] **Step 3: 写 ytdlp-routes + HTTP 测试（parse 部分）**
+- [x] **Step 3: 写 ytdlp-routes + HTTP 测试（parse 部分）**
 
 ```ts
 // server/src/ytdlp/ytdlp-routes.ts(本步先落 parse 路由 + 共享辅助,download/SSE 路由 Task 5/6 续)
@@ -911,12 +913,12 @@ describe('POST /api/ytdlp/parse', () => {
 });
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `cd server && pnpm test -- ytdlp-routes.test.ts`
 Expected: PASS
 
-- [ ] **Step 5: index.ts 注册 ytdlp 路由 + audioDir + close dispose**
+- [x] **Step 5: index.ts 注册 ytdlp 路由 + audioDir + close dispose**
 
 ```ts
 // index.ts 内 createServer:
@@ -949,12 +951,12 @@ close: async () => {
 },
 ```
 
-- [ ] **Step 6: typecheck + 全量单测**
+- [x] **Step 6: typecheck + 全量单测**
 
 Run: `cd server && pnpm test && pnpm typecheck`
 Expected: 全绿（含既有 M0 用例）；typecheck exit 0
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add server/src/ytdlp/parse.ts server/src/ytdlp/parse.test.ts server/src/ytdlp/ytdlp-routes.ts server/src/ytdlp/ytdlp-routes.test.ts server/src/index.ts
