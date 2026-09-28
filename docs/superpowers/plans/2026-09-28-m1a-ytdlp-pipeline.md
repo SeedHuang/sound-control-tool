@@ -1485,6 +1485,8 @@ git commit -m "feat(server): SSE 事件桥 + cancel/retry"
 
 ### Task 7: audio 列表与文件流路由
 
+> **实施注记（2026-09-28 Task 7 落地）**：实现主体逐字转录 brief；2 处偏离——①**`list()` 补 `ORDER BY created_at DESC, id DESC`（`server/src/db/repo/audio-items.ts`）**：spec §0.4 明确 `list(): AudioItemRow[]`（按 created_at DESC），但 Task 2 落地时漏了 ORDER BY（brief 的 `app.get('/api/audio', async () => audioRepo.list())` 假定 repo 已排好序）；Task 7 首次消费该接口，为满足 spec「GET /api/audio 按 created_at DESC」补齐，`id DESC` 作同秒并列的稳定 tiebreaker。文件不在本 Task 的 Files 清单内，但它是 spec 契约的一部分，已并入本 Task 提交；②**`import { createReadStream } from 'node:fs'` 合入顶部 import**（brief 代码块把 import 写在路由下方，ESM 非法位置）——语义不变。其余逐字转录：`GET /api/audio` 返回数组（非 `{ok,items}`）、`GET /api/audio/:id/file` 走 D3 query token（`<audio>` 标签无法设 header）+ P2-5 非正整数 id → 404 + MIME 映射 + `content-disposition: inline` + `accept-ranges: bytes` + 流式响应。
+
 **Files:**
 - Modify: `server/src/ytdlp/ytdlp-routes.ts`（`GET /api/audio`、`GET /api/audio/:id/file`）
 - Modify: `server/src/ytdlp/ytdlp-routes.test.ts`（补用例）
@@ -1493,7 +1495,7 @@ git commit -m "feat(server): SSE 事件桥 + cancel/retry"
 - Consumes: `createAudioItemsRepo`（Task 2）
 - Produces: `GET /api/audio`（列表）、`GET /api/audio/:id/file`（流 + Content-Type 映射 + D3 query token）
 
-- [ ] **Step 1: 实现路由**
+- [x] **Step 1: 实现路由**
 
 ```ts
 const MIME: Record<string, string> = { mp3: 'audio/mpeg', m4a: 'audio/mp4', wav: 'audio/wav' };
@@ -1519,7 +1521,7 @@ app.get('/api/audio/:id/file', async (req, reply) => {
 import { createReadStream } from 'node:fs';
 ```
 
-- [ ] **Step 2: 补单测**
+- [x] **Step 2: 补单测**
 
 ```ts
 it('audio 文件 token 错 → 401;不存在 → 404;非正整数 id → 404;存在 → 200 + Content-Type', async () => {
@@ -1547,12 +1549,12 @@ it('audio 列表返回全部', async () => {
 });
 ```
 
-- [ ] **Step 3: typecheck + 全量单测**
+- [x] **Step 3: typecheck + 全量单测**
 
 Run: `cd server && pnpm test && pnpm typecheck`
 Expected: 全绿；typecheck exit 0
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add server/src/ytdlp/ytdlp-routes.ts server/src/ytdlp/ytdlp-routes.test.ts
