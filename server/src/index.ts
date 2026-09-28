@@ -1,12 +1,17 @@
 import Fastify, { type FastifyInstance } from 'fastify';
 import { randomBytes } from 'node:crypto';
 import { mkdirSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
 import { openDatabase } from './db/index.js';
 import { createSettingsRepo } from './db/repo/settings.js';
 import { initSchema } from './db/schema.js';
 import { isAllowedLocalOrigin, registerCors } from './http/cors.js';
 import { registerSettingsRoutes } from './http/settings-routes.js';
 import { findFreePort } from './net/find-free-port.js';
+import { probeBin } from './bins.js';
+import { SETTINGS_KEYS } from './settings-keys.js';
+import { createDownloadManager } from './ytdlp/download.js';
+import { registerYtdlpRoutes } from './ytdlp/ytdlp-routes.js';
 
 export { bootstrap } from './bootstrap.js';
 
@@ -50,6 +55,21 @@ export async function createServer(opts: CreateServerOpts): Promise<{
     // D12:随机 API token
     const token = randomBytes(16).toString('hex');
 
+    // D4:audioDir 与 db 同目录
+    const audioDir = path.join(path.dirname(opts.dbPath), 'audio');
+    mkdirSync(audioDir, { recursive: true });
+
+    const downloadManager = createDownloadManager();
+    registerYtdlpRoutes(app, {
+      db,
+      binProvider: async () => {
+        const explicit = settingsRepo.get(SETTINGS_KEYS.binYtdlp);
+        const p = await probeBin('yt-dlp', explicit ?? undefined);
+        return { path: p.path };
+      },
+      downloadManager, audioDir, tempDir: opts.tempDir, token,
+    });
+
     // onRequest 守卫(路由注册之后、listen 之前);OPTIONS 必须跳过——预检交 cors 通配路由,否则被 401
     app.addHook('onRequest', async (req, reply) => {
       if (req.method === 'OPTIONS') return;
@@ -87,11 +107,12 @@ export async function createServer(opts: CreateServerOpts): Promise<{
     return {
       port,
       token,
-      // Low:close 幂等 + try/finally 保证 db 句柄一定释放
+      // Low:close 幂等 + try/finally 保证 db 句柄一定释放;先 dispose 下载进程(杀残留 yt-dlp/ffmpeg)再关 server/db
       close: async () => {
         if (closed) return;
         closed = true;
         try {
+          await downloadManager.dispose();
           await instance.close();
         } finally {
           db.close();
