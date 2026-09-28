@@ -101,6 +101,33 @@ async function openWindow(mode: 'dev' | 'file', apiPort: number, apiToken: strin
     const indexPath = path.join(app.getAppPath(), '..', 'web', 'dist', 'index.html');
     await mainWindow.loadFile(indexPath, { search });
   } else {
+    // 竞态修复:dev server(webpack)启动慢于 electron,直接 loadURL 会 ERR_CONNECTION_REFUSED 弹"启动失败"。
+    // 先等 8000 有 HTTP 响应(任意状态码,dev 页面编译中也会返回 HTML)再加载。
+    const webReady = await waitForWebReady(8000, 60_000);
+    if (!webReady) {
+      dialog.showErrorBox('Web 页面未就绪', '60 秒内未检测到 web dev server(8000 端口)。\n\n请确认已运行:\n\n  pnpm dev:web\n\n(或直接 pnpm dev 三进程一起起)');
+      app.exit(1);
+      return;
+    }
     await mainWindow.loadURL(`http://localhost:8000/?${search}`);
   }
+}
+
+/** 轮询等待端口上有 HTTP 响应;dev server 一旦 listen 即响应,编译中页面也返回 HTML */
+async function waitForWebReady(port: number, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 800);
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/`, { signal: ctl.signal });
+      if (res.status < 500) return true;
+    } catch {
+      /* 未就绪,继续轮询 */
+    } finally {
+      clearTimeout(timer);
+    }
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  return false;
 }

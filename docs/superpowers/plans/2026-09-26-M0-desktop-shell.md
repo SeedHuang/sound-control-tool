@@ -7,6 +7,8 @@
 > **修订 2026-09-26(Task 1 spike 裁决):** D9 双副本在 pnpm 12 下证伪(别名与原版去重为同一物理实例;Electron 44 需 ABI 149 无预编译且本机无 MSVC)。按 spec 0.7 预授权切换**方案 C:SQLite 驱动 = node:sqlite**(用户拍板 C1:Node 22.12 + NODE_OPTIONS flag)。Global Constraints 已更新;**Task 1/2 中 better-sqlite3/pickDriver/rebuild/probe:abi 相关代码以各任务 brief(task-1b-brief.md 及后续)为准**;Task 2 的 `openDatabase` 为**同步**签名;Task 3-8 不受影响(SQL 用法同形)。probe:abi 全文读作 probe:sqlite。
 >
 > **修订 2026-09-26(OCR 评审后二次修复):** ①**D1 变更**——desktop 的 `module/moduleResolution` 改 `node16`,TS 保留原生 dynamic import,故删除 `shared/dynamic-import.ts`(`new Function`),main.ts/probes 直接 `await import('@sct/server')`(已实测 probe:sqlite PASS)。计划中所有"经 dynamic-import.ts / new Function 包装"的表述作废。②**新增 D12 API token**——受保护路由(settings GET/PUT、bins/probe)要求 `x-sct-token`,Origin 为白名单 localhost 来源时豁免;token 经 portFile/URL query 流转。③server 的 `module/moduleResolution` 改 `NodeNext`。④其余修复(cors 白名单、health 只读化、bins/jobs/bootstrap/close 等 bug)见 `.superpowers/sdd/2026-09-26-M0-desktop-shell/ocr-fix-brief.md` 与 `ocr-fix-report.md`。
+>
+> **修订 2026-09-28(dev 竞态修复,收尾):** `desktop/src/main.ts` 新增 `waitForWebReady(port, timeoutMs)`——dev 形态 `loadURL` 前先轮询等待 web dev server(8000)有 HTTP 响应(≤60s),超时才弹中文指引退出。根因:三进程并发下 electron 启动快于 webpack 冷启动,直接 `loadURL` 撞 `ERR_CONNECTION_REFUSED` 弹"启动失败"(外层 catch 弹窗)。原计划 Task 7 验证第 3 步"浏览器直开 8000"与 main.ts 直接 `loadURL` 的表述,以本修订为准(加载前必须先等 web 就绪)。dev 态 4 项目验已由用户确认;生产态 file:// 3 项仍待目验。
 
 **Goal:** 用最小代价证明"better-sqlite3 双副本 + Electron 内嵌 Fastify server"走得通,并立起 web/server/desktop 三包开发态骨架,达成 PRD M0 验收。
 
@@ -14,7 +16,7 @@
 
 **Tech Stack:** Node 22.12.0 / pnpm 12.6.0 / TypeScript 5.9.3 / Fastify 5 / better-sqlite3 12(双副本)/ Electron(最新稳定,Task 1 锁定)/ UmiJS Max 4.7.17 / React 18 / antd 5 / vitest 3
 
-**Spec:** `docs/superpowers/specs/m0-desktop-shell.md`(决定 D1-D11、机制 §0.3、测试边界 §0.4 与本计划配套阅读)
+**Spec:** `docs/superpowers/specs/m0-desktop-shell.md`(决定 D1-D12、机制 §0.3、测试边界 §0.4 与本计划配套阅读)
 
 ## Global Constraints
 

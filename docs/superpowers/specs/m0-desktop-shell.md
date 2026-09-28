@@ -91,7 +91,7 @@ export function openDatabase(dbPath: string): DB {
 - dev：tsx server 监听成功后写 `{port, pid, token}` 进 portFile（`.sct/dev-port`，gitignore）；electron 轮询读取（≤10s）→ **对读到的端口发 `/api/health` 短超时验证** → 通过才拼 URL（带 `?apiPort=X&apiToken=Y`）
 - **回退链**：portFile 缺失/超时/health 不通（含双跑竞态脏端口）→ 回退 7310 再验 → 仍失败 → dialog 指引并退出（D10）
 - 生产：主进程 `createServer()` 内嵌启动直接拿返回值；浏览器独立开发：api.ts 缺省 7310
-- **web dev 端口固定 8000**：显式传参，被占即失败——electron 拼 URL 依赖此约定
+- **web dev 端口固定 8000**：显式传参，被占即失败——electron 拼 URL 依赖此约定；**loadURL 前先轮询等待 8000 有 HTTP 响应（≤60s，waitForWebReady）**——三进程并发下 electron 启动快于 webpack 冷启动，直接加载会 ERR_CONNECTION_REFUSED 弹"启动失败"（2026-09-28 实测复现后补）
 - **CORS**：server 对 `/api/*` 仅放行 **origin 白名单**——`null`(file://) / `localhost` / `127.0.0.1`（含任意端口）；非白名单**不下发** `access-control-allow-origin`，`vary: Origin` 恒下发（无论是否反射）。理由：server 监听 127.0.0.1 且含 execFile 二进制探测链路，无条件反射任意站点 origin 会允许恶意网页读取/改写本地设置，故收紧为白名单
 - **API token（D12）**：受保护路由（settings GET/PUT、bins/probe）校验请求头 `x-sct-token`；**Origin 属上述白名单 localhost 来源时豁免**（dev 浏览器直开零额外步骤，ADR-2 不受影响）；`/api/health` 不校验（只读 + 回退链需要）。token 流转：createServer 生成 → portFile/返回值 → desktop 注入 URL query → web api.ts 作为请求头发送；浏览器独立开发时从 `.sct/dev-port` 读取后手填 `?apiToken=`。CORS 的 `allow-headers` 需含 `x-sct-token`
 
@@ -134,11 +134,15 @@ export function openDatabase(dbPath: string): DB {
 - `pnpm build` 三包（server/web/desktop）退出码 0；`pnpm start:file` 生产态启动：electron 进程存活，`http://127.0.0.1:7310/api/health` → `200 {ok:true, sqlite:<毫秒时间戳>, port:7310}`。**已证**：electron 主进程内嵌 server 起在 7310 + `node:sqlite` 读写真通（health 200 含 sqlite 时间戳）。**未证**：file:// 窗口是否成功加载、hash 路由是否可达——归待目验（health 为测试者用 `Invoke-WebRequest` 直打，`run()` 中 createServer 先于 openWindow，窗口加载与之无关）
 - 数据目录隔离实证：生产态 userData = `%APPDATA%\@sct\desktop`（未打包态取包名 `@sct/desktop`），`sct.db` 与 `tmp/` 生成其中，与 dev 的 `.sct/dev-data` 分离
 - 端口递增 + D3b 自动化部分：带连接计数的占位进程占住 7310 → 内嵌 server 递增 **7311**（health `200 {ok:true, sqlite:<时间戳>, port:7311}`）；占位进程累计连接数**恒为 0**——自动化已证：7310 全程收到 0 个连接（与"页面未回落 7310"一致，但不等于已证渲染链路生效）
-- **D10 分支可达（粗粒度）**：将 `server/dist` 改名 `server/dist.bak` 后原样运行 `pnpm start:file` → **仍到达 electron**，showErrorBox 弹出并挂起等待点击（进程级观测 **MainWindowTitle=[Error]**，error 类模态窗、标题文本未采集/待补，未裸崩、未继续建窗）。**由此可粗粒度判定 D10 分支可达，但不等于已唯一锁定 D10**：代码里两个 dialog title 分别是 `加载本地服务失败`（D10 分支）与 `启动失败`（外层 catch），均非 `[Error]`，外层 catch 同会弹 error 模态，精确区分需补标题文本或截图（归待目验）；`dist.bak` 恢复为 `dist` 后重跑 health 200、窗口标题复归 `@sct/desktop`——**还原已功能验证**（22 个产物条目逐一复归）
+- **D10 分支可达（2026-09-28 已精确锁定）**：将 `server/dist` 改名 `server/dist.bak` 后原样运行（`pnpm start:file` 或 `electron . --load=file`）→ electron 弹 error 模态窗（进程级观测 `MainWindowTitle=Error`、未裸崩、未建主窗）。**2026-09-28 补证**：按 HWND 用 `PrintWindow` 抓取窗口位图，正文读出 **"加载本地服务失败 / 常见原因:server 构建产物缺失(dist/)或运行时模块加载失败。请运行: pnpm --filter @sct/server build 然后重新启动。Error [ERR_MODULE_NOT_FOUND]..."**——标题为 `加载本地服务失败`（D10 分支），**非**外层 catch 的 `启动失败`，**D10 分支已唯一锁定**（原先"两个 dialog title 均非 [Error]、无法精确区分"的悬念解除：原生 MessageBox 的窗体 caption 恒为 `Error`，业务标题是正文的大字标题）；点掉后进程退出（`app.exit(1)`）。`dist.bak` 恢复为 `dist` 后重跑 health 200、窗口标题复归 `@sct/desktop`——**还原已功能验证**
 - 方法注记（**2026-09-26 OCR 修复后修订**）：desktop 主进程对 `@sct/server` **无静态类型依赖**（main.ts 经 `await import('@sct/server')` 加载——node16 模块设置下编译产物保留原生 `import()`；server 包 exports 仅指向 dist），实测 `server/dist` 缺失时 `pnpm start:file` 的 `tsc -p tsconfig.json` 前置**退出码 0**、不阻断 electron——即 **`pnpm start:file` 本身就是 D10 的有效复现命令**；`pnpm --filter @sct/desktop exec electron . --load=file`（已构建产物直启）为等价手段
-- **待目验移交**（自动化不可达）：①file:// 窗口渲染出"后端 OK · SQLite 读写成功"；②占用场景下 `#/settings` 显示 apiPort=7311（即 D3b 最终判定：hash 保留 search）；③D10 dialog 文案（"加载本地服务失败"+ 构建指引）与点掉后进程退出
+- **目验状态（2026-09-28 全部确认，7/7）**：
+  - dev 态（`pnpm dev`）：窗口渲染首页"后端 OK"、`#/settings` 可达、设置页两卡片正常、无黑色控制台窗（用户目验）。
+  - 生产态 file://（CDP `Runtime.evaluate` / `PrintWindow` 客观证据）：①窗口渲染出 `音频库(骨架) / 后端 OK · SQLite 读写成功 · API 端口 7311`；②占住 7310 时 server 递增 7311、页面 URL 注入 `?apiPort=7311&apiToken=...`、`#/settings` 正文 `设置 / API 端口:7311 / 重新探测 / yt-dlp / ffmpeg`（D3b 最终判定：hash 保留 search 成立）；③D10 dialog 文案 `加载本地服务失败`+ 构建指引、点掉后进程退出（见上条）。
+  - 补充 4 项（2026-09-28 CDP/PrintWindow 补验）：④无 query 打开 `index.html` → 默认 7310 → `后端 OK · SQLite 读写成功 · API 端口 7310`（ADR-2 缺省路径）；⑤指向死端口 `?apiPort=7999` → 首页 `无法连接本地服务(apiPort=7999)。请确认 server 进程已启动(pnpm dev:server)。`，设置页同 Alert + 两卡片"暂无数据 / 探测未成功"（非永久 loading）；⑥双开第二实例 143ms 内退出码 0、窗口数恒为 1（单实例锁）；⑦`dev:electron` 无 server 时 dialog 正文 `本地服务未启动 / 10 秒内未检测到本地 API 服务。请先运行: pnpm dev:server`。
+  - **M0 待目验清零。**
 
-**只手动验证**：窗口加载与双开拦截、双跑 `-k` 收割、API 不可达 Alert、file:// 路由可达。
+**只手动验证**：窗口加载与双开拦截（✅ 2026-09-28 已验）、API 不可达 Alert（✅ 2026-09-28 已验）、file:// 路由可达（✅ 2026-09-28 已验）、双跑 `-k` 收割（✅ 2026-09-28 已验：杀 server 后 concurrently 输出 `--> Sending SIGTERM to other processes..`，web(8000) 与 electron 6s 内归零，`pnpm dev` 整体退出码 1，deferred ⑬ 闭环）。
 
 **不测**：Electron 生命周期（太薄）、max dev 本身、AntD 组件（无逻辑）。
 
