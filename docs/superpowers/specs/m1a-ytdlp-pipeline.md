@@ -126,7 +126,7 @@ M1 前半使命：**贴一个网页 URL（B 站课程/YouTube/播客等）→ �
   - **finalize 失败路径（P1-2）**：`finalizeDownload` 全程包 try/catch——`ingestDownloadedFile` 抛错（rename 被占/权限/IO）时：`jobsRepo.fail(jobId, msg)` + **`audioRepo.delete(已INSERT的id)`** 回滚 + emit SSE `status error`。禁止 unhandled rejection（`onEvent` 里的 `void finalizeDownload(...)` 不得裸奔）。
   - **并发检查位置（P1-1）**：`POST /api/ytdlp/download` 在校验段末尾、建 job **之前**调 `jobsRepo.findActiveByUrl(url)`，命中即 409 BUSY（见 §0.3）。
 - **关闭清理**：`createServer` 返回的 `close()` 内先 `downloadManager.dispose()`（`taskkill` 全部活跃子进程）再关 Fastify/db——`detached:true` 的子进程不随父进程退出，若不主动杀，应用退出后 yt-dlp/ffmpeg 会残留空转继续写 tempDir（与 S1 的孤儿清理冲突）。
-- **`--progress-template` 待验证（P2-7）**：`%(progress._percent_str)s`/`%(progress.downloaded_bytes)s`/`%(progress.total_bytes)s` 的字段名与"进度行走 stdout"均属机制断言——**Task 1 必须先用真实 `yt-dlp` 跑一次小下载实测确认**，若字段名或输出流与预期不符，回改 args.ts/`parseProgressLine` 并回写本节。
+- **`--progress-template` 已验证（P2-7，2026-09-28 Task 1 真实探针）**：`%(progress._percent_str)s`/`%(progress.downloaded_bytes)s`/`%(progress.total_bytes)s` 字段名与"进度行走 stdout"均已实测确认——探针行形如 `  0.1%|1024|788493`（前导空格属 `_percent_str`，`parseProgressLine` 已 trim），stderr 为空。若后续版本字段名或输出流变化，回改 args.ts/`parseProgressLine` 并回写本节。
 
 ### 0.6 web（最小音频库页 + 获取页）
 
@@ -192,7 +192,7 @@ M1 前半使命：**贴一个网页 URL（B 站课程/YouTube/播客等）→ �
 | P2-1 | spec §0.5 download.ts 表格与计划 StartOpts 不一致 | §0.5 表格同步为 `start(opts: StartOpts)` |
 | P2-2 | cancel 后 tempDir 半成品运行中不清理 | §0.5 download.ts `cancel` 增加清理 outDir 半成品 |
 | P2-5 | `audio/:id/file` 的 id 未校验正整数 | §0.3 非正整数 → 404；§0.7 测试项 |
-| P2-7 | `--progress-template` 字段名/输出流是待验证机制断言 | §0.5 标注"Task 1 必须真实 yt-dlp 实测确认" |
+| P2-7 | `--progress-template` 字段名/输出流是待验证机制断言 | §0.5 标注"Task 1 必须真实 yt-dlp 实测确认"；**2026-09-28 Task 1 已实测通过**（探针行 `  0.1%|1024|788493` 走 stdout，字段非空） |
 
 ### 已关闭（伪需求/被替代）
 

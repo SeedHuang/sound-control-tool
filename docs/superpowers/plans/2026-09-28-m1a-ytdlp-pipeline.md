@@ -46,7 +46,7 @@
   - `progress.ts`：`export interface ProgressInfo { percent: number; downloadedBytes?: number; totalBytes?: number }`；`parseProgressLine(line: string): ProgressInfo | null`
   - `errors.ts`：`export interface YtdlpErrorInfo { code: string; message: string; next: string }`；`mapYtdlpError(e: { code?: string; stderr?: string; binPath?: string | null }): YtdlpErrorInfo`
 
-- [ ] **Step 1: 写 `slug.ts` 与失败测试**
+- [x] **Step 1: 写 `slug.ts` 与失败测试**
 
 ```ts
 // server/src/ytdlp/slug.ts
@@ -88,12 +88,12 @@ describe('resolveUniquePath', () => {
 });
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cd server && pnpm test -- slug.test.ts`
 Expected: FAIL（模块不存在）
 
-- [ ] **Step 3: 写 `args.ts` 与失败测试**
+- [x] **Step 3: 写 `args.ts` 与失败测试**
 
 ```ts
 // server/src/ytdlp/args.ts
@@ -163,12 +163,12 @@ describe('buildDownloadArgs', () => {
 });
 ```
 
-- [ ] **Step 4: 跑测试确认失败**
+- [x] **Step 4: 跑测试确认失败**
 
 Run: `cd server && pnpm test -- args.test.ts`
 Expected: FAIL（模块不存在）
 
-- [ ] **Step 5: 写 `progress.ts` 与失败测试**
+- [x] **Step 5: 写 `progress.ts` 与失败测试**
 
 ```ts
 // server/src/ytdlp/progress.ts
@@ -202,12 +202,12 @@ describe('parseProgressLine', () => {
 });
 ```
 
-- [ ] **Step 6: 跑测试确认失败**
+- [x] **Step 6: 跑测试确认失败**
 
 Run: `cd server && pnpm test -- progress.test.ts`
 Expected: FAIL（模块不存在）
 
-- [ ] **Step 7: 写 `errors.ts` 与失败测试**
+- [x] **Step 7: 写 `errors.ts` 与失败测试**
 
 ```ts
 // server/src/ytdlp/errors.ts
@@ -253,17 +253,17 @@ describe('mapYtdlpError', () => {
 });
 ```
 
-- [ ] **Step 8: 跑测试确认失败**
+- [x] **Step 8: 跑测试确认失败**
 
 Run: `cd server && pnpm test -- errors.test.ts`
 Expected: FAIL（模块不存在）
 
-- [ ] **Step 9: 全绿 + typecheck**
+- [x] **Step 9: 全绿 + typecheck**
 
 Run: `cd server && pnpm test -- slug.test.ts args.test.ts progress.test.ts errors.test.ts && pnpm typecheck`
 Expected: 全部 PASS；typecheck exit 0
 
-- [ ] **Step 10: 真实 yt-dlp 实测 progress-template（P2-7 机制断言验证）**
+- [x] **Step 10: 真实 yt-dlp 实测 progress-template（P2-7 机制断言验证）**
 
 本步验证 spec §0.5 标注的机制断言：`--progress-template` 的字段名与"进度行走 stdout"是否符合预期。**若不符，回改 args.ts/parseProgressLine 并回写 spec §0.5。**
 
@@ -278,7 +278,7 @@ Expected:
 3. 若字段输出为空 → 换用 `%(progress._downloaded_bytes_str)s`/`%(progress._total_bytes_str)s`，回改 args.ts
 4. 探针产物文件删除（临时目录，不入库）
 
-- [ ] **Step 11: Commit**
+- [x] **Step 11: Commit**
 
 ```bash
 git add server/src/ytdlp/slug.ts server/src/ytdlp/args.ts server/src/ytdlp/progress.ts server/src/ytdlp/errors.ts server/src/ytdlp/*.test.ts
