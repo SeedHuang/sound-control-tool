@@ -1,6 +1,6 @@
 // server/src/ytdlp/ytdlp-routes.ts(Task 5:download 路由 + 两段式入库;Task 6 续 SSE/cancel/retry)
 import type { FastifyInstance } from 'fastify';
-import { existsSync, statSync } from 'node:fs';
+import { createReadStream, existsSync, statSync } from 'node:fs';
 import type { DB } from '../db/index.js';
 import { createAudioItemsRepo } from '../db/repo/audio-items.js';
 import { createJobsRepo } from '../db/repo/jobs.js';
@@ -29,6 +29,9 @@ function emit(jobId: number, ev: unknown): void {
     sseConnections.delete(jobId);
   }
 }
+
+// Task 7:文件流 Content-Type 按扩展名映射——给 <audio> 标签可识别的 MIME,未知格式回退 octet-stream
+const MIME: Record<string, string> = { mp3: 'audio/mpeg', m4a: 'audio/mp4', wav: 'audio/wav' };
 
 export interface YtdlpDeps {
   db: DB;
@@ -266,5 +269,25 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
       durationSec: typeof payload.durationSec === 'number' ? payload.durationSec : undefined,
     });
     return reply.code(201).send({ ok: true, jobId: newId });
+  });
+
+  // Task 7:音频列表——spec 0.3:返回数组(非 {ok,items});list() 已按 created_at DESC(§0.4)
+  app.get('/api/audio', async () => audioRepo.list());
+
+  // Task 7:音频文件流——D3 query token(<audio> 标签无法设 header);P2-5:非正整数 id → 404,避免 NaN 查询行为未定义
+  app.get('/api/audio/:id/file', async (req, reply) => {
+    const id = Number((req.params as { id: string }).id);
+    const q = (req.query ?? {}) as { token?: string };
+    if (q.token !== token) return reply.code(401).send({ ok: false, error: { code: 'UNAUTHORIZED', message: 'token 无效', next: '' } });
+    // P2-5:id 非正整数(Number('abc')/0/负数)→ 404,避免 NaN 查询行为未定义
+    if (!Number.isInteger(id) || id <= 0) return reply.code(404).send({ ok: false, error: { code: 'NOT_FOUND', message: '音频不存在', next: '' } });
+    const item = audioRepo.get(id);
+    if (!item) return reply.code(404).send({ ok: false, error: { code: 'NOT_FOUND', message: '音频不存在', next: '' } });
+    if (!existsSync(item.file_path)) return reply.code(404).send({ ok: false, error: { code: 'FILE_MISSING', message: '文件已丢失', next: '' } });
+    reply
+      .header('content-type', MIME[item.format] ?? 'application/octet-stream')
+      .header('content-disposition', 'inline')
+      .header('accept-ranges', 'bytes');
+    return reply.send(createReadStream(item.file_path));
   });
 }

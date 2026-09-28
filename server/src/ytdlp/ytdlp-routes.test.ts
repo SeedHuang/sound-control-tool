@@ -171,3 +171,31 @@ describe('POST /api/jobs/:id/retry', () => {
     expect(res.json().jobId).not.toBe(errJid);
   });
 });
+
+// Task 7:audio 列表与文件流路由——文件流用真实临时文件(注入 mkdtemp 写真实 mp3),
+// 断言 token 401/不存在 404/非正整数 id 404(P2-5)/200 + Content-Type + body
+describe('GET /api/audio 与 GET /api/audio/:id/file', () => {
+  it('audio 文件 token 错 → 401;不存在 → 404;非正整数 id → 404;存在 → 200 + Content-Type', async () => {
+    const audioRepo = createAudioItemsRepo(db);
+    const audioDir = mkdtempSync(join(tmpdir(), 'sct-audio-'));
+    const id = audioRepo.create({ title: 't', source_type: 'download', source_url: 'u', file_path: join(audioDir, 't.mp3'), format: 'mp3', duration_sec: null, file_size: 3 });
+    writeFileSync(join(audioDir, 't.mp3'), 'abc');
+    makeApp('yt-dlp', 'tok2');
+    expect((await app.inject({ method: 'GET', url: `/api/audio/${id}/file?token=bad` })).statusCode).toBe(401);
+    expect((await app.inject({ method: 'GET', url: '/api/audio/999/file?token=tok2' })).statusCode).toBe(404);
+    // P2-5:非正整数 id → 404
+    expect((await app.inject({ method: 'GET', url: '/api/audio/abc/file?token=tok2' })).statusCode).toBe(404);
+    expect((await app.inject({ method: 'GET', url: '/api/audio/0/file?token=tok2' })).statusCode).toBe(404);
+    const ok = await app.inject({ method: 'GET', url: `/api/audio/${id}/file?token=tok2` });
+    expect(ok.statusCode).toBe(200);
+    expect(ok.headers['content-type']).toBe('audio/mpeg');
+    expect(ok.body).toBe('abc');
+  });
+  it('audio 列表返回全部', async () => {
+    createAudioItemsRepo(db).create({ title: 'a', source_type: 'download', source_url: 'u', file_path: 'C:/x/a.mp3', format: 'mp3', duration_sec: null, file_size: 1 });
+    makeApp('yt-dlp', 'tok2');
+    const res = await app.inject({ method: 'GET', url: '/api/audio' });
+    expect(res.json()).toHaveLength(1);
+    expect(res.json()[0].title).toBe('a');
+  });
+});

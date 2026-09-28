@@ -18,7 +18,7 @@ export function createAudioItemsRepo(db: DB): AudioItemsRepo {
     'INSERT INTO audio_items (title, source_type, source_url, file_path, format, duration_sec, file_size) VALUES (?, ?, ?, ?, ?, ?, ?)',
   );
   const select = db.prepare(
-    'SELECT id, title, source_type, source_url, file_path, format, duration_sec, file_size, created_at FROM audio_items',
+    'SELECT id, title, source_type, source_url, file_path, format, duration_sec, file_size, created_at FROM audio_items ORDER BY created_at DESC, id DESC',
   );
   return {
     create: (item) =>
