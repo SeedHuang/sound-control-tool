@@ -967,6 +967,8 @@ git commit -m "feat(server): yt-dlp 元数据解析路由 + audioDir 与关闭�
 
 ### Task 5: 下载闭环——POST download + 入库
 
+> **实施注记（2026-09-28 Task 5 落地）**：实现主体逐字转录 brief；3 处最小偏离（均已在代码注释标注）——①**ingest.test 冲突用例修正**：brief 原测试"两个同标题条目"实际不会触发 `resolveUniquePath`（文件名含 id8，两条 id 不同→文件名天然不同），实测 FAIL，改为"预置第二个条目默认文件名的磁盘占位文件"再断言 `-2` 后缀；②**download 201 用例注入假 DownloadManager**：brief 原用 `createDownloadManager()` 会真实拉起本机 yt-dlp 访问 `https://a/1` 并写 `C:/tmp`（本机 yt-dlp 在 PATH、`C:/tmp` 不存在），测试不封闭；路由契约（201/jobId/running + start 接线）不依赖真实子进程，故注入假件；③**类型修正两处**：`body` 类型放宽容 `title?/durationSec?`、`startDownload` 调用处 `options: body.options ?? {}`（brief 原样两处均编译不过）。评审 Minor 的 parse success HTTP 用例已补（`vi.mock('./parse.js')` 展开保 `YtdlpRunError` 真身、仅 mock `parseMetadata`，`duration_sec` 下划线契约断言通过）。
+
 **Files:**
 - Modify: `server/src/ytdlp/ytdlp-routes.ts`（补 download 路由 + 完成回调）
 - Modify: `server/src/ytdlp/ytdlp-routes.test.ts`（补 download 用例）
@@ -980,7 +982,7 @@ git commit -m "feat(server): yt-dlp 元数据解析路由 + audioDir 与关闭�
   - `ingest.ts`：`export function ingestDownloadedFile(opts: { tmpPath: string; title: string; format: string; durationSec: number | null; fileSize: number; sourceUrl: string; audioDir: string; exists: (p: string) => boolean; audioRepo: AudioItemsRepo }): { audioId: number; finalPath: string }`——D5 两段式：INSERT(temp 路径) → 计算 `{slug(title)}-{id前8位}.{ext}` → resolveUniquePath → rename → updateFilePath
   - `ffprobe.ts`：`export function probeDuration(ffprobePath: string, filePath: string, timeoutMs?: number, doExec?: typeof execFile): Promise<number | null>`——`ffprobe -v error -show_entries format=duration -of json <file>` 解析 `format.duration`，失败/缺失返回 null
 
-- [ ] **Step 1: 写 ingest.ts + 测试（真实临时文件）**
+- [x] **Step 1: 写 ingest.ts + 测试（真实临时文件）**
 
 ```ts
 // server/src/ytdlp/ingest.ts
@@ -1051,12 +1053,12 @@ describe('ingestDownloadedFile', () => {
 });
 ```
 
-- [ ] **Step 2: 跑测试确认失败→通过**
+- [x] **Step 2: 跑测试确认失败→通过**
 
 Run: `cd server && pnpm test -- ingest.test.ts`
 Expected: 先 FAIL，实现后 PASS
 
-- [ ] **Step 3: 写 ffprobe.ts + 测试（D10 duration 兜底）**
+- [x] **Step 3: 写 ffprobe.ts + 测试（D10 duration 兜底）**
 
 ```ts
 // server/src/ytdlp/ffprobe.ts
@@ -1108,12 +1110,12 @@ describe('probeDuration', () => {
 });
 ```
 
-- [ ] **Step 4: 跑测试确认失败→通过**
+- [x] **Step 4: 跑测试确认失败→通过**
 
 Run: `cd server && pnpm test -- ffprobe.test.ts`
 Expected: 先 FAIL，实现后 PASS
 
-- [ ] **Step 5: ytdlp-routes 补 download 路由**
+- [x] **Step 5: ytdlp-routes 补 download 路由**
 
 > **前置（本步先落，供 Task 6 扩展）**：在 `ytdlp-routes.ts` 顶部声明 SSE 桥接的骨架——`emit` 先做空实现（只落 jobs 表），Task 6 补 SSE 推送：
 > ```ts
@@ -1252,7 +1254,7 @@ app.post('/api/ytdlp/download', async (req, reply) => {
 
 > **Task 5 的最终断言点**：`finalizeDownload` 完成两段式入库（`ingestDownloadedFile`）后 `jobsRepo.finish(jobId)` 且 `audio_items` 新增一行、`file_path` 为 `{slug}-{id前8位}.{ext}`。SSE 推送 gap 由 Task 6 闭合。
 
-- [ ] **Step 6: 补 download 单测（校验/DUPLICATE/BUSY/201）**
+- [x] **Step 6: 补 download 单测（校验/DUPLICATE/BUSY/201）**
 
 ```ts
 // ytdlp-routes.test.ts 追加
@@ -1290,12 +1292,12 @@ it('download 合法 → 201 返回 jobId', async () => {
 ```
 （入库链路由 ingest.test.ts 保证；finalize 全链路留 Task 9 端到端）
 
-- [ ] **Step 7: typecheck + 全量单测**
+- [x] **Step 7: typecheck + 全量单测**
 
 Run: `cd server && pnpm test && pnpm typecheck`
 Expected: 全绿；typecheck exit 0
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add server/src/ytdlp/ingest.ts server/src/ytdlp/ingest.test.ts server/src/ytdlp/ffprobe.ts server/src/ytdlp/ffprobe.test.ts server/src/ytdlp/ytdlp-routes.ts server/src/ytdlp/ytdlp-routes.test.ts
