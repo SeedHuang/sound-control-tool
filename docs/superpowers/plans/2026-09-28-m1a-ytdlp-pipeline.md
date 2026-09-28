@@ -1308,6 +1308,8 @@ git commit -m "feat(server): 下载闭环——job 创建、子进程、两段�
 
 ### Task 6: SSE 事件桥 + cancel + retry
 
+> **实施注记（2026-09-28 Task 6 落地）**：实现主体逐字转录 brief；3 处最小偏离（均已在代码注释标注）——①**retry 成功用例注入假 DownloadManager**：brief 原用 `createDownloadManager()` 会真实拉起本机 yt-dlp 访问 `https://a/1` 并写 `C:/tmp`（同 Task 5 ② 同一问题），测试不封闭，注入假件仅断言路由契约（201/新 jobId）；②**retry 透传 title/durationSec**：brief 只透 url/options，若照抄，重试后的下载会丢标题回落"下载音频"（`finalizeDownload` 用 `payload.title ?? '下载音频'`），故将原任务 payload 的 title/durationSec 一并传入 `startDownload`；③**startDownload 的 bin 缺失分支补 emit error**：progress.md Minor deferred ⑯ 明确"Task 6 落 SSE 时补"——否则该分支只 fail 不 emit，已订阅的 SSE 连接永不收到终态而悬挂。SSE 实时流（真实 listen + fetch 读流）按 brief 留 Task 9 端到端手工验证；单测覆盖 401/404 静态分支。
+
 **Files:**
 - Modify: `server/src/ytdlp/ytdlp-routes.ts`（SSE 订阅表、`GET /api/jobs/:id/events`、`POST /api/jobs/:id/cancel`、`POST /api/jobs/:id/retry`）
 - Modify: `server/src/ytdlp/ytdlp-routes.test.ts`（SSE/cancel/retry 用例）
@@ -1316,7 +1318,7 @@ git commit -m "feat(server): 下载闭环——job 创建、子进程、两段�
 - Consumes: Task 5 的 `emit` 占位、`createJobsRepo`、`DownloadManager.cancel`
 - Produces: 完整 SSE（D3 query token + 心跳 + 终态补发）
 
-- [ ] **Step 1: 实现 SSE 订阅表 + events 路由**
+- [x] **Step 1: 实现 SSE 订阅表 + events 路由**
 
 ```ts
 // ytdlp-routes.ts 顶部(模块级):
@@ -1371,7 +1373,7 @@ app.get('/api/jobs/:id/events', async (req, reply) => {
 ```
 > **Fastify SSE 约定**：`reply.raw` 直接写流后，handler 返回 `reply`（不返回 payload）且必须确保未被 Fastify 自动结束——本实现用 `reply.raw.writeHead` 先行锁定头。
 
-- [ ] **Step 2: cancel / retry 路由**
+- [x] **Step 2: cancel / retry 路由**
 
 ```ts
 app.post('/api/jobs/:id/cancel', async (req, reply) => {
@@ -1415,7 +1417,7 @@ app.post('/api/jobs/:id/retry', async (req, reply) => {
 ```
 > **重构点**：把 Task 5 download 路由里"解析 payload → buildDownloadArgs → downloadManager.start"抽成 `startDownload(jobId, payload, deps)`，download 路由与 retry 共用，避免重复（DRY）。
 
-- [ ] **Step 3: SSE/cancel/retry 单测**
+- [x] **Step 3: SSE/cancel/retry 单测**
 
 ```ts
 // ytdlp-routes.test.ts 追加
@@ -1467,12 +1469,12 @@ it('retry error job 且无并发 → 201 新 jobId', async () => {
 ```
 > SSE 实时流（真实 listen + fetch 读流）留作 Task 9 端到端手工验证；单测覆盖 401/404 静态分支。
 
-- [ ] **Step 4: typecheck + 全量单测**
+- [x] **Step 4: typecheck + 全量单测**
 
 Run: `cd server && pnpm test && pnpm typecheck`
 Expected: 全绿；typecheck exit 0
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add server/src/ytdlp/ytdlp-routes.ts server/src/ytdlp/ytdlp-routes.test.ts
