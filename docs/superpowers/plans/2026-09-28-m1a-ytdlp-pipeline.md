@@ -712,7 +712,7 @@ Expected: PASS
 Run: `cd server && pnpm typecheck`
 Expected: exit 0
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add server/src/ytdlp/download.ts server/src/ytdlp/download.test.ts
@@ -1565,6 +1565,8 @@ git commit -m "feat(server): 音频列表与文件流路由(query token)"
 
 ### Task 8: web——获取页 + 音频库页 + api 增补
 
+> **实施注记（2026-09-29 Task 8 落地）**：Step 4 的导航片段是"Card 下插入"的 JSX 片段而非完整文件——按片段直接插入后 `index.tsx` 出现两个顶层兄弟节点，`tsc` 报 TS2657（JSX 表达式必须单一父节点）。最小修正：把 Card 与导航 Space 包进 `<>...</>` 空 Fragment（typecheck/build 均 exit 0）。其余 4 个文件逐字转录 brief；commit `f5c377d`。另注：acquire.tsx 的 `List` import 实际未使用（brief 原文自带，`noUnusedLocals` 未开故 tsc 不报，留待后续清理）。
+
 **Files:**
 - Modify: `web/src/api.ts`（增补封装）
 - Create: `web/src/pages/acquire.tsx`
@@ -1576,7 +1578,7 @@ git commit -m "feat(server): 音频列表与文件流路由(query token)"
 - Consumes: `apiGet`（现有）、`apiToken`（现有）、server 接口契约（spec §0.3）
 - Produces: `parseUrl`、`startDownload`、`subscribeJob`、`cancelJob`、`retryJob`、`listAudio`、`audioFileUrl`
 
-- [ ] **Step 1: api.ts 增补**
+- [x] **Step 1: api.ts 增补**
 
 ```ts
 // web/src/api.ts 追加
@@ -1652,7 +1654,7 @@ export function subscribeJob(jobId: number, handlers: {
 }
 ```
 
-- [ ] **Step 2: 写 library.tsx**
+- [x] **Step 2: 写 library.tsx**
 
 ```tsx
 // web/src/pages/library.tsx
@@ -1684,7 +1686,7 @@ export default function LibraryPage() {
 }
 ```
 
-- [ ] **Step 3: 写 acquire.tsx（URL 输入 → parse → 勾选/格式 → 下载 → 进度）**
+- [x] **Step 3: 写 acquire.tsx（URL 输入 → parse → 勾选/格式 → 下载 → 进度）**
 
 ```tsx
 // web/src/pages/acquire.tsx
@@ -1809,7 +1811,7 @@ export default function AcquirePage() {
 ```
 > **subscribeJob 接入已完整**：acquire 页的 `useEffect`（依赖 `jobId`）已在 Step 3 组件代码中给出，订阅 progress/done/error/cancelled 事件。
 
-- [ ] **Step 4: index.tsx 加导航 + umirc routes**
+- [x] **Step 4: index.tsx 加导航 + umirc routes**
 
 ```tsx
 // index.tsx 内 Card 下加:
@@ -1829,12 +1831,12 @@ routes: [
 ],
 ```
 
-- [ ] **Step 5: typecheck + build**
+- [x] **Step 5: typecheck + build**
 
 Run: `cd web && pnpm typecheck && pnpm build`
 Expected: 均 exit 0（build 产物 `web/dist` 就绪，供 Task 9 file:// 验证）
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add web/src/api.ts web/src/pages/acquire.tsx web/src/pages/library.tsx web/src/pages/index.tsx web/.umirc.ts
