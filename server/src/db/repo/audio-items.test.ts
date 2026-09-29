@@ -40,4 +40,29 @@ describe('audio-items repo', () => {
     expect(repo.get(id)).toBeNull();
     expect(repo.list()).toHaveLength(0);
   });
+  // 2026-09-29 用户拍板:音频库要显示「第几集 / 所属合集」→ audio_items 增两列
+  it('entry_index/collection_title 落库并回读;不传 → null', () => {
+    const repo = createAudioItemsRepo(db);
+    const ep = repo.create({ title: '第 3 集', source_type: 'download', source_url: 'https://a/pl', file_path: 'C:/tmp/3.mp3', format: 'mp3', duration_sec: null, file_size: 1, entry_index: 3, collection_title: '某合集' });
+    expect(repo.get(ep)!.entry_index).toBe(3);
+    expect(repo.get(ep)!.collection_title).toBe('某合集');
+    const single = repo.create({ title: '单视频', source_type: 'download', source_url: 'https://a/s', file_path: 'C:/tmp/s.mp3', format: 'mp3', duration_sec: null, file_size: 1 });
+    expect(repo.get(single)!.entry_index).toBeNull();
+    expect(repo.get(single)!.collection_title).toBeNull();
+  });
+  it('老库(无剧集两列)initSchema 自动补列,repo 随即可用(升级路径)', () => {
+    const old = openDatabase(':memory:');
+    // 故意按改动前的旧结构建表:CREATE TABLE IF NOT EXISTS 不会补列,只能靠 initSchema 的 ALTER TABLE
+    old.exec(
+      'CREATE TABLE audio_items (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, source_type TEXT NOT NULL, ' +
+      'source_url TEXT, parent_id INTEGER, file_path TEXT NOT NULL UNIQUE, format TEXT NOT NULL, duration_sec REAL, ' +
+      'file_size INTEGER, created_at TEXT NOT NULL DEFAULT (datetime(\'now\')))',
+    );
+    initSchema(old);
+    const repo = createAudioItemsRepo(old);
+    const id = repo.create({ title: '第 2 集', source_type: 'download', source_url: 'https://a/pl', file_path: 'C:/tmp/2.mp3', format: 'mp3', duration_sec: null, file_size: 1, entry_index: 2, collection_title: '旧库合集' });
+    expect(repo.get(id)!.entry_index).toBe(2);
+    expect(repo.get(id)!.collection_title).toBe('旧库合集');
+    old.close();
+  });
 });

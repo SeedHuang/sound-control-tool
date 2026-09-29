@@ -1,9 +1,9 @@
 // web/src/components/LogsButton.tsx(2026-09-29 用户反馈:"一个按钮看前后端日志")
 // 固定悬浮按钮 + 抽屉面板:后端日志(拉 /api/logs)+ 前端日志(api.ts 环形缓冲),
 // 跨进程问题(浏览器↔server↔yt-dlp)可观测——CORS 修复前的 SSE 断连排查就缺这样一个入口。
-import { Button, Drawer, Empty, Space, Typography } from 'antd';
+import { Button, Drawer, Empty, Modal, Space, Typography } from 'antd';
 import { useCallback, useEffect, useState, type CSSProperties } from 'react';
-import { fetchLogs, getFeLogs, type LogRow } from '@/api';
+import { clearServerLogs, fetchLogs, getFeLogs, type LogRow } from '@/api';
 
 // 等宽日志块:日志是给排查用的,字体一乱时间戳就没法对齐
 const preStyle: CSSProperties = {
@@ -57,11 +57,7 @@ export default function LogsButton() {
 
   return (
     <>
-      <Button
-        type="primary"
-        style={{ position: 'fixed', right: 24, bottom: 24, zIndex: 1000 }}
-        onClick={() => setOpen(true)}
-      >
+      <Button type="primary" onClick={() => setOpen(true)}>
         日志
       </Button>
       <Drawer title="诊断日志" width={560} open={open} onClose={() => setOpen(false)}>
@@ -70,6 +66,21 @@ export default function LogsButton() {
             <Space style={{ marginBottom: 8 }}>
               <Typography.Text strong>后端日志</Typography.Text>
               <Button size="small" onClick={() => void refresh()}>刷新</Button>
+              {/* 清空 = 内存缓冲 + 落盘文件一起删(2026-09-29 用户拍板:日志要可删除) */}
+              <Button
+                size="small"
+                danger
+                onClick={() => {
+                  Modal.confirm({
+                    title: '清空全部日志?',
+                    content: '将清空后端内存日志,并删除已按天/小时落盘的日志文件。',
+                    okText: '清空', okType: 'danger', cancelText: '取消',
+                    onOk: async () => { await clearServerLogs(); await refresh(); },
+                  });
+                }}
+              >
+                清空
+              </Button>
             </Space>
             {error && <Typography.Text type="danger">{error}</Typography.Text>}
             {!error && backend !== null && backend.length === 0 && (

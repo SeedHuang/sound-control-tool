@@ -7,7 +7,7 @@ import { createSettingsRepo } from './db/repo/settings.js';
 import { initSchema } from './db/schema.js';
 import { isAllowedLocalOrigin, registerCors } from './http/cors.js';
 import { registerSettingsRoutes } from './http/settings-routes.js';
-import { pushLog, registerRequestLogging } from './logs.js';
+import { initFileLogging, pushLog, registerRequestLogging } from './logs.js';
 import { findFreePort } from './net/find-free-port.js';
 import { probeBin } from './bins.js';
 import { SETTINGS_KEYS } from './settings-keys.js';
@@ -60,6 +60,9 @@ export async function createServer(opts: CreateServerOpts): Promise<{
     // D4:audioDir 与 db 同目录
     const audioDir = path.join(path.dirname(opts.dbPath), 'audio');
     mkdirSync(audioDir, { recursive: true });
+    // 日志文件落盘根目录(2026-09-29 用户拍板:日志按 天/小时 落文件,与 db 同级 logs/)。
+    // :memory: 是测试库 → 不落盘,避免测试运行往仓库 cwd 写 logs/
+    if (!opts.dbPath.includes(':memory:')) initFileLogging(path.join(path.dirname(opts.dbPath), 'logs'));
 
     const downloadManager = createDownloadManager();
     registerYtdlpRoutes(app, {

@@ -42,6 +42,22 @@ describe('ingestDownloadedFile', () => {
     expect(p2.endsWith('-2.mp3')).toBe(true);
     expect(p2).not.toBe(p1);
   });
+  // 2026-09-29 用户拍板:合集条目入库要记住「第几集 / 所属合集」,音频库据此显示
+  it('剧集字段 entryIndex/collectionTitle 随入库写进 audio_items(单视频不传 → null)', () => {
+    const audioRepo = createAudioItemsRepo(db);
+    const t1 = join(dir, 'ep3.mp3'); writeFileSync(t1, 'x');
+    const { audioId } = ingestDownloadedFile({
+      tmpPath: t1, title: '第 3 集', format: 'mp3', durationSec: null, fileSize: 1,
+      sourceUrl: 'https://a/pl', audioDir: dir, exists: existsSync, audioRepo,
+      entryIndex: 3, collectionTitle: '某合集',
+    });
+    expect(audioRepo.get(audioId)!.entry_index).toBe(3);
+    expect(audioRepo.get(audioId)!.collection_title).toBe('某合集');
+    const t2 = join(dir, 'single.mp3'); writeFileSync(t2, 'y');
+    const { audioId: sid } = ingestDownloadedFile({ tmpPath: t2, title: '单视频', format: 'mp3', durationSec: null, fileSize: 1, sourceUrl: 'https://a/s', audioDir: dir, exists: existsSync, audioRepo });
+    expect(audioRepo.get(sid)!.entry_index).toBeNull();
+    expect(audioRepo.get(sid)!.collection_title).toBeNull();
+  });
   it('rename 失败 → 已 INSERT 的行回滚删除(修复:不留指向 temp 的悬空行)', () => {
     const audioRepo = createAudioItemsRepo(db);
     // tmpPath 不存在 → renameSync 抛 ENOENT;此时行已 INSERT,必须回滚删除

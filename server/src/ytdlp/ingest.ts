@@ -7,10 +7,12 @@ import { resolveUniquePath, slugify } from './slug.js';
 export function ingestDownloadedFile(opts: {
   tmpPath: string; title: string; format: string; durationSec: number | null;
   fileSize: number; sourceUrl: string; audioDir: string;
+  entryIndex?: number | null; collectionTitle?: string | null; // 剧集信息:第几集 / 所属合集(单视频不传)
   exists: (p: string) => boolean; audioRepo: AudioItemsRepo;
 }): { audioId: number; finalPath: string } {
   const audioId = opts.audioRepo.create({
     title: opts.title, source_type: 'download', source_url: opts.sourceUrl,
+    entry_index: opts.entryIndex ?? null, collection_title: opts.collectionTitle ?? null,
     file_path: opts.tmpPath, format: opts.format, duration_sec: opts.durationSec, file_size: opts.fileSize,
   });
   const id8 = String(audioId).padStart(8, '0').slice(-8);

@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog } from 'electron';
+import { app, BrowserWindow, dialog, shell } from 'electron';
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { parsePortFile, type DevPortInfo } from './shared/parse-port-file.js';
@@ -97,6 +97,12 @@ async function openWindow(mode: 'dev' | 'file', apiPort: number, apiToken: strin
     },
   });
   const search = `apiPort=${apiPort}&apiToken=${apiToken}`;
+  // 外链走系统浏览器(2026-09-29:音频库「原视频」链接用 target=_blank):
+  // 不拦的话 Electron 默认新开一个无 preload 的裸窗口,点一次冒一个;这里统一 deny + openExternal
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (/^https?:\/\//i.test(url)) void shell.openExternal(url);
+    return { action: 'deny' };
+  });
   if (mode === 'file') {
     const indexPath = path.join(app.getAppPath(), '..', 'web', 'dist', 'index.html');
     await mainWindow.loadFile(indexPath, { search });

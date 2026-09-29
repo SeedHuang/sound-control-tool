@@ -5,8 +5,8 @@ import { createReadStream, existsSync, mkdirSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import type { DB } from '../db/index.js';
 import { isAllowedOrigin, isAllowedLocalOrigin } from '../http/cors.js';
-import { getLogs, pushLog } from '../logs.js';
-import { createAudioItemsRepo } from '../db/repo/audio-items.js';
+import { clearLogs, getLogs, pushLog } from '../logs.js';
+import { createAudioItemsRepo, type AudioItemRow } from '../db/repo/audio-items.js';
 import { deleteAudioFile } from '../audio-files.js';
 import { createJobsRepo } from '../db/repo/jobs.js';
 import { createSettingsRepo } from '../db/repo/settings.js';
@@ -14,6 +14,7 @@ import { BILI_COOKIE_KEY, SETTINGS_KEYS } from '../settings-keys.js';
 import { buildDownloadArgs } from './args.js';
 import { countCookies, getSessdataExpiry, materializeCookieFile, normalizeCookieContent, toCookieHeader } from './cookies.js';
 import { validateBiliLogin } from './bili-login.js';
+import { createImportsRepo, detectSite } from '../db/repo/imports.js';
 import type { DownloadManager } from './download.js';
 import { mapYtdlpError } from './errors.js';
 import { probeDuration } from './ffprobe.js';
@@ -50,6 +51,16 @@ export interface YtdlpDeps {
   audioDir: string; tempDir: string; token: string;
 }
 
+/** 下载任务载荷(jobs.payload 存的就是它,retry 直接复用):剧集两字段随行,入库时才写进 audio_items */
+export interface DownloadJobPayload {
+  url: string;
+  options: Record<string, unknown>;
+  title?: string;
+  durationSec?: number;
+  entryIndex?: number | null;      // 合集第几集(1 起);单视频不传
+  collectionTitle?: string | null; // 所属合集标题;单视频不传
+}
+
 // B 站 Cookie 注入(parse/download 两处共用):settings 里存了 Cookie → 物化 cookies.txt 到数据目录
 // (dirname(audioDir),与 db 同级,不进仓库);未设置/全空白/物化失败 → 返回 undefined 并留痕,不阻断下载
 // (Cookie 只是增强,不能因为它让无 Cookie 场景挂掉)。
@@ -77,7 +88,7 @@ function createDownloadHandlers(deps: YtdlpDeps) {
     if (ffmpegPath) ffprobePath = ffmpegPath.replace(/ffmpeg(\.exe)?$/i, 'ffprobe$1');
     return ffprobePath;
   }
-  async function finalizeDownload(jobId: number, payload: { url: string; options: Record<string, unknown>; title?: string; durationSec?: number }, producedPath: string): Promise<void> {
+  async function finalizeDownload(jobId: number, payload: DownloadJobPayload, producedPath: string): Promise<void> {
     // P1-2:入库全流程包 try/catch——rename 被占/权限/IO 失败不得 unhandled rejection
     let audioId: number | null = null;
     try {
@@ -90,6 +101,7 @@ function createDownloadHandlers(deps: YtdlpDeps) {
       const result = ingestDownloadedFile({
         tmpPath: producedPath, title: payload.title ?? '下载音频', format,
         durationSec: duration, fileSize: size, sourceUrl: payload.url,
+        entryIndex: payload.entryIndex ?? null, collectionTitle: payload.collectionTitle ?? null,
         audioDir, exists: existsSync, audioRepo,
       });
       audioId = result.audioId;
@@ -106,7 +118,7 @@ function createDownloadHandlers(deps: YtdlpDeps) {
       emit(jobId, { type: 'status', state: 'error', message: msg });
     }
   }
-  async function startDownload(jobId: number, payload: { url: string; options: Record<string, unknown>; title?: string; durationSec?: number }): Promise<void> {
+  async function startDownload(jobId: number, payload: DownloadJobPayload): Promise<void> {
     jobsRepo.update(jobId, { status: 'running' });
     const opt = (payload.options ?? {}) as { entryIndices?: number[]; section?: { start: number; end: number }; format?: string; quality?: string };
     const bin = await binProvider();
@@ -163,6 +175,7 @@ function createDownloadHandlers(deps: YtdlpDeps) {
 export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void {
   const { db, binProvider, token, downloadManager, audioDir } = deps;
   const audioRepo = createAudioItemsRepo(db);
+  const importsRepo = createImportsRepo(db);
   const { startDownload } = createDownloadHandlers(deps);
 
   app.post('/api/ytdlp/parse', async (req, reply) => {
@@ -179,6 +192,15 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
       const parsed = await parseMetadata(bin.path, url, 20_000, execFile, resolveCookiePath(db, audioDir));
       // 诊断日志:解析成功一行(kind + 条目数),面板里能看到"解析了什么"
       pushLog('info', 'job', `parse ${url} → ${parsed.kind} (${parsed.entries?.length ?? 0} entries)`);
+      // 导入来源自动落库(2026-09-29 用户拍板):同 URL 重复解析更新缓存,前端左列表据此持久化
+      const importId = importsRepo.upsertByUrl({
+        url,
+        title: parsed.title,
+        site: detectSite(url),
+        kind: parsed.kind,
+        duration_sec: parsed.durationSec ?? null,
+        entries: parsed.entries ?? null,
+      });
       const existing = audioRepo.findBySourceUrl(url);
       // 注意:parse 内部用 durationSec(驼峰),对外契约 spec 0.3 是 duration_sec(下划线,与 audio_items 键风格一致)
       return {
@@ -189,6 +211,7 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
         thumbnail: parsed.thumbnail,
         entries: parsed.entries,
         existing: existing ? { audioId: existing.id, title: existing.title } : undefined,
+        import_id: importId,
       };
     } catch (e) {
       if (e instanceof YtdlpRunError) {
@@ -200,7 +223,10 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
   });
 
   app.post('/api/ytdlp/download', async (req, reply) => {
-    const body = (req.body ?? {}) as { url?: unknown; options?: Record<string, unknown>; title?: unknown; durationSec?: unknown };
+    const body = (req.body ?? {}) as {
+      url?: unknown; options?: Record<string, unknown>; title?: unknown; durationSec?: unknown;
+      entryIndex?: unknown; collectionTitle?: unknown;
+    };
     if (typeof body.url !== 'string' || body.url.trim().length === 0) {
       return reply.code(400).send({ ok: false, error: { code: 'BAD_REQUEST', message: 'url 必填', next: '粘贴一个网页 URL' } });
     }
@@ -224,7 +250,11 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
         return reply.code(400).send({ ok: false, error: { code: 'BAD_REQUEST', message: 'entryIndices 必须为单个正整数条目,多选请逐条提交', next: '重新勾选合集条目(逐条下载)' } });
       }
     }
-    const existing = audioRepo.findBySourceUrl(url);
+    // 判重只对"单视频整条"生效(2026-09-29 用户拍板修复批量下载闸门):
+    // 合集每集的请求共用同一个播放列表 URL(entryIndices 只是指定第几集)——若仍按 URL 判重,
+    // 第 1 集入库后第 2 集必被 409 拦停,批量永远下不完。条目级重复交给用户勾选自行控制。
+    const isEntryDownload = Array.isArray(opt.entryIndices) && opt.entryIndices.length > 0;
+    const existing = isEntryDownload ? null : audioRepo.findBySourceUrl(url);
     if (existing && opt.force !== true) {
       return reply.code(409).send({ ok: false, error: { code: 'DUPLICATE', message: `库中已存在《${existing.title}》`, next: '若确认重复下载请勾选"仍下载"' } });
     }
@@ -238,9 +268,20 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
       return reply.code(409).send({ ok: false, error: { code: 'YTDLP_NOT_FOUND', message: 'yt-dlp 未找到或路径无效', next: '请到设置页配置 yt-dlp 路径后重试' } });
     }
     const jobsRepo = createJobsRepo(db);
-    const jobId = jobsRepo.create('ytdlp_download', { url, options: body.options, title: body.title ?? null, durationSec: body.durationSec ?? null });
+    // 剧集元数据(前端下载合集某集时带上):非法/缺省即视为单视频 → 落 NULL,不因它拦下载
+    const entryIndex =
+      typeof body.entryIndex === 'number' && Number.isInteger(body.entryIndex) && body.entryIndex > 0 ? body.entryIndex : null;
+    const collectionTitle =
+      typeof body.collectionTitle === 'string' && body.collectionTitle.trim().length > 0 ? body.collectionTitle.trim() : null;
+    const payload: DownloadJobPayload = {
+      url, options: body.options ?? {},
+      title: typeof body.title === 'string' ? body.title : undefined,
+      durationSec: typeof body.durationSec === 'number' ? body.durationSec : undefined,
+      entryIndex, collectionTitle,
+    };
+    const jobId = jobsRepo.create('ytdlp_download', payload);
     pushLog('info', 'job', `job ${jobId} created url=${url} format=${String(opt.format)}`); // 诊断日志:任务创建留痕
-    await startDownload(jobId, { url, options: body.options ?? {}, title: typeof body.title === 'string' ? body.title : undefined, durationSec: typeof body.durationSec === 'number' ? body.durationSec : undefined });
+    await startDownload(jobId, payload);
     return reply.code(201).send({ ok: true, jobId });
   });
 
@@ -298,6 +339,23 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
     const count = countCookies(netscape);
     pushLog('info', 'job', `cookie saved (count=${count}, verified=${verified}${force ? ', force' : ''})`);
     return { ok: true, count, verified, uname: uname ?? null };
+  });
+
+  // ---- 导入来源(2026-09-29 用户拍板:左列表持久化;parse 成功已自动落库) ----
+  app.get('/api/imports', async () => ({ ok: true, imports: importsRepo.list() }));
+
+  app.get('/api/imports/:id', async (req, reply) => {
+    const id = Number((req.params as { id: string }).id);
+    if (!Number.isInteger(id) || id <= 0) return reply.code(404).send({ ok: false, error: { code: 'NOT_FOUND', message: '来源不存在', next: '' } });
+    const row = importsRepo.get(id);
+    if (row === null) return reply.code(404).send({ ok: false, error: { code: 'NOT_FOUND', message: '来源不存在', next: '' } });
+    return { ok: true, import: row };
+  });
+
+  app.delete('/api/imports/:id', async (req, reply) => {
+    const id = Number((req.params as { id: string }).id);
+    if (!Number.isInteger(id) || id <= 0) return reply.code(404).send({ ok: false, error: { code: 'NOT_FOUND', message: '来源不存在', next: '' } });
+    return { ok: importsRepo.delete(id) };
   });
 
   // Task 6:SSE 事件流——query token(D3,EventSource 无法设 header);终态 job 立即补发并关闭
@@ -382,8 +440,8 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
     if (old.status !== 'error') {
       return reply.code(409).send({ ok: false, error: { code: 'NOT_RETRYABLE', message: '只有失败的任务可以重试', next: '' } });
     }
-    let payload: { url?: string; options?: unknown; title?: unknown; durationSec?: unknown };
-    try { payload = JSON.parse(old.payload) as typeof payload; } catch {
+    let payload: Partial<DownloadJobPayload>;
+    try { payload = JSON.parse(old.payload) as Partial<DownloadJobPayload>; } catch {
       return reply.code(400).send({ ok: false, error: { code: 'BAD_REQUEST', message: '原任务参数损坏，无法重试', next: '重新提交下载' } });
     }
     if (typeof payload.url !== 'string') {
@@ -396,23 +454,63 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
     }
     const newId = jobsRepo.create('ytdlp_download', payload);
     jobsRepo.update(newId, { status: 'running' });
-    // 复用 Task 5 的 startDownload;原 title/durationSec 一并透传(否则重试后标题回落"下载音频")
+    // 复用 Task 5 的 startDownload;原 title/durationSec/剧集字段一并透传(否则重试后标题回落"下载音频"、第几集丢失)
     await startDownload(newId, {
       url: payload.url,
       options: (payload.options ?? {}) as Record<string, unknown>,
       title: typeof payload.title === 'string' ? payload.title : undefined,
       durationSec: typeof payload.durationSec === 'number' ? payload.durationSec : undefined,
+      entryIndex: typeof payload.entryIndex === 'number' ? payload.entryIndex : null,
+      collectionTitle: typeof payload.collectionTitle === 'string' ? payload.collectionTitle : null,
     });
     return reply.code(201).send({ ok: true, jobId: newId });
   });
 
   // Task 7:音频列表——spec 0.3:返回数组(非 {ok,items});list() 已按 created_at DESC(§0.4)
-  app.get('/api/audio', async () => audioRepo.list());
+  // 2026-09-29 用户拍板:每行带 site(由 source_url 反查平台)→ 前端音频库显示平台 logo
+  // 2026-09-29 用户拍板(补齐老记录):改动前入库的音频没记「所属合集 / 第几集」,但来源网址还在——
+  // 拿它反查 imported_sources(解析时落库的那张表)就能把番剧名补回来;集数只在分集清单里
+  // **唯一命中同名条目**时才判定(同名多条一律不猜:宁可不显示,也不显示错的集数)。已记录的值优先,不覆盖。
+  const fillEpisodeFromImport = (row: AudioItemRow): { collection_title?: string; entry_index?: number } => {
+    if (row.collection_title !== null && row.entry_index !== null) return {}; // 下载时已记全,不必反查
+    if (row.source_url === null) return {};
+    const src = importsRepo.getByUrl(row.source_url);
+    if (src === null || src.kind !== 'playlist') return {}; // 单视频没有「第几集」可言,不补
+    const out: { collection_title?: string; entry_index?: number } = {};
+    if (row.collection_title === null) out.collection_title = src.title;
+    if (row.entry_index === null) {
+      const hits = (src.entries ?? []).filter((e) => e.title === row.title);
+      if (hits.length === 1) out.entry_index = hits[0]!.index;
+    }
+    return out;
+  };
+  app.get('/api/audio', async () =>
+    audioRepo.list().map((row) => ({ ...row, ...fillEpisodeFromImport(row), site: detectSite(row.source_url ?? '') })),
+  );
 
   // 诊断日志(2026-09-29 用户反馈):环形缓冲最近 500 条,前端"日志"按钮拉取。
   // 守卫不需要改——index.ts 的 onRequest 对 /api/* 校验 token(localhost 来源豁免),
   // 浏览器直连(localhost)与 Electron(file:// + x-sct-token 头)都可达。
   app.get('/api/logs', async () => ({ ok: true, logs: getLogs() }));
+
+  // 前端操作日志汇入(2026-09-29 用户拍板:前端做什么操作都发给后端,统一系统里看"当时发生了什么")
+  app.post('/api/logs', async (req, reply) => {
+    const body = (req.body ?? {}) as { level?: unknown; message?: unknown };
+    if (typeof body.message !== 'string' || body.message.trim().length === 0) {
+      return reply.code(400).send({ ok: false, error: { code: 'BAD_REQUEST', message: 'message 必填(非空字符串)', next: '' } });
+    }
+    pushLog(body.level === 'error' ? 'error' : 'info', 'web', body.message);
+    return { ok: true };
+  });
+
+  // 清空日志(2026-09-29 用户拍板:日志要可删除):?day=YYYY-MM-DD 只清该天,缺省清全部(内存缓冲 + 落盘文件)
+  app.delete('/api/logs', async (req) => {
+    const q = (req.query ?? {}) as { day?: string };
+    const day = typeof q.day === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(q.day) ? q.day : undefined;
+    const r = clearLogs(day);
+    pushLog('info', 'server', `logs cleared day=${day ?? '(all)'} entries=${r.clearedEntries} files=${r.deletedFiles.length} failed=${r.failedFiles.length}`); // 清完留一行,面板不至于空白
+    return { ok: true, ...r };
+  });
 
   // Task 7:音频文件流——D3 query token(<audio> 标签无法设 header);P2-5:非正整数 id → 404,避免 NaN 查询行为未定义
   app.get('/api/audio/:id/file', async (req, reply) => {
@@ -428,10 +526,29 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
     const item = audioRepo.get(id);
     if (!item) return reply.code(404).send({ ok: false, error: { code: 'NOT_FOUND', message: '音频不存在', next: '' } });
     if (!existsSync(item.file_path)) return reply.code(404).send({ ok: false, error: { code: 'FILE_MISSING', message: '文件已丢失', next: '' } });
+    const stat = statSync(item.file_path);
+    // Range 支持(2026-09-29 用户反馈:音频进度条拉不动)——浏览器拖动进度条发 Range 头期待 206 部分内容;
+    // 之前声明 accept-ranges 却永远回 200 全量,浏览器锁死进度条。现在真正处理 Range:
+    const range = req.headers.range;
     reply
       .header('content-type', MIME[item.format] ?? 'application/octet-stream')
       .header('content-disposition', 'inline')
       .header('accept-ranges', 'bytes');
+    const m = typeof range === 'string' ? /^bytes=(\d*)-(\d*)$/.exec(range.trim()) : null;
+    if (m !== null && ((m[1] ?? '') !== '' || (m[2] ?? '') !== '')) {
+      const size = stat.size;
+      const startRaw = m[1] ?? '';
+      const endRaw = m[2] ?? '';
+      const start = startRaw !== '' ? parseInt(startRaw, 10) : 0;
+      const end = endRaw !== '' ? Math.min(parseInt(endRaw, 10), size - 1) : size - 1;
+      if (Number.isNaN(start) || Number.isNaN(end) || start > end || start >= size) {
+        reply.header('content-range', `bytes */${size}`);
+        return reply.code(416).send();
+      }
+      reply.code(206).header('content-range', `bytes ${start}-${end}/${size}`).header('content-length', end - start + 1);
+      return reply.send(createReadStream(item.file_path, { start, end }));
+    }
+    reply.header('content-length', stat.size);
     return reply.send(createReadStream(item.file_path));
   });
 

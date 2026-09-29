@@ -13,6 +13,7 @@ import { createJobsRepo } from '../db/repo/jobs.js';
 import { createAudioItemsRepo } from '../db/repo/audio-items.js';
 import { registerRequestLogging } from '../logs.js';
 import { createSettingsRepo } from '../db/repo/settings.js';
+import { createImportsRepo } from '../db/repo/imports.js';
 import { BILI_COOKIE_KEY, SETTINGS_KEYS } from '../settings-keys.js';
 import { registerSettingsRoutes } from '../http/settings-routes.js';
 
@@ -94,6 +95,30 @@ describe('POST /api/ytdlp/download', () => {
     const res = await app.inject({ method: 'POST', url: '/api/ytdlp/download', payload: { url: 'https://a/1', options: { format: 'mp3' } } });
     expect(res.statusCode).toBe(409);
     expect(res.json().error.code).toBe('DUPLICATE');
+  });
+  it('合集条目下载(带 entryIndices)跳过 URL 判重 → 201(批量闸门修复 2026-09-29)', async () => {
+    // 库里已有同一播放列表 URL 的条目(第 1 集已入库);第 2 集请求带 entryIndices → 不得 409,
+    // 否则每集请求共用同一 URL,批量永远只能下出第 1 集。假 DM 只记录 start,不真 spawn。
+    const dm = { start: vi.fn(), cancel: vi.fn(async () => {}), dispose: vi.fn(async () => {}) };
+    createAudioItemsRepo(db).create({ title: '第1集已入库', source_type: 'download', source_url: 'https://a/1', file_path: 'C:/x/1.mp3', format: 'mp3', duration_sec: null, file_size: 1 });
+    makeApp('yt-dlp', 'tok2', dm as unknown as ReturnType<typeof createDownloadManager>);
+    const res = await app.inject({ method: 'POST', url: '/api/ytdlp/download', payload: { url: 'https://a/1', title: '第2集', options: { format: 'mp3', entryIndices: [2] } } });
+    expect(res.statusCode).toBe(201);
+    expect(typeof res.json().jobId).toBe('number');
+  });
+  // 2026-09-29 用户拍板:合集条目下载带上「第几集/所属合集」→ 存进 job payload(retry 复用),入库后才写 audio_items
+  it('合集条目下载携带 entryIndex/collectionTitle → 存档进 job payload', async () => {
+    const dm = { start: vi.fn(), cancel: vi.fn(async () => {}), dispose: vi.fn(async () => {}) };
+    makeApp('yt-dlp', 'tok2', dm as unknown as ReturnType<typeof createDownloadManager>);
+    const res = await app.inject({
+      method: 'POST', url: '/api/ytdlp/download',
+      payload: { url: 'https://www.bilibili.com/list/1', title: '第 3 集', entryIndex: 3, collectionTitle: '某合集', options: { format: 'mp3', entryIndices: [3] } },
+    });
+    expect(res.statusCode).toBe(201);
+    const job = createJobsRepo(db).get(res.json().jobId as number)!;
+    const saved = JSON.parse(job.payload) as { entryIndex: number; collectionTitle: string };
+    expect(saved.entryIndex).toBe(3);
+    expect(saved.collectionTitle).toBe('某合集');
   });
   it('download 同 URL 已有 running job → 409 BUSY(P1-1)', async () => {
     // 预置一个 running 的同 URL job
@@ -301,6 +326,58 @@ describe('GET /api/audio 与 GET /api/audio/:id/file', () => {
     const res = await app.inject({ method: 'GET', url: '/api/audio' });
     expect(res.json()).toHaveLength(1);
     expect(res.json()[0].title).toBe('a');
+  });
+  // 2026-09-29 用户拍板:音频库要显示平台 logo / 第几集 / 所属合集 → 列表附带 site + 剧集两列
+  it('audio 列表带 site(由 source_url 反查平台)与剧集字段', async () => {
+    const audioRepo = createAudioItemsRepo(db);
+    audioRepo.create({ title: '第 3 集', source_type: 'download', source_url: 'https://www.bilibili.com/list/1', file_path: 'C:/x/3.mp3', format: 'mp3', duration_sec: null, file_size: 1, entry_index: 3, collection_title: '某合集' });
+    makeApp('yt-dlp', 'tok2');
+    const row = (await app.inject({ method: 'GET', url: '/api/audio' })).json()[0] as { site: string; entry_index: number; collection_title: string };
+    expect(row.site).toBe('bilibili');
+    expect(row.entry_index).toBe(3);
+    expect(row.collection_title).toBe('某合集');
+  });
+  // 2026-09-29 用户拍板(补齐老记录):改动前入库的音频只记了标题+来源网址,合集名/集数两列是空的 →
+  // 拿 source_url 反查 imported_sources 把番剧名补回来(集数只在分集清单唯一命中同名条目时才判定)
+  it('老音频(未记合集/集数)→ 按 source_url 反查导入来源,补出番剧名与集数', async () => {
+    const srcUrl = 'https://www.bilibili.com/bangumi/play/ss28747';
+    createImportsRepo(db).upsertByUrl({
+      url: srcUrl, title: '凡人修仙传', site: 'bilibili', kind: 'playlist', duration_sec: null,
+      entries: [{ index: 93, title: '条目 93' }, { index: 94, title: '条目 94' }],
+    });
+    createAudioItemsRepo(db).create({ title: '条目 94', source_type: 'download', source_url: srcUrl, file_path: 'C:/x/94.mp3', format: 'mp3', duration_sec: null, file_size: 1 });
+    makeApp('yt-dlp', 'tok2');
+    const row = (await app.inject({ method: 'GET', url: '/api/audio' })).json()[0] as { collection_title: string; entry_index: number; site: string };
+    expect(row.collection_title).toBe('凡人修仙传');
+    expect(row.entry_index).toBe(94);
+    expect(row.site).toBe('bilibili');
+  });
+  it('分集清单里有多条同名条目 → 补合集名但不猜集数(宁缺勿错)', async () => {
+    const srcUrl = 'https://www.bilibili.com/bangumi/play/ss9';
+    createImportsRepo(db).upsertByUrl({
+      url: srcUrl, title: '某合集', site: 'bilibili', kind: 'playlist', duration_sec: null,
+      entries: [{ index: 1, title: '同名' }, { index: 2, title: '同名' }],
+    });
+    createAudioItemsRepo(db).create({ title: '同名', source_type: 'download', source_url: srcUrl, file_path: 'C:/x/dup.mp3', format: 'mp3', duration_sec: null, file_size: 1 });
+    makeApp('yt-dlp', 'tok2');
+    const row = (await app.inject({ method: 'GET', url: '/api/audio' })).json()[0] as { collection_title: string; entry_index: number | null };
+    expect(row.collection_title).toBe('某合集');
+    expect(row.entry_index).toBeNull();
+  });
+  it('单视频来源(kind=single)不补集数;下载时已记的值不被覆盖', async () => {
+    const singleUrl = 'https://www.youtube.com/watch?v=1';
+    createImportsRepo(db).upsertByUrl({ url: singleUrl, title: '某单曲', site: 'youtube', kind: 'single', duration_sec: null, entries: null });
+    const audioRepo = createAudioItemsRepo(db);
+    audioRepo.create({ title: '某单曲', source_type: 'download', source_url: singleUrl, file_path: 'C:/x/s.mp3', format: 'mp3', duration_sec: null, file_size: 1 });
+    audioRepo.create({ title: '条目 5', source_type: 'download', source_url: 'https://www.bilibili.com/list/9', file_path: 'C:/x/5.mp3', format: 'mp3', duration_sec: null, file_size: 1, entry_index: 5, collection_title: '入库时记的合集' });
+    makeApp('yt-dlp', 'tok2');
+    const rows = (await app.inject({ method: 'GET', url: '/api/audio' })).json() as Array<{ title: string; collection_title: string | null; entry_index: number | null }>;
+    const single = rows.find((r) => r.title === '某单曲')!;
+    expect(single.collection_title).toBeNull();
+    expect(single.entry_index).toBeNull();
+    const recorded = rows.find((r) => r.title === '条目 5')!;
+    expect(recorded.collection_title).toBe('入库时记的合集');
+    expect(recorded.entry_index).toBe(5);
   });
 });
 

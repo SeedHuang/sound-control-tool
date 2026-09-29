@@ -58,8 +58,9 @@ M1 前半使命：**贴一个网页 URL（B 站课程/YouTube/播客等）→ �
   - `entries`：合集才返回；`index` 从 1 起（yt-dlp 的 playlist-items 从 1 起）
 - 失败 4xx/5xx `{ ok:false, error:{...} }`（D9 映射）
 
-**POST `/api/ytdlp/download`**（body: `{ url, options: { entryIndices?: number[], section?: { start:number, end:number }, format:'mp3'|'m4a'|'wav', quality?: string, force?: boolean }, title?: string, durationSec?: number }`）
+**POST `/api/ytdlp/download`**（body: `{ url, options: { entryIndices?: number[], section?: { start:number, end:number }, format:'mp3'|'m4a'|'wav', quality?: string, force?: boolean }, title?: string, durationSec?: number, entryIndex?: number, collectionTitle?: string }`）
 - `title?`：前端从 parse 结果带入的显示名，作入库 title 与文件名 slug（D5c）。缺省时 finalize 用 `'下载音频'`
+- `entryIndex?` / `collectionTitle?`（**2026-09-29 增补**，用户拍板：音频库要显示「第几集 / 该集自己的名字」）：前端下载合集某集时带入 `entryIndex=条目 index`、`collectionTitle=合集 title`，随 job payload 一起存（retry 复用），入库时写进 `audio_items.entry_index / collection_title`。非法或缺省 → 落 NULL（视为单视频），**不因它拦下载**
 - `durationSec?`：前端从 parse 结果带入（D10），作入库 duration；**`section` 存在时忽略此值，强制 ffprobe 实测**（P1-3 修复：片段产物时长 ≠ 整条时长）；缺省则 ffprobe 兜底
 - 校验：format 非法 → 400；section 存在且 `start<0 || end<=start` → 400；`entryIndices` 存在时必须是**长度 1 的数组** `[i]` 且 `i` 为正整数（D8：单产物模型，多选由前端逐条提交）→ 违反 400
 - 重复（有同 URL download 条目且 `!force`）→ 409 `{ ok:false, error:{ code:'DUPLICATE', ... } }`
@@ -82,7 +83,9 @@ M1 前半使命：**贴一个网页 URL（B 站课程/YouTube/播客等）→ �
 - **仅限 `error` 状态的 job**（对 `running`/`pending` 重试会造出同 URL 并发——P1-1 同族）；原 job 非 error → 409 `{ ok:false, error:{ code:'NOT_RETRYABLE', message:'只有失败的任务可以重试', next:'' } }`
 - 建新 job **前**同样过 `findActiveByUrl` 并发检查（命中即 409 BUSY，同 §0.3 download）——防"旧 job 已 error 但同 URL 另有 running job"的窗口
 
-**GET `/api/audio`** → 200 `[{ id, title, source_type, format, duration_sec, file_size, created_at }]`（按 created_at DESC）
+**GET `/api/audio`** → 200 `[{ id, title, source_type, source_url, entry_index, collection_title, format, duration_sec, file_size, created_at, site }]`（按 created_at DESC）
+- **2026-09-29 增补**（用户拍板：音频库要显示平台 logo + 原视频地址 + 第几集）：出参在 repo 行基础上补两个字段——`entry_index / collection_title`（入库时写入，单视频为 `null`）；`site` 由 `source_url` 反查（`detectSite`，`bilibili|youtube|other`），**不新增列**。返回结构仍是数组（非 `{ok,items}`），搜索/分页在前端本地做（库为本地单机、条目量小，输入即响应）
+- **2026-09-29 增补（补齐老记录）**：改动前入库的音频没记 `entry_index / collection_title`（当时还没这两列），这两列如今为空 → 出参时拿 `source_url` 反查 `imported_sources`（解析成功时落库的那张表）补齐：合集名直接取该来源的 `title`；集数只在**该来源 kind='playlist' 且分集清单里唯一命中同名条目**时才判定（同名多条一律留空，宁缺勿错）。下载时已记录的值优先，绝不被反查结果覆盖
 
 **GET `/api/audio/:id/file`**（query: `token` 必填）→ 200 流式（`Content-Type` 按扩展名：mp3→`audio/mpeg`、m4a→`audio/mp4`、wav→`audio/wav`；`Content-Disposition: inline`）
 - `id` 非正整数（`Number('abc')`/0/负数）→ 404（P2-5）
@@ -99,15 +102,15 @@ M1 前半使命：**贴一个网页 URL（B 站课程/YouTube/播客等）→ �
 - `findActiveByUrl(url): { id:number } | null`（kind='ytdlp_download' 且 status IN ('pending','running') 且 payload 的 url 匹配——**payload 是 JSON 文本，用 `LIKE` 匹配 `"url":"<escaped>"` 子串**，防同 URL 并发 P1-1）
 
 `server/src/db/repo/audio-items.ts`（新建）：
-- `create(item: { title, source_type, source_url, file_path, format, duration_sec, file_size }): number`（返回 lastInsertRowid）
+- `create(item: { title, source_type, source_url, file_path, format, duration_sec, file_size, entry_index?, collection_title? }): number`（返回 lastInsertRowid；后两个可选，不传即落 NULL）
 - `list(): AudioItemRow[]`（按 created_at DESC）
 - `get(id): AudioItemRow | null`
 - `findBySourceUrl(url): AudioItemRow | null`（source_type='download' 且 source_url=?）
 - `updateFilePath(id, file_path): void`（D5 入库第二段）
 - `delete(id): void`（入库失败回滚用，P1-2）
-- `AudioItemRow` 类型：`{ id, title, source_type, source_url, file_path, format, duration_sec, file_size, created_at }`
+- `AudioItemRow` 类型：`{ id, title, source_type, source_url, entry_index, collection_title, file_path, format, duration_sec, file_size, created_at }`
 
-`server/src/db/schema.ts` 不动（表已齐）。
+`server/src/db/schema.ts` 增补（**2026-09-29**，之前是"不动"）：`audio_items` 加两列 `entry_index INTEGER` / `collection_title TEXT`，并在 `initSchema` 里用 `PRAGMA table_info` + `ALTER TABLE` 幂等补列——`CREATE TABLE IF NOT EXISTS` 只对"表不存在"生效，老库不补列就会在写入时报"no such column"。
 
 ### 0.5 yt-dlp 集成层（`server/src/ytdlp/` 新建目录）
 
@@ -137,7 +140,7 @@ M1 前半使命：**贴一个网页 URL（B 站课程/YouTube/播客等）→ �
 | 页面 | 路由 | 内容 |
 |---|---|---|
 | `acquire.tsx` | `/acquire` | Tab1 URL 下载：输入 URL → parse（重复检测提示）→ 合集勾选（默认勾当前页单条）/片段起止/格式+码率选择 → 提交下载 → SSE 进度条（可取消；合集逐条串行）→ 完成后"去音频库"入口 |
-| `library.tsx` | `/library` | `GET /api/audio` 列表（antd List/Table + Empty 空态），行内 `<audio controls src="/api/audio/:id/file?token=..." />` 播放 |
+| `library.tsx` | `/library` | `GET /api/audio` 列表（antd Empty 空态），行内 `<audio controls src="/api/audio/:id/file?token=..." />` 播放。**2026-09-29 用户拍板增补**：每行显示平台 logo（`site` → `SiteLogo` 官方品牌矢量标）+ 名称（合集条目取 `collection_title`）+ `第 N 集`标签（`entry_index`）+ 该集自己的名字（`title`）+ 原视频地址（`source_url`，`target=_blank`，Electron 侧由 `setWindowOpenHandler` 转系统浏览器）+ 删除；顶部搜索框按名字本地过滤，底部分页（默认 10/页，可 10/20/50）；整页三段式（头/列表自滚/页脚），窄窗自动折行 |
 
 `web/src/api.ts` 增补：`parseUrl(url)`、`startDownload(payload)`、`subscribeJob(jobId, { onProgress, onStatus, onDone, onError, signal })`（EventSource + query token）、`cancelJob(jobId)`、`retryJob(jobId)`、`listAudio()`、`audioFileUrl(id, token)`。
 

@@ -41,7 +41,7 @@ export function registerCors(app: FastifyInstance): void {
     handler: async (req, reply) => {
       const origin = req.headers.origin;
       reply
-        .header('access-control-allow-methods', 'GET,PUT,POST,OPTIONS')
+        .header('access-control-allow-methods', 'GET,PUT,POST,DELETE,OPTIONS')
         .header('access-control-allow-headers', 'content-type, x-sct-token')
         .header('access-control-max-age', '86400');
       if (origin && isAllowedOrigin(origin)) {

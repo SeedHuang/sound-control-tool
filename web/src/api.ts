@@ -24,9 +24,20 @@ export interface LogRow { ts: string; level: 'info' | 'error'; source: string; m
 const feLogs: LogRow[] = [];
 const FE_LOG_CAP = 200;
 
+// 上报通道:直连 fetch(不走 apiPost)——apiPost 失败时会调 logFe 记错误,若上报失败也走它会造成"失败→记日志→再上报→再失败"自旋。
+function shipLogToBackend(level: LogRow['level'], message: string): void {
+  const headers: Record<string, string> = { 'content-type': 'application/json' };
+  const token = apiToken();
+  if (token) headers['x-sct-token'] = token;
+  void fetch(`${API_BASE}/api/logs`, { method: 'POST', headers, body: JSON.stringify({ level, message }) }).catch(() => {
+    /* 上报失败静默:本地缓冲仍在;server 没起时不刷屏不递归 */
+  });
+}
+
 export function logFe(level: LogRow['level'], message: string): void {
   feLogs.push({ ts: new Date().toISOString(), level, source: 'web', message });
   if (feLogs.length > FE_LOG_CAP) feLogs.splice(0, feLogs.length - FE_LOG_CAP);
+  shipLogToBackend(level, message); // 2026-09-29 用户拍板:前端所有操作日志同步上报后端,统一系统可查"当时发生了什么"
 }
 
 export function getFeLogs(): LogRow[] {
@@ -85,16 +96,19 @@ export async function apiPost<T>(path: string, body: unknown): Promise<T> {
   } finally { clearTimeout(timer); }
 }
 
-// spec §0.3 接口契约:parse 返回 kind/title/duration_sec/entries/existing
+// spec §0.3 接口契约:parse 返回 kind/title/duration_sec/entries/existing;2026-09-29 增 import_id(解析成功自动落库的来源行 id)
 export interface ParseResponse {
   ok: boolean; kind: 'single' | 'playlist'; title: string; duration_sec?: number;
   entries?: { index: number; title: string }[];
   existing?: { audioId: number; title: string };
+  import_id?: number;
 }
 export interface DownloadPayload {
   url: string;
   title?: string;
   durationSec?: number;
+  entryIndex?: number;      // 合集第几集(1 起);单视频不传(2026-09-29 用户拍板:音频库要显示第几集)
+  collectionTitle?: string; // 所属合集标题;单视频不传
   options: { entryIndices?: number[]; section?: { start: number; end: number }; format: 'mp3' | 'm4a' | 'wav'; quality?: string; force?: boolean };
 }
 
@@ -127,7 +141,13 @@ export async function retryJob(jobId: number): Promise<{ ok: boolean; jobId: num
 export async function listAudio(): Promise<AudioRow[]> {
   return apiGet<AudioRow[]>('/api/audio');
 }
-export interface AudioRow { id: number; title: string; source_type: string; format: string; duration_sec: number | null; created_at: string }
+export interface AudioRow {
+  id: number; title: string; source_type: string; format: string; duration_sec: number | null; created_at: string;
+  source_url: string | null;      // 原视频地址(后端返回;音频库展示 + 可点开)
+  site: string;                   // 平台标识(bilibili/youtube/other,后端由 source_url 反查)→ 音频库显示 logo
+  entry_index: number | null;     // 合集第几集;单视频/录制 → null
+  collection_title: string | null; // 所属合集标题;非合集 → null
+}
 
 export function audioFileUrl(id: number): string {
   const token = apiToken();
@@ -228,4 +248,33 @@ export async function deleteAudio(audioId: number): Promise<{ ok: boolean; delet
   const r = await apiDelete<{ ok: boolean; deleted: boolean }>(`/api/audio/${audioId}`);
   logFe('info', `deleteAudio id=${audioId} deleted=${r.deleted}`);
   return r;
+}
+
+// ---- 导入来源(2026-09-29 用户拍板:parse 成功自动落库,获取页左列表持久化) ----
+export interface ImportSource { id: number; url: string; title: string; site: string; kind: 'single' | 'playlist'; entry_count: number; created_at: string }
+export interface ImportDetail extends Omit<ImportSource, 'entry_count'> { duration_sec: number | null; entries: { index: number; title: string }[] | null }
+
+/** 左列表(新→旧;轻量,不带 entries) */
+export async function listImports(): Promise<ImportSource[]> {
+  const r = await apiGet<{ ok: boolean; imports: ImportSource[] }>('/api/imports');
+  return r.imports;
+}
+
+/** 来源详情(含集数缓存——点左列表秒开,不重新解析) */
+export async function getImport(id: number): Promise<ImportDetail> {
+  const r = await apiGet<{ ok: boolean; import: ImportDetail }>(`/api/imports/${id}`);
+  return r.import;
+}
+
+/** 删除左列表条目(不影响已下载音频) */
+export async function deleteImport(id: number): Promise<void> {
+  logFe('info', `deleteImport id=${id}`);
+  await apiDelete(`/api/imports/${id}`);
+}
+
+// ---- 日志清空(2026-09-29 用户拍板:日志要可删除) ----
+/** DELETE /api/logs[?day=]:清空后端内存日志 + 删除落盘文件;day=YYYY-MM-DD 只清该天,缺省全清 */
+export async function clearServerLogs(day?: string): Promise<{ ok: boolean; clearedEntries: number; deletedFiles: string[]; failedFiles: string[] }> {
+  logFe('info', `clearServerLogs day=${day ?? '(all)'}`); // 本地缓冲也留痕
+  return apiDelete(`/api/logs${day ? `?day=${encodeURIComponent(day)}` : ''}`);
 }
