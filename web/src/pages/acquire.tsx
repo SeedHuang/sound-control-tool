@@ -57,6 +57,7 @@ export default function AcquirePage() {
       const entries = parsed.kind === 'playlist' && parsed.entries ? checked : [0]; // [0] 表示非合集(不带 entryIndices)
       let lastDone: { audioId: number; title: string } | null = null;
       for (const entryIndex of entries) {
+        setDone(null); // 每条开始前重置:合集多条时上一条 onDone 已置 done,避免进度/取消被隐藏而误报"已入库"
         const { jobId: jid } = await startDownload({
           url,
           title: entryIndex === 0 ? parsed.title : parsed.entries!.find((e) => e.index === entryIndex)?.title ?? parsed.title,
