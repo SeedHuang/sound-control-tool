@@ -46,6 +46,7 @@ M1 前半使命：**贴一个网页 URL（B 站课程/YouTube/播客等）→ �
 | D8 | **单条下载强制 `--no-playlist`**；合集多选**由前端逐条提交**（每条一个 download 请求 + 一个 job），`entryIndices` 限定为**单元素** `[i]` 服务端换算 `--playlist-items i` | FR-1.1 防误下整个合集；服务端换算避免前端拼 shell 参数。**关键约束（同族扫描发现）**：finalize 是单产物入库模型（findLatest 只取 mtime 最新一个文件），一次 `--playlist-items 1,3` 会下载多个文件到 tempDir，其余成孤儿丢失——故禁止一次多产物，多选必须逐条提交 |
 | D9 | **错误映射 `mapYtdlpError`**：spawn ENOENT→"yt-dlp 未找到，请到设置页配置路径"；非零退出→取 stderr 关键行，按已知特征（DRM/需登录/站点不支持/网络）映射中文 message + `next`（可执行下一步）；未知→原样摘要 | FR-1.5 每条错误必须附"下一步"，不得只抛原始 stderr |
 | D10 | 下载完成后 **duration 取下载期 parse 传入的 `durationSec`**（download payload 可选带 `durationSec`，前端从 parse 结果带入）；**`section`（片段下载）存在时忽略 `durationSec`，强制 `ffprobe` 实测**——片段产物时长 ≠ 整条时长，用 parse 值会把错误时长持久化（P1-3）；无 section 且无 durationSec 时 ffprobe 兜底（binProvider 已有 ffmpeg 路径，`ffprobe -show_entries format=duration`），仍无则 null | 入库 duration_sec 尽量准确，剪辑 S5 依赖它定位时间轴；避免下载时再跑一次 `-J` 的额外开销 |
+| D11 | **B 站 Cookie 由用户在设置页粘贴**（2026-09-29 增补，实测 B 站对无 Cookie 的 yt-dlp 请求全面 412 风控）：设置页 TextArea 粘贴（Netscape cookies.txt 或 cookie-editor JSON，`normalizeCookieContent` 归一化）→ `PUT /api/cookie` 存 settings 表 `bili_cookie` 键（**故意不入 SETTINGS_KEYS 白名单**——GET /api/settings 不回传凭据）→ parse/download spawn 时 `materializeCookieFile` 写数据目录 `cookies.txt` 并注入 `--cookies`。凭据安全：内容不回传 UI（GET /api/cookie 只回 set/length）、日志只记长度、cookies.txt 在 gitignore 数据目录。过期处理：重新导出粘贴覆盖 | B 站 412 实测（番剧+普通视频均拦）；yt-dlp 官方 Cookie 机制；浏览器插件导出是最稳方案（不受浏览器加密升级影响，用户拍板） |
 
 ### 0.3 接口契约
 
