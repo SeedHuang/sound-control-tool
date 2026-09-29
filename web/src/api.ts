@@ -148,3 +148,31 @@ export function subscribeJob(jobId: number, handlers: {
   };
   return () => es.close();
 }
+
+// ---- B 站 Cookie(2026-09-29 用户拍板):设置页粘贴 → PUT /api/cookie → server 保存 → yt-dlp --cookies 注入 ----
+export interface CookieStatus { ok: boolean; set: boolean; length: number }
+
+/** PUT 语义(与 apiPost 同款错误处理;/api/cookie 等写接口用) */
+export async function apiPut<T>(path: string, body: unknown): Promise<T> {
+  const headers: Record<string, string> = { 'content-type': 'application/json' };
+  const token = apiToken();
+  if (token) headers['x-sct-token'] = token;
+  const res = await fetch(`${API_BASE}${path}`, { method: 'PUT', headers, body: JSON.stringify(body) });
+  if (!res.ok) {
+    const j = (await res.json().catch(() => null)) as { error?: { message?: string; next?: string } } | null;
+    const msg = j?.error?.message ?? `请求失败 ${res.status}:${path}${j?.error?.next ? `。${j.error.next}` : ''}`;
+    logFe('error', `请求失败 ${path}: ${msg}`); // 诊断日志:业务错误(400)也进前端面板
+    throw new ApiError(msg);
+  }
+  return (await res.json()) as T;
+}
+
+/** GET /api/cookie:只回元数据(set/length);Cookie 内容永不回传 UI(server 端键不在 settings 白名单) */
+export function getCookieStatus(): Promise<CookieStatus> {
+  return apiGet<CookieStatus>('/api/cookie');
+}
+
+/** PUT /api/cookie:保存 Cookie 内容;服务端校验非空字符串,400 时抛 ApiError(message 含 next 指引) */
+export async function saveCookie(content: string): Promise<{ ok: boolean }> {
+  return apiPut<{ ok: boolean }>('/api/cookie', { content });
+}
