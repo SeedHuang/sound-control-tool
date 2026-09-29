@@ -529,7 +529,7 @@ git commit -m "feat(server): audio-items repo 与 jobs update/finish/fail"
   - `export function createDownloadManager(deps?: { spawn?: typeof spawn; execFile?: typeof execFile; findLatest?: (dir: string) => string | null }): DownloadManager`
   - `producedPath`：仅 `state:'done'` 时可能携带（下载产物绝对路径，`close(0)` 时用 `findLatest(outDir)` 解析），供路由层入库
 
-- [ ] **Step 1: 写测试（mock spawn 模拟进度/完成/失败/取消）**
+- [x] **Step 1: 写测试（mock spawn 模拟进度/完成/失败/取消）**
 
 ```ts
 // server/src/ytdlp/download.test.ts
@@ -587,12 +587,12 @@ describe('DownloadManager', () => {
 });
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cd server && pnpm test -- download.test.ts`
 Expected: FAIL（模块不存在）
 
-- [ ] **Step 3: 实现 download.ts**
+- [x] **Step 3: 实现 download.ts**
 
 ```ts
 // server/src/ytdlp/download.ts
@@ -702,12 +702,12 @@ export function createDownloadManager(deps?: { spawn?: typeof spawn; execFile?: 
 }
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `cd server && pnpm test -- download.test.ts`
 Expected: PASS
 
-- [ ] **Step 5: typecheck**
+- [x] **Step 5: typecheck**
 
 Run: `cd server && pnpm typecheck`
 Expected: exit 0
@@ -1850,12 +1850,12 @@ git commit -m "feat(web): 获取页(URL 下载 + SSE 进度)与音频库页(列�
 **Files:**
 - 无新增（验证为主）
 
-- [ ] **Step 1: 全量验证（三包）**
+- [x] **Step 1: 全量验证（三包）**
 
 Run: `pnpm typecheck && pnpm test && pnpm build`
 Expected: 三包 typecheck 0 错；`pnpm test` server 全绿（含既有 M0 + 新增 S2 用例）；build 三包 exit 0
 
-- [ ] **Step 2: 手工端到端（用户目验）**
+- [x] **Step 2: 手工端到端（用户目验）**
 
 1. `pnpm dev` 三进程起
 2. 浏览器/electron 打开 `#/acquire`：粘贴 B 站课程 URL → 解析出合集列表（默认勾第 1 条）→ 选 mp3 → 下载 → SSE 进度条到 100% → 提示入库
@@ -1866,13 +1866,13 @@ Expected: 三包 typecheck 0 错；`pnpm test` server 全绿（含既有 M0 + �
 7. 片段下载（输起止时间）→ 完成后库中条目时长 ≈ 片段时长而非整条（P1-3）
 8. 设置页把 yt-dlp 路径清空 → 解析报 `YTDLP_NOT_FOUND` + 设置页指引
 
-- [ ] **Step 3: 文档回写（落地扫描）**
+- [x] **Step 3: 文档回写（落地扫描）**
 
 - `docs/superpowers/specs/m1a-ytdlp-pipeline.md`：按实测修订（进度模板格式、SSE 细节、任何偏差）
 - `.superpowers/sdd/2026-09-28-m1a-ytdlp-pipeline/progress.md`：逐 Task 台账
 - **落地扫描**（用户规则）：用 `Get-ChildItem docs -Recurse -Include *.md | Select-String -Pattern '未做|未验证|待建|TODO'` 检查所有"声明 S2 状态"的地方，含 PRD §6.1-S2（若标记为待开发）——确保无过时描述
 
-- [ ] **Step 4: Commit（若 Step 2 有代码修正）**
+- [x] **Step 4: Commit（若 Step 2 有代码修正）**
 
 ```bash
 git add -A
