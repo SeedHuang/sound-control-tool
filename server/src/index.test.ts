@@ -128,4 +128,43 @@ describe('createServer(D12 API token)', () => {
     await s.close();
     await expect(s.close()).resolves.toBeUndefined();
   });
+
+  it('D3:GET /api/jobs/1/events 无 header token、无 Origin、query token 正确 → 到路由(404 job 不存在,非守卫 401)', async () => {
+    const s = await createServer({ port: 7367, dbPath: ':memory:', tempDir: path.join(tmp(), 't17') });
+    const res = await fetch(`http://127.0.0.1:${s.port}/api/jobs/1/events?token=${s.token}`);
+    expect(res.status).toBe(404);
+    const body = (await res.json()) as { error?: { code?: string } };
+    expect(body.error?.code).toBe('NOT_FOUND');
+    await s.close();
+  });
+
+  it('D3:GET /api/audio/1/file 无 header token、无 Origin、query token 正确 → 到路由(404 音频不存在,非守卫 401)', async () => {
+    const s = await createServer({ port: 7368, dbPath: ':memory:', tempDir: path.join(tmp(), 't18') });
+    const res = await fetch(`http://127.0.0.1:${s.port}/api/audio/1/file?token=${s.token}`);
+    expect(res.status).toBe(404);
+    const body = (await res.json()) as { error?: { code?: string } };
+    expect(body.error?.code).toBe('NOT_FOUND');
+    await s.close();
+  });
+
+  it('D3:query token 错误时 events/audio 由路由返回 401 UNAUTHORIZED(非守卫"缺少或无效的 API token")', async () => {
+    const s = await createServer({ port: 7369, dbPath: ':memory:', tempDir: path.join(tmp(), 't19') });
+    for (const p of ['/api/jobs/1/events?token=wrong', '/api/audio/1/file?token=wrong']) {
+      const res = await fetch(`http://127.0.0.1:${s.port}${p}`);
+      expect(res.status).toBe(401);
+      const body = (await res.json()) as { error?: { code?: string; message?: string } };
+      expect(body.error?.code).toBe('UNAUTHORIZED');
+      expect(body.error?.message).not.toBe('缺少或无效的 API token');
+    }
+    await s.close();
+  });
+
+  it('D3:豁免不扩散——/api/audio 列表无 header token、无 Origin 仍被守卫 401', async () => {
+    const s = await createServer({ port: 7370, dbPath: ':memory:', tempDir: path.join(tmp(), 't20') });
+    const res = await fetch(`http://127.0.0.1:${s.port}/api/audio`);
+    expect(res.status).toBe(401);
+    const body = (await res.json()) as { error?: string };
+    expect(body.error).toBe('缺少或无效的 API token');
+    await s.close();
+  });
 });

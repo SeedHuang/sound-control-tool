@@ -77,6 +77,9 @@ export async function createServer(opts: CreateServerOpts): Promise<{
       // 精确匹配 pathname(去 query),避免顺带豁免 /api/health-check 之类的未来路由
       const pathname = req.url.split('?')[0] ?? '';
       if (pathname === '/api/health') return; // 只读 + 回退链需要
+      // D3:SSE 与音频文件端点无法设 header(EventSource/<audio>),token 走 query——豁免 header 校验,由路由内 query 校验接管
+      if (/^\/api\/jobs\/\d+\/events$/.test(pathname)) return;
+      if (/^\/api\/audio\/\d+\/file$/.test(pathname)) return;
       const origin = req.headers.origin;
       if (typeof origin === 'string' && isAllowedLocalOrigin(origin)) return; // dev 浏览器豁免(D12)
       if (req.headers['x-sct-token'] !== token) {
