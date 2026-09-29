@@ -18,6 +18,11 @@ const preStyle: CSSProperties = {
   wordBreak: 'break-all',
 };
 
+// 抽屉开着期间每秒拉一次前后端日志:
+// 原版只在「打开瞬间」拉一次,开着期间 menu 点击 / SSE 事件产生的 logFe 全看不到——
+// 用户反馈「菜单点了日志没出现」就是这个根因。1s 间隔对排查够即时,对网络/CPU 可忽略。
+const POLL_MS = 1000;
+
 /** 渲染"时间 [级别] 消息"一行一条,最新的在最上(打开先看到刚发生的);error 行加 [错误] 前缀 */
 function renderRows(rows: LogRow[]): string {
   return [...rows]
@@ -42,9 +47,12 @@ export default function LogsButton() {
     }
   }, []);
 
-  // 每次打开抽屉都拉最新后端日志 + 前端快照
+  // 抽屉打开瞬间拉一次 + 开着期间每秒轮询,确保 menu 点击 / SSE 事件产生的 logFe 立刻可见
   useEffect(() => {
-    if (open) void refresh();
+    if (!open) return;
+    void refresh();
+    const t = setInterval(() => { void refresh(); }, POLL_MS);
+    return () => clearInterval(t);
   }, [open, refresh]);
 
   return (

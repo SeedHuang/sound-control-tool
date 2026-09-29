@@ -1,6 +1,6 @@
-import { Alert, Button, Card, Descriptions, Input, Typography, message } from 'antd';
+import { Alert, Button, Card, Descriptions, Input, Modal, Typography, message } from 'antd';
 import { useEffect, useState } from 'react';
-import { apiGet, apiPort, getCookieStatus, saveCookie, type CookieStatus } from '@/api';
+import { ApiError, apiGet, apiPort, getCookieStatus, logFe, saveCookie, type CookieStatus } from '@/api';
 
 interface BinProbe {
   path: string | null;
@@ -47,10 +47,20 @@ function BinCard({ title, bin, loading }: { title: string; bin: BinProbe | null;
 
 // B 站 Cookie 卡片(2026-09-29 用户拍板):粘贴 → PUT /api/cookie 服务端保存 → yt-dlp --cookies 注入,解 B 站 412 风控
 const COOKIE_PLACEHOLDER = [
-  '粘贴 B 站 Cookie(推荐用浏览器插件 Get cookies.txt 导出 Netscape 格式;cookie-editor 的 JSON 也支持)。',
-  '步骤:① 浏览器登录 bilibili.com ② 插件导出当前站点 Cookie ③ 复制粘贴到此处 ④ 点保存。',
-  'Cookie 过期后(解析/下载报 412 或要求登录),重新导出并粘贴保存即可。',
+  '推荐:F12 → 网络面板 → 刷新页面 → 随便点一个 www.bilibili.com 的请求 → 右键 Copy → Copy as cURL (bash),整条粘贴到这里。',
+  '也支持:Get cookies.txt 插件导出的 Netscape 文本,或 cookie-editor 的 JSON。',
+  '保存时会自动调 B 站接口校验登录态;已有未过期登录信息时会先询问是否覆盖。',
+  '过期后(解析/下载报 412 或要求登录)重新导出覆盖即可。',
 ].join('\n');
+
+/** 状态行:条数 + 登录有效期(离线解析 SESSDATA;在线校验只在保存时做一次) */
+function cookieStatusText(s: CookieStatus | null): string {
+  if (s === null) return '状态未知(本地服务未连接)';
+  if (!s.set) return '未设置';
+  if (s.expired === true) return `已保存(${s.count} 条)·登录已过期,请重新导出`;
+  if (s.sessdataExpiry !== null) return `已保存(${s.count} 条)·登录有效期至 ${new Date(s.sessdataExpiry * 1000).toLocaleDateString('zh-CN')}`;
+  return `已保存(${s.count} 条)·有效期未知`;
+}
 
 function CookieCard() {
   const [status, setStatus] = useState<CookieStatus | null>(null);
@@ -66,23 +76,40 @@ function CookieCard() {
     void refresh();
   }, []);
 
-  const save = (): void => {
-    if (content.trim().length === 0 || saving) return;
-    setSaving(true);
-    saveCookie(content)
-      .then(() => {
-        message.success('已保存');
+  const doSave = (force: boolean): Promise<void> => {
+    logFe('info', `CookieCard.save length=${content.length}${force ? ' force' : ''}`);
+    return saveCookie(content, force)
+      .then((r) => {
+        message.success(r.uname !== null ? `已保存并验证登录(${r.uname})` : r.verified ? '已保存' : '已保存(在线校验未通过:网络原因)');
         setContent(''); // 保存成功清空输入框,凭据不留在页面
         return refresh();
       })
-      .catch((e: Error) => message.error(e.message))
+      .catch((e: unknown) => {
+        // 409 CONFLICT = 已有未过期登录信息(用户拍板:提示而不是默默覆盖)→ 弹窗确认后带 force 重发
+        if (e instanceof ApiError && e.code === 'CONFLICT') {
+          Modal.confirm({
+            title: '已存在有效的登录信息',
+            content: `${e.message}。要用新粘贴的覆盖吗?`,
+            okText: '仍然覆盖',
+            cancelText: '取消',
+            onOk: () => doSave(true),
+          });
+          return;
+        }
+        message.error(e instanceof Error ? e.message : String(e));
+      })
       .finally(() => setSaving(false));
+  };
+  const save = (): void => {
+    if (content.trim().length === 0 || saving) return;
+    setSaving(true);
+    void doSave(false);
   };
 
   return (
     <Card title="B 站 Cookie" style={{ marginBottom: 16 }}>
       <Typography.Paragraph type="secondary">
-        {status === null ? '状态未知(本地服务未连接)' : status.set ? `已保存(${status.length} 字符)` : '未设置'}
+        {cookieStatusText(status)}
       </Typography.Paragraph>
       <Input.TextArea
         rows={8}

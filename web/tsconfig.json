@@ -13,7 +13,8 @@
     "resolveJsonModule": true,
     "baseUrl": ".",
     "paths": {
-      "@/*": ["src/*"]
+      "@/*": ["src/*"],
+      "umi": ["src/.umi/exports.ts"]
     }
   },
   "include": ["src/**/*.ts", "src/**/*.tsx"]

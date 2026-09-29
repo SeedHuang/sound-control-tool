@@ -26,6 +26,11 @@ vi.mock('./parse.js', async (importOriginal) => {
   };
 });
 
+// bili-login 在线校验 mock(不发真网;cookie 校验逻辑本身在 bili-login 单测/真机验证覆盖)
+vi.mock('./bili-login.js', () => ({
+  validateBiliLogin: vi.fn(async () => ({ requestOk: true, isLogin: true, uname: '测试号' })),
+}));
+
 let db: DB;
 let app: FastifyInstance;
 let tempDir: string; // 每用例独立真实 tempDir(startDownload 会 mkdirSync 子目录;用 'C:/tmp' 会在机器上留残余)
@@ -379,7 +384,7 @@ describe('GET/PUT /api/cookie', () => {
     makeApp('yt-dlp');
     const res = await app.inject({ method: 'GET', url: '/api/cookie' });
     expect(res.statusCode).toBe(200);
-    expect(res.json()).toEqual({ ok: true, set: false, length: 0 });
+    expect(res.json()).toEqual({ ok: true, set: false, length: 0, count: 0, sessdataExpiry: null, expired: null });
   });
   it('PUT content 缺失/空白/非字符串 → 400', async () => {
     makeApp('yt-dlp');
@@ -404,6 +409,24 @@ describe('GET/PUT /api/cookie', () => {
     expect((await app.inject({ method: 'PUT', url: '/api/settings', payload: { bili_cookie: 'x' } })).statusCode).toBe(400);
     // 键常量本身也不在白名单数组里(双保险)
     expect(Object.values(SETTINGS_KEYS)).not.toContain(BILI_COOKIE_KEY);
+  });
+  it('PUT 游客 Cookie(无 SESSDATA)→ 400 NO_LOGIN_COOKIE', async () => {
+    makeApp('yt-dlp');
+    const res = await app.inject({ method: 'PUT', url: '/api/cookie', payload: { content: 'foo=bar; baz=qux' } });
+    expect(res.statusCode).toBe(400);
+    expect((res.json() as { error: { code: string } }).error.code).toBe('NO_LOGIN_COOKIE');
+  });
+  it('已有未过期登录信息 → PUT 409 CONFLICT;force=true 放行(用户拍板:提示已有登录信息而不是默默覆盖)', async () => {
+    makeApp('yt-dlp');
+    // 1804299628 = 2027-02 未来时间,保证「未过期」判定成立;值必须带 %2C 分段(SESSDATA 值格式)才能解析出过期时间
+    const content = '# Netscape HTTP Cookie File\n.bilibili.com\tTRUE\t/\tTRUE\t1804299628\tSESSDATA\ta%2C1804299628%2Cb';
+    const first = await app.inject({ method: 'PUT', url: '/api/cookie', payload: { content } });
+    expect(first.statusCode).toBe(200);
+    const dup = await app.inject({ method: 'PUT', url: '/api/cookie', payload: { content } });
+    expect(dup.statusCode).toBe(409);
+    expect((dup.json() as { error: { code: string } }).error.code).toBe('CONFLICT');
+    const force = await app.inject({ method: 'PUT', url: '/api/cookie', payload: { content, force: true } });
+    expect(force.statusCode).toBe(200);
   });
 });
 

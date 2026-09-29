@@ -1,6 +1,6 @@
 import { Alert, Button, Card, Checkbox, Input, Progress, Radio, Space, Spin, Typography } from 'antd';
 import { useEffect, useState } from 'react';
-import { cancelJob, parseUrl, startDownload, subscribeJob, type ParseResponse } from '@/api';
+import { cancelJob, logFe, parseUrl, startDownload, subscribeJob, type ParseResponse } from '@/api';
 
 export default function AcquirePage() {
   const [url, setUrl] = useState('');
@@ -36,6 +36,8 @@ export default function AcquirePage() {
 
   const onParse = async () => {
     setParsing(true); setError(null); setParsed(null);
+    // 诊断日志:用户点「解析」也要留痕,便于「点了没反应 / 卡死」时区分是前端没发还是后端没回
+    logFe('info', `onParse url=${url.slice(0, 80)}`);
     try {
       const r = await parseUrl(url);
       setParsed(r);
@@ -53,6 +55,8 @@ export default function AcquirePage() {
       return;
     }
     setBusy(true); setError(null); setDone(null); setPercent(0);
+    // 诊断日志:用户点「下载」按 force/entries 区分留痕,排查「点了没响应」「合集丢条目」时一眼定位
+    logFe('info', `onDownload force=${force} entries=${parsed.kind === 'playlist' ? checked.length : 1}`);
     try {
       const entries = parsed.kind === 'playlist' && parsed.entries ? checked : [0]; // [0] 表示非合集(不带 entryIndices)
       let lastDone: { audioId: number; title: string } | null = null;
@@ -101,7 +105,7 @@ export default function AcquirePage() {
             <Radio value="mp3">mp3</Radio><Radio value="m4a">m4a</Radio><Radio value="wav">wav</Radio>
           </Radio.Group>
           <br />
-          <Button type="primary" onClick={() => onDownload(false)} loading={busy} disabled={busy} style={{ marginTop: 12 }}>下载</Button>
+          <Button type="primary" onClick={() => onDownload(false)} loading={busy} disabled={busy} style={{ marginTop: 12 }}>{parsed.existing ? '重新下载' : '下载'}</Button>
         </div>
       )}
       {jobId !== null && !done && (

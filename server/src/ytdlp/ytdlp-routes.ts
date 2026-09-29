@@ -7,11 +7,13 @@ import type { DB } from '../db/index.js';
 import { isAllowedOrigin, isAllowedLocalOrigin } from '../http/cors.js';
 import { getLogs, pushLog } from '../logs.js';
 import { createAudioItemsRepo } from '../db/repo/audio-items.js';
+import { deleteAudioFile } from '../audio-files.js';
 import { createJobsRepo } from '../db/repo/jobs.js';
 import { createSettingsRepo } from '../db/repo/settings.js';
 import { BILI_COOKIE_KEY, SETTINGS_KEYS } from '../settings-keys.js';
 import { buildDownloadArgs } from './args.js';
-import { materializeCookieFile } from './cookies.js';
+import { countCookies, getSessdataExpiry, materializeCookieFile, normalizeCookieContent, toCookieHeader } from './cookies.js';
+import { validateBiliLogin } from './bili-login.js';
 import type { DownloadManager } from './download.js';
 import { mapYtdlpError } from './errors.js';
 import { probeDuration } from './ffprobe.js';
@@ -243,21 +245,59 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
   });
 
   // B 站 Cookie(2026-09-29 用户拍板:设置页粘贴 → server 保存 → yt-dlp --cookies 注入):
-  // GET 只回元数据(set/length),内容永不回传(键不在 SETTINGS_KEYS 白名单,GET /api/settings 也拿不到)
+  // GET 只回元数据(set/length/count/有效期),内容永不回传(键不在 SETTINGS_KEYS 白名单,GET /api/settings 也拿不到)
   app.get('/api/cookie', async () => {
     const content = createSettingsRepo(db).get(BILI_COOKIE_KEY);
-    return { ok: true, set: content !== null && content.trim().length > 0, length: content?.length ?? 0 };
+    const set = content !== null && content.trim().length > 0;
+    const count = set ? countCookies(content) : 0;
+    const expiry = set ? getSessdataExpiry(content) : null; // SESSDATA 过期 unix 秒;无登录凭据 → null
+    return { ok: true, set, length: content?.length ?? 0, count, sessdataExpiry: expiry, expired: expiry === null ? null : expiry * 1000 <= Date.now() };
   });
 
+  // PUT 流程(用户 2026-09-29 拍板「要做有效性校验;未过期提示已有登录信息」):
+  // ① 结构校验(必须带 SESSDATA 登录凭据)→ ② 已有未过期登录信息 → 409 弹确认(force 放行)→ ③ B 站 nav 在线验登录态 → 保存
   app.put('/api/cookie', async (req, reply) => {
-    const body = (req.body ?? {}) as { content?: unknown };
+    const body = (req.body ?? {}) as { content?: unknown; force?: unknown };
     if (typeof body.content !== 'string' || body.content.trim().length === 0) {
       return reply.code(400).send({ ok: false, error: { code: 'BAD_REQUEST', message: 'content 必填(非空字符串)', next: '粘贴 B 站 Cookie 内容后保存' } });
     }
-    createSettingsRepo(db).set(BILI_COOKIE_KEY, body.content);
-    // 日志只记长度不记内容(凭据不进诊断日志)
-    pushLog('info', 'job', `cookie saved (length=${body.content.length})`);
-    return { ok: true };
+    const force = body.force === true;
+    let netscape: string;
+    try {
+      netscape = normalizeCookieContent(body.content); // cURL 里没 Cookie 会在这里抛人话报错
+    } catch (e) {
+      return reply.code(400).send({ ok: false, error: { code: 'BAD_REQUEST', message: e instanceof Error ? e.message : 'Cookie 内容解析失败', next: '按设置页说明重新复制(F12 → Copy as cURL,选带登录 Cookie 的请求)' } });
+    }
+    const hasSessdata = netscape.split('\n').some((l) => { const c = l.split('\t'); return c.length >= 7 && c[5] === 'SESSDATA'; });
+    if (!hasSessdata) {
+      return reply.code(400).send({ ok: false, error: { code: 'NO_LOGIN_COOKIE', message: '解析不到登录凭据(SESSDATA)——这份 Cookie 只是游客设备指纹,过不了 B 站风控', next: '在已登录的浏览器:F12 → 网络面板 → 刷新 → 任选 www.bilibili.com 的请求 → 右键 Copy → Copy as cURL (bash) 重新粘贴' } });
+    }
+    const settingsRepo = createSettingsRepo(db);
+    const existing = settingsRepo.get(BILI_COOKIE_KEY);
+    if (existing !== null && !force) {
+      const existingExpiry = getSessdataExpiry(existing);
+      if (existingExpiry !== null && existingExpiry * 1000 > Date.now()) {
+        const until = new Date(existingExpiry * 1000).toISOString().slice(0, 10);
+        return reply.code(409).send({ ok: false, error: { code: 'CONFLICT', message: `已有一份有效的登录信息(有效期至 ${until})`, next: '确认要覆盖的话,在弹窗里点「仍然覆盖」' } });
+      }
+    }
+    // 在线校验:B 站官方 nav 接口验登录态;网络类失败(requestOk=false)不拦保存——Cookie 可能仍可用于 yt-dlp
+    const header = toCookieHeader(netscape);
+    let verified = false;
+    let uname: string | undefined;
+    if (header !== null) {
+      const v = await validateBiliLogin(header);
+      if (v.requestOk && !v.isLogin) {
+        return reply.code(400).send({ ok: false, error: { code: 'INVALID_COOKIE', message: `登录校验失败:${v.reason ?? '未登录'}`, next: 'Cookie 已过期或无效——请在浏览器重新登录后重新导出' } });
+      }
+      verified = v.requestOk ? v.isLogin : false;
+      uname = v.uname;
+    }
+    settingsRepo.set(BILI_COOKIE_KEY, body.content);
+    // 日志只记条数与校验结果,不记内容(凭据不进诊断日志)
+    const count = countCookies(netscape);
+    pushLog('info', 'job', `cookie saved (count=${count}, verified=${verified}${force ? ', force' : ''})`);
+    return { ok: true, count, verified, uname: uname ?? null };
   });
 
   // Task 6:SSE 事件流——query token(D3,EventSource 无法设 header);终态 job 立即补发并关闭
@@ -270,6 +310,8 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
     // 非 localhost(含 file://)仍需 token——本地请求只能来自本机,不新增攻击面
     const origin = typeof req.headers.origin === 'string' ? req.headers.origin : '';
     if (q.token !== token && !isAllowedLocalOrigin(origin)) {
+      // 诊断日志:401 要看清是 token 错还是 origin 不在白名单——查 SSE 断连必备
+      pushLog('error', 'job', `SSE 401 job=${id} origin=${origin || '(none)'} token=${q.token ? 'present' : 'missing'} localOrigin=${isAllowedLocalOrigin(origin)}`);
       return reply.code(401).send({ ok: false, error: { code: 'UNAUTHORIZED', message: 'token 无效', next: '' } });
     }
     const jobsRepo = createJobsRepo(db);
@@ -285,6 +327,8 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
     };
     if (origin !== '') sseHeaders.vary = 'Origin';
     if (allowOrigin !== null) sseHeaders['access-control-allow-origin'] = allowOrigin;
+    // 诊断日志(规则正例):hijacked 端点必须留 CORS 摘要——curl 不查 CORS,只有这行能解释「为什么浏览器没收到事件」
+    pushLog('info', 'job', `SSE open job=${id} origin=${origin || '(none)'} acao=${allowOrigin ?? '(none)'} local=${isAllowedLocalOrigin(origin)}`);
     reply.raw.writeHead(200, sseHeaders);
     // 立即冲刷响应头:Node 的 writeHead 只排队,首个 write/end 才真正发出头字节;
     // 不冲刷则客户端 fetch 会一直等响应头(心跳 15s 前的空闲连接头也不到客户端)
@@ -299,6 +343,8 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
       clearInterval(heartbeat);
       sseConnections.get(id)?.delete(conn);
       if (sseConnections.get(id)?.size === 0) sseConnections.delete(id);
+      // 诊断日志:客户端断开要留痕——浏览器关 tab / 心跳超时 / 浏览器 cancel,排查 SSE 异常中断必备
+      pushLog('info', 'job', `SSE close job=${id} remaining=${sseConnections.get(id)?.size ?? 0}`);
     });
     // 已结束的 job 立即补发终态
     if (['done', 'error', 'cancelled'].includes(job.status)) {
@@ -387,5 +433,20 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
       .header('content-disposition', 'inline')
       .header('accept-ranges', 'bytes');
     return reply.send(createReadStream(item.file_path));
+  });
+
+  // 2026-09-29 新增:DELETE /api/audio/:id —— 同时删 DB 行 + 磁盘文件
+  // 设计:删文件失败(ENOENT/权限)不让接口失败,只 log——DB 行已删就达到用户"删了"的语义
+  // (audio-files.ts 内部 try/catch 兜住,这里只看 DB 行删除结果)
+  app.delete('/api/audio/:id', async (req, reply) => {
+    const id = Number((req.params as { id: string }).id);
+    // P2-5:同 /file 路由,非正整数 id → 404(避免 NaN 查询行为未定义)
+    if (!Number.isInteger(id) || id <= 0) return reply.code(404).send({ ok: false, error: { code: 'NOT_FOUND', message: '音频不存在', next: '' } });
+    const before = audioRepo.get(id);
+    if (!before) return reply.code(404).send({ ok: false, error: { code: 'NOT_FOUND', message: '音频不存在', next: '' } });
+    const fileResult = deleteAudioFile(id, audioRepo); // 先删文件(DB 行还在时按 file_path 读得到路径)
+    audioRepo.delete(id); // 再删 DB 行
+    pushLog('info', 'audio.delete', `id=${id} deleted=${fileResult.deleted} path=${fileResult.path ?? '(none)'}`);
+    return { ok: true, deleted: fileResult.deleted };
   });
 }

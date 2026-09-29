@@ -1,6 +1,6 @@
 import { Alert, Card, Spin, Typography } from 'antd';
 import { useEffect, useState } from 'react';
-import { apiGet } from '@/api';
+import { apiGet, logFe } from '@/api';
 
 interface Health {
   ok: boolean;
@@ -13,6 +13,8 @@ export default function IndexPage() {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
+    // 诊断日志:页面打开 / 离开都要留痕——「看不到健康状态」时区分是没请求还是请求挂了
+    logFe('info', 'IndexPage mounted → GET /api/health');
     apiGet<Health>('/api/health').then(setHealth).catch((e: Error) => setError(e.message));
   }, []);
 

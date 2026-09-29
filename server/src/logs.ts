@@ -4,7 +4,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 export interface LogRow {
   ts: string; // ISO 时间戳
   level: 'info' | 'error';
-  source: 'server' | 'job' | 'http';
+  source: 'server' | 'job' | 'http' | 'audio.delete';
   message: string;
 }
 
@@ -34,9 +34,12 @@ export function registerRequestLogging(app: FastifyInstance): void {
   });
   app.addHook('onResponse', async (req: FastifyRequest, reply: FastifyReply) => {
     if (!req.url.startsWith('/api/')) return;
+    // 自递归防护:LogsButton 抽屉开着每秒拉一次 /api/logs,若不排除,环形缓冲会刷满自反的 http 行,真正的诊断日志被挤出。
+    // 只跳过 http 行的写入,onResponse 钩子本身仍然跑(否则 keep-alive 心跳等指标会缺失)。
+    const pathname = req.url.split('?')[0] ?? req.url;
+    if (pathname === '/api/logs') return;
     const t0 = startTimes.get(req);
     const ms = t0 === undefined ? 0 : Date.now() - t0;
-    const pathname = req.url.split('?')[0] ?? req.url;
     pushLog(reply.statusCode >= 500 ? 'error' : 'info', 'http', `${req.method} ${pathname} → ${reply.statusCode} (${ms}ms)`);
   });
 }

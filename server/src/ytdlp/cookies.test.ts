@@ -1,9 +1,9 @@
-// server/src/ytdlp/cookies.test.ts(B 站 Cookie:粘贴内容归一化 + 物化,TDD 先行)
+// server/src/ytdlp/cookies.test.ts(B 站 Cookie:粘贴内容归一化 + 物化 + 登录有效期,TDD 先行)
 import { describe, expect, it } from 'vitest';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { materializeCookieFile, normalizeCookieContent } from './cookies.js';
+import { countCookies, getSessdataExpiry, materializeCookieFile, normalizeCookieContent, toCookieHeader } from './cookies.js';
 
 const HEADER = '# Netscape HTTP Cookie File';
 
@@ -59,6 +59,67 @@ describe('normalizeCookieContent', () => {
     const out = normalizeCookieContent('.bilibili.com\tTRUE\t/\tTRUE\t1790000000\tSESSDATA\tx');
     expect(out.startsWith(`${HEADER}\n`)).toBe(true);
     expect(out.split('\n')).toHaveLength(2);
+  });
+});
+
+describe('cURL 粘贴(2026-09-29 用户主姿势:F12 Copy as cURL bash)', () => {
+  // bash 续行:每行行尾反斜杠 + 换行
+  const curlB = [
+    "curl 'https://api.bilibili.com/x/web-interface/nav' \\",
+    "  -H 'accept: application/json' \\",
+    "  -b 'SESSDATA=abc%2C1790000000%2Cd*92; bili_jct=jct123; DedeUserID=27725036' \\",
+    "  -H 'user-agent: Mozilla/5.0'",
+  ].join('\n');
+
+  it('-b 形式:提取 cookie 串转 Netscape(续行打平,条数正确)', () => {
+    const out = normalizeCookieContent(curlB);
+    expect(out.startsWith(`${HEADER}\n`)).toBe(true);
+    expect(out).toContain('.bilibili.com\tTRUE\t/\tTRUE\t1893456000\tSESSDATA\tabc%2C1790000000%2Cd*92');
+    expect(out).toContain('bili_jct\tjct123');
+    expect(countCookies(curlB)).toBe(3);
+  });
+
+  it("-H 'cookie:' 形式同样支持(DevTools 标准姿势)", () => {
+    const c = "curl 'https://www.bilibili.com/' \\\n  -H 'cookie: SESSDATA=abc%2C1790000000%2Cd*92; bili_jct=jct123'";
+    expect(normalizeCookieContent(c)).toContain('SESSDATA\tabc%2C1790000000%2Cd*92');
+  });
+
+  it('cURL 里没有 Cookie → TypeError 带人话指引(用户复制到媒体/CDN 请求的真实场景)', () => {
+    const c = "curl 'https://upos-sz-mirror08c.bilivideo.com/xxx.m4s' \\\n  -H 'user-agent: Mozilla/5.0' \\\n  -H 'referer: https://www.bilibili.com/'";
+    expect(() => normalizeCookieContent(c)).toThrow('这条 cURL 里没有 Cookie');
+  });
+
+  it('原始 cookie 头串(k=v; k=v)→ Netscape', () => {
+    const out = normalizeCookieContent('SESSDATA=abc%2C1790000000%2Cd*92; bili_jct=jct123');
+    expect(out.startsWith(`${HEADER}\n`)).toBe(true);
+    expect(out).toContain('SESSDATA\tabc%2C1790000000%2Cd*92');
+    expect(countCookies('SESSDATA=a; bili_jct=x; foo=y')).toBe(3);
+  });
+});
+
+describe('getSessdataExpiry 登录有效期(离线判定,支撑「已有未过期登录信息」提示)', () => {
+  it('SESSDATA 值 URL 解码后第 2 段是过期 unix 秒', () => {
+    expect(getSessdataExpiry('SESSDATA=abc%2C1790000000%2Cd*92; bili_jct=x')).toBe(1790000000);
+  });
+
+  it('cURL 粘贴同样解析出有效期', () => {
+    expect(getSessdataExpiry("curl 'https://x' -b 'SESSDATA=a%2C1804299628%2Cb'")).toBe(1804299628);
+  });
+
+  it('没有 SESSDATA / 格式异常 / 空 → null', () => {
+    expect(getSessdataExpiry('foo=bar; baz=qux')).toBeNull();
+    expect(getSessdataExpiry('SESSDATA=nocomma')).toBeNull();
+    expect(getSessdataExpiry('')).toBeNull();
+  });
+});
+
+describe('toCookieHeader(在线校验用:归一化内容转回请求头串)', () => {
+  it('头串 → k=v; k=v', () => {
+    expect(toCookieHeader('SESSDATA=abc; bili_jct=x')).toBe('SESSDATA=abc; bili_jct=x');
+  });
+
+  it('空/垃圾 → null', () => {
+    expect(toCookieHeader('  ')).toBeNull();
   });
 });
 
