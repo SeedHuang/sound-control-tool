@@ -122,6 +122,7 @@ M1 前半使命：**贴一个网页 URL（B 站课程/YouTube/播客等）→ �
 `server/src/index.ts` 注册：`registerYtdlpRoutes(app, { db, binProvider, downloadManager, audioDir, tempDir, token })`。
 
 - `binProvider`：注入函数 `() => Promise<{ path: string|null, explicit?: string|null }>`，读取 settings 的 `bin_ytdlp`（SETTINGS_KEYS.binYtdlp，M0 bins/probe 已写入）优先，否则 `probeBin('yt-dlp')`。测试注入 mock。
+- **D12 守卫豁免 D3 端点（2026-09-29）**：`server/src/index.ts` 的 onRequest 守卫对 `GET /api/jobs/:id/events`（SSE）与 `GET /api/audio/:id/file`（音频文件流）**豁免 header token 校验**——两者是 D3 query-token 端点（EventSource/`<audio>` 无法设请求头），token 校验由路由内完成；生产 file:// 加载（Origin=null）下不再被守卫以 401 拦截。豁免按 pathname 精确匹配（`/^\/api\/jobs\/\d+\/events$/`、`/^\/api\/audio\/\d+\/file$/`），不扩散到同族路径。
 - **事件桥接**：路由层持有 `Map<jobId, Set<SSE reply>>`；`DownloadManager` 构造时注入 `onEvent(jobId, event)` 回调（`download.ts` 内部 spawn 的进度/结束事件统一经此出口），路由层收到后推给该 job 的所有 SSE 连接，`done/error/cancelled` 终态事件发出后断开连接。下载完成回调（路由层 `finalizeDownload`）：temp 产物 → INSERT → rename → UPDATE → job finish → SSE `done`。
   - **finalize 失败路径（P1-2）**：`finalizeDownload` 全程包 try/catch——`ingestDownloadedFile` 抛错（rename 被占/权限/IO）时：`jobsRepo.fail(jobId, msg)` + **`audioRepo.delete(已INSERT的id)`** 回滚 + emit SSE `status error`。禁止 unhandled rejection（`onEvent` 里的 `void finalizeDownload(...)` 不得裸奔）。
   - **并发检查位置（P1-1）**：`POST /api/ytdlp/download` 在校验段末尾、建 job **之前**调 `jobsRepo.findActiveByUrl(url)`，命中即 409 BUSY（见 §0.3）。
