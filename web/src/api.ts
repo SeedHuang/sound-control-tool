@@ -20,7 +20,7 @@ export class ApiError extends Error {
 
 // ---- 诊断日志(2026-09-29 用户反馈:一个按钮看前后端日志) ----
 // 前端环形缓冲(容量 200,丢最旧):api.ts 是唯一埋点点位,页面组件不感知。
-export interface LogRow { ts: string; level: 'info' | 'error'; source: string; message: string }
+export interface LogRow { ts: string; level: 'debug' | 'info' | 'error'; source: string; message: string }
 const feLogs: LogRow[] = [];
 const FE_LOG_CAP = 200;
 
@@ -48,6 +48,22 @@ export function getFeLogs(): LogRow[] {
 export async function fetchLogs(): Promise<LogRow[]> {
   const j = await apiGet<{ ok: boolean; logs: LogRow[] }>('/api/logs');
   return j.logs;
+}
+
+// ---- 音频库数据变更通知(2026-09-29 用户反馈:下载结束后切到音频库看不到刚下的文件) ----
+// 真相:切页那一刻列表确实拉了,但后端「rename + ffprobe 测时长 + INSERT」还没跑完(实测差了 4 秒),
+// 之后页面就不再刷新了 → 用户看到的是旧列表。这里放一个极小的进程内事件总线:
+// 谁写完音频库数据就喊一声,音频库页订阅后自己重拉列表(页面开着也能立刻看到新条目)。
+// 喊的时候若音频库页没打开,通知丢失也无妨——它每次挂载都会自己拉一次。
+export type AudioChangedHandler = () => void;
+const audioChangedHandlers = new Set<AudioChangedHandler>();
+export function notifyAudioChanged(reason: string): void {
+  logFe('info', `通知音频库刷新(${reason})`); // 诊断日志:日志页能看清"是谁触发的那次刷新"
+  for (const fn of [...audioChangedHandlers]) fn();
+}
+export function onAudioChanged(fn: AudioChangedHandler): () => void {
+  audioChangedHandlers.add(fn);
+  return () => { audioChangedHandlers.delete(fn); };
 }
 
 export async function apiGet<T>(path: string): Promise<T> {
@@ -87,10 +103,11 @@ export async function apiPost<T>(path: string, body: unknown): Promise<T> {
   try {
     const res = await fetch(`${API_BASE}${path}`, { method: 'POST', headers, body: JSON.stringify(body), signal: ctl.signal });
     if (!res.ok) {
-      const j = (await res.json().catch(() => null)) as { error?: { message?: string; next?: string } } | null;
+      const j = (await res.json().catch(() => null)) as { error?: { code?: string; message?: string; next?: string } } | null;
       const msg = j?.error?.message ?? `请求失败 ${res.status}:${path}${j?.error?.next ? `。${j.error.next}` : ''}`;
       logFe('error', `请求失败 ${path}: ${msg}`); // 诊断日志:业务错误(400/409)也进前端面板
-      throw new ApiError(msg);
+      // code 要带上:调用方按 code 分支(如 DUPLICATE → 弹「重新下载并替换」确认,2026-09-29)
+      throw new ApiError(msg, j?.error?.code);
     }
     return (await res.json()) as T;
   } finally { clearTimeout(timer); }
@@ -154,19 +171,30 @@ export function audioFileUrl(id: number): string {
   // 诊断日志:记下 audio 标签请求 URL(去 token 尾段,凭据不全打)+ token 来源(query/无),
   // CORS 排查时一眼看清「这次 audio 请求有没有带 token」「origin 该不该让服务器放行」
   const src = token ? 'query' : 'none';
-  logFe('info', `audioFileUrl id=${id} token=${src}`);
+  // 级别 debug(2026-09-29):每个 <audio> 元素渲染都会调它,一屏十几条 —— 只在排查 CORS/token 时才想看,
+  // 归到「调试」档,日志面板默认折叠,需要时一键展开
+  logFe('debug', `audioFileUrl id=${id} token=${src}`);
   return `${API_BASE}/api/audio/${id}/file?token=${encodeURIComponent(token ?? '')}`;
+}
+
+/** 作品封面地址(2026-09-29):图片本体由服务端落到本地(covers/),不直连外网图床,断网/防盗链都不怕。
+ *  这里**不写日志**——一屏十几张卡片,每张都 logFe 会把日志面板刷爆(封面请求本身也不值得逐条记)。 */
+export function coverUrl(importId: number): string {
+  const token = apiToken();
+  return `${API_BASE}/api/imports/${importId}/cover?token=${encodeURIComponent(token ?? '')}`;
 }
 
 export function subscribeJob(jobId: number, handlers: {
   onProgress?: (p: { percent: number }) => void;
-  onDone?: (d: { audioId: number; title: string; format: string }) => void;
+  onPhase?: (p: { phase: 'ingest' }) => void; // 阶段信号(2026-09-29):下载进程结束、开始入库 → 进度条切第二段
+  onDone?: (d: { audioId: number; title: string; format: string; replaced?: boolean }) => void; // replaced:本次是覆盖下载(旧的那份已删)
   onStatus?: (s: { state: string; message?: string }) => void;
   onError?: (msg: string) => void;
 }): () => void {
   const token = apiToken();
   const es = new EventSource(`${API_BASE}/api/jobs/${jobId}/events?token=${encodeURIComponent(token ?? '')}`);
   es.addEventListener('progress', (e) => handlers.onProgress?.(JSON.parse((e as MessageEvent).data)));
+  es.addEventListener('phase', (e) => handlers.onPhase?.(JSON.parse((e as MessageEvent).data)));
   es.addEventListener('done', (e) => handlers.onDone?.(JSON.parse((e as MessageEvent).data)));
   es.addEventListener('status', (e) => {
     const s = JSON.parse((e as MessageEvent).data) as { state: string; message?: string };
@@ -251,7 +279,12 @@ export async function deleteAudio(audioId: number): Promise<{ ok: boolean; delet
 }
 
 // ---- 导入来源(2026-09-29 用户拍板:parse 成功自动落库,获取页左列表持久化) ----
-export interface ImportSource { id: number; url: string; title: string; site: string; kind: 'single' | 'playlist'; entry_count: number; created_at: string }
+export interface ImportSource {
+  id: number; url: string; title: string; site: string; kind: 'single' | 'playlist';
+  entry_count: number; created_at: string;
+  thumbnail: string | null; // 封面原始地址(图片本体在服务端 covers/,前端走 coverUrl 取)
+  has_cover: boolean;       // 封面图是否已在本地——没图就别渲染 <img>,免得每个卡片发一个 404
+}
 export interface ImportDetail extends Omit<ImportSource, 'entry_count'> { duration_sec: number | null; entries: { index: number; title: string }[] | null }
 
 /** 左列表(新→旧;轻量,不带 entries) */

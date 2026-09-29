@@ -1,7 +1,8 @@
-// server/src/ytdlp/cookies.ts(B 站 Cookie:粘贴内容归一化为 Netscape 格式 + 物化 cookies.txt)
+// server/src/ytdlp/cookies.ts(B 站 Cookie:粘贴内容归一化为 Netscape 格式 + 物化 cookie 文件给 yt-dlp)
 // 支持三种粘贴(2026-09-29 用户实测后补齐 cURL 支持——用户主流姿势是 F12 Copy as cURL):
 // 1. cookie-editor JSON 2. cURL bash 命令(-b '...' 或 -H 'cookie: ...')3. 原始 cookie 头串(k=v; k=v)
-import { writeFileSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
+import { readdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const NETSCAPE_HEADER = '# Netscape HTTP Cookie File';
@@ -184,10 +185,33 @@ export function toCookieHeader(content: string): string | null {
   return pairs.length > 0 ? pairs.join('; ') : null;
 }
 
-/** 归一化后写入 dataDir/cookies.txt 并返回路径;内容为空时 normalizeCookieContent 抛错,调用方捕获后跳过注入 */
+/** 清理旧的 cookie 副本(每份都带唯一后缀,会累积):只删 1 小时前的,尽力而为不抛 */
+function cleanupOldCookieFiles(dir: string): void {
+  try {
+    const cutoff = Date.now() - 60 * 60_000;
+    for (const f of readdirSync(dir)) {
+      if (!f.startsWith('cookies-') || !f.endsWith('.txt')) continue;
+      const p = join(dir, f);
+      try {
+        if (statSync(p).mtimeMs < cutoff) unlinkSync(p);
+      } catch { /* 单个文件删不掉不影响本次物化 */ }
+    }
+  } catch { /* 目录读不到就跳过清理 */ }
+}
+
+/**
+ * 归一化后写入 `dataDir/cookies-<唯一后缀>.txt` 并返回路径;内容为空时 normalizeCookieContent 抛错,调用方捕获后跳过注入。
+ *
+ * **文件名必须唯一(2026-09-29 实测踩坑)**:yt-dlp 退出时会把 cookie jar **回写**进 `--cookies` 指定的那个文件。
+ * 我们有三处会起 yt-dlp(解析 / 下载 / 单独问封面),它们可能并发 → 共用一个固定路径就会互相覆盖。
+ * 实测后果:原来的 `cookies.txt` 被回写成 **0 字节**,下一次调用直接报
+ * `does not look like a Netscape format cookies file`(而库里那份凭据其实是好的)。
+ * 每份带唯一后缀,顺带也避免"读到别人正在回写的半截文件"。
+ */
 export function materializeCookieFile(content: string, dataDir: string): string {
   const normalized = normalizeCookieContent(content);
-  const filePath = join(dataDir, 'cookies.txt');
+  cleanupOldCookieFiles(dataDir);
+  const filePath = join(dataDir, `cookies-${Date.now().toString(36)}-${randomBytes(3).toString('hex')}.txt`);
   writeFileSync(filePath, normalized, 'utf8'); // node 的 'utf8' 不写 BOM(区别于 PowerShell 5.1 的 -Encoding UTF8)
   return filePath;
 }

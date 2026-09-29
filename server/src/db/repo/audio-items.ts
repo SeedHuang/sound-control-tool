@@ -18,6 +18,7 @@ export interface AudioItemsRepo {
   list(): AudioItemRow[];
   get(id: number): AudioItemRow | null;
   findBySourceUrl(url: string): AudioItemRow | null;
+  findSameItem(url: string, entryIndex: number | null, title: string): AudioItemRow[]; // 覆盖下载判重(2026-09-29)
   updateFilePath(id: number, file_path: string): void;
   delete(id: number): void; // P1-2:入库失败回滚
 }
@@ -45,6 +46,20 @@ export function createAudioItemsRepo(db: DB): AudioItemsRepo {
     findBySourceUrl: (url) => {
       const row = db.prepare(`${SELECT_COLS} WHERE source_type = 'download' AND source_url = ?`).get(url);
       return row && isRow(row) ? normalize(row) : null;
+    },
+    // 覆盖下载判重(2026-09-29 用户拍板):找出「同一个视频/同一集」在库里的其它行。
+    // 规则:先在同一网址下的行里按 entry_index 精确匹配(2026-09-29 起下载会记集数);
+    // 老记录没集数(entry_index IS NULL)时,退一步按标题认(同一集解析出的条目标题是一样的)。
+    // 单视频(entryIndex=null)则按「没集数 + 标题相同」认——不能只按网址,否则会误伤同网址下的合集分集。
+    findSameItem: (url, entryIndex, title) => {
+      const rows = (db.prepare(`${SELECT_COLS} WHERE source_type = 'download' AND source_url = ?`).all(url) as unknown[])
+        .filter(isRow).map(normalize);
+      if (entryIndex !== null) {
+        const exact = rows.filter((r) => r.entry_index === entryIndex);
+        if (exact.length > 0) return exact;
+        return rows.filter((r) => r.entry_index === null && r.title === title);
+      }
+      return rows.filter((r) => r.entry_index === null && r.title === title);
     },
     updateFilePath: (id, file_path) => db.prepare('UPDATE audio_items SET file_path = ? WHERE id = ?').run(file_path, id),
     delete: (id) => db.prepare('DELETE FROM audio_items WHERE id = ?').run(id),

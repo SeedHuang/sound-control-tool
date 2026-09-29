@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS imported_sources (
   kind TEXT NOT NULL CHECK (kind IN ('single','playlist')),
   duration_sec REAL,
   entries_json TEXT,
+  thumbnail TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 `;
@@ -70,5 +71,9 @@ export function initSchema(db: DB): void {
   ensureColumns(db, 'audio_items', [
     { name: 'entry_index', ddl: 'entry_index INTEGER' },
     { name: 'collection_title', ddl: 'collection_title TEXT' },
+  ]);
+  // 2026-09-29 用户拍板:分组视图要作品封面 → imported_sources 存封面原始地址(图片本体落盘在 covers/)
+  ensureColumns(db, 'imported_sources', [
+    { name: 'thumbnail', ddl: 'thumbnail TEXT' },
   ]);
 }

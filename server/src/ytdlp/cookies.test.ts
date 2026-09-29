@@ -1,6 +1,6 @@
 // server/src/ytdlp/cookies.test.ts(B 站 Cookie:粘贴内容归一化 + 物化 + 登录有效期,TDD 先行)
 import { describe, expect, it } from 'vitest';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { countCookies, getSessdataExpiry, materializeCookieFile, normalizeCookieContent, toCookieHeader } from './cookies.js';
@@ -124,15 +124,20 @@ describe('toCookieHeader(在线校验用:归一化内容转回请求头串)', ()
 });
 
 describe('materializeCookieFile', () => {
-  it('归一化后写入 dataDir/cookies.txt 并返回路径', () => {
+  // 2026-09-29:文件名带唯一后缀——yt-dlp 退出会把 cookie jar 回写进 --cookies 指的文件,固定名字会被并发调用互相覆盖(实测被回写成 0 字节)
+  it('归一化后写入 dataDir/cookies-<唯一后缀>.txt 并返回路径', () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'sct-cookie-'));
     try {
       const p = materializeCookieFile(JSON.stringify([{ domain: '.bilibili.com', name: 'SESSDATA', value: 'x', expirationDate: 1790000000 }]), dataDir);
-      expect(p).toBe(join(dataDir, 'cookies.txt'));
+      expect(p.startsWith(join(dataDir, 'cookies-'))).toBe(true);
+      expect(p.endsWith('.txt')).toBe(true);
       expect(existsSync(p)).toBe(true);
       const written = readFileSync(p, 'utf8');
       expect(written.startsWith(`${HEADER}\n`)).toBe(true);
       expect(written).toContain('SESSDATA\tx');
+      // 连写两份 → 路径必须不同(否则并发时互相覆盖)
+      const p2 = materializeCookieFile('.bilibili.com\tTRUE\t/\tTRUE\t1790000000\tSESSDATA\ty', dataDir);
+      expect(p2).not.toBe(p);
     } finally {
       rmSync(dataDir, { recursive: true, force: true });
     }
@@ -142,7 +147,7 @@ describe('materializeCookieFile', () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'sct-cookie-'));
     try {
       expect(() => materializeCookieFile('  ', dataDir)).toThrow('Cookie 内容为空');
-      expect(existsSync(join(dataDir, 'cookies.txt'))).toBe(false);
+      expect(readdirSync(dataDir).filter((f) => f.startsWith('cookies-'))).toHaveLength(0);
     } finally {
       rmSync(dataDir, { recursive: true, force: true });
     }

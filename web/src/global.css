@@ -1,0 +1,43 @@
+/* web/src/global.css
+   2026-09-29:音频库「剧集分组」卡片墙的动效。
+   为什么单独开一个 CSS 文件:内联样式表达不了 :hover / :active / @media(不含伪类与媒体查询),
+   而这个项目没有引入 styled-components(规则:用了就得单独开 sc.tsx),所以用最朴素的 CSS 类。
+   动效口径(emil-design-eng):
+   - 只动 transform / opacity(不触发布局与重绘,GPU 上跑)
+   - 按下必须有反馈;悬停上浮只在真鼠标设备上做(触屏点一下也会触发 hover,会出现"点完还浮着")
+   - 缓动用强 ease-out 曲线而非内置 ease;时长压在 160ms 内(UI 动效超过 300ms 就显慢)
+   - 尊重系统"减弱动效":去掉位移/缩放,保留淡入(淡入帮助理解"内容换了",不是纯装饰) */
+
+.sct-card {
+  transition:
+    transform 160ms cubic-bezier(0.23, 1, 0.32, 1),
+    box-shadow 160ms cubic-bezier(0.23, 1, 0.32, 1);
+}
+
+/* 按下反馈:0.985 的幅度几乎看不出来,但手感对了——界面像"听见"了这次点击 */
+.sct-card:active {
+  transform: scale(0.985);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .sct-card:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 6px 16px rgba(0, 0, 0, 0.1);
+  }
+}
+
+/* 切视图 / 进作品 / 返回时给内容区一次淡入:直接"啪"地换掉会显得像页面闪了一下 */
+.sct-view-enter {
+  animation: sct-fade-in 150ms cubic-bezier(0.23, 1, 0.32, 1);
+}
+
+@keyframes sct-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sct-card { transition: none; }
+  .sct-card:active,
+  .sct-card:hover { transform: none; box-shadow: none; }
+}

@@ -3,6 +3,7 @@ import { spawn, execFile, type ChildProcess } from 'node:child_process';
 import { readdirSync, statSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { mapYtdlpError } from './errors.js';
+import { pushLog } from '../logs.js';
 import { parseProgressLine } from './progress.js';
 
 export type DownloadEvent =
@@ -70,7 +71,9 @@ export function createDownloadManager(deps?: { spawn?: typeof spawn; execFile?: 
         // spawn 失败(如 binPath 缺失):清掉 activeOutDir 作为"终态已发"标记,避免 close 再补发一条 error
         active.delete(jobId);
         activeOutDir.delete(jobId);
-        onEvent(jobId, { type: 'status', state: 'error', message: mapYtdlpError({ code: (err as NodeJS.ErrnoException).code, binPath }).message });
+        const info = mapYtdlpError({ code: (err as NodeJS.ErrnoException).code, binPath });
+        pushLog('error', 'job', `job ${jobId} spawn 失败 code=${(err as NodeJS.ErrnoException).code ?? '?'} message=${err.message.slice(0, 200)}`);
+        onEvent(jobId, { type: 'status', state: 'error', message: info.message });
       });
       child.on('close', (code) => {
         active.delete(jobId);
@@ -99,7 +102,11 @@ export function createDownloadManager(deps?: { spawn?: typeof spawn; execFile?: 
             return;
           }
           cleanJobOutputs(jobId, outDir);
-          onEvent(jobId, { type: 'status', state: 'error', message: mapYtdlpError({ stderr: stderrBuf, binPath }).message });
+          const info = mapYtdlpError({ stderr: stderrBuf, binPath });
+          // 诊断日志(铁律:stderr 永远记下来):发给前端的是 map 后的中文消息,原始 stderr 必须留在日志里。
+          // 2026-09-29 踩过:一个 YouTube 下载失败只留下"网络请求失败或资源不可达",原始报错没记 → 事后无从定位。
+          pushLog('error', 'job', `job ${jobId} error code=${info.code} exit=${code} stderr=${stderrBuf.trim().slice(0, 300) || '(空)'}`);
+          onEvent(jobId, { type: 'status', state: 'error', message: info.message });
         }
       });
     },

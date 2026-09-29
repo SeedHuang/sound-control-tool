@@ -25,6 +25,19 @@ export function isAllowedLocalOrigin(origin: string): boolean {
   }
 }
 
+/**
+ * 媒体类端点(<audio> / <img>)的补充豁免判据(2026-09-29 增补)。
+ * 背景:这两类请求由浏览器自己发起,**没有 Origin 头**(no-cors 媒体请求不带),页面也没法给它们加
+ * X-SCT-Token 头 → 本地开发裸开浏览器(URL 里没有 apiToken)时,音频播放与作品封面一律 401(实测)。
+ * 但媒体请求**会带 Referer(发起它的页面地址)**:本机页面的 Referer 一定是 localhost/127.0.0.1。
+ * 安全论证:外部站点无法把 Referer 伪造成 localhost(Referer 由浏览器按发起页面填,JS 改不了),
+ * 恶意页面发起的跨源 <img>/<audio> 带的是它自己的地址 → 依旧被拦。故本判据只放行"确实由本机页面发起"的请求。
+ */
+export function isLocalPageReferer(referer: string | undefined): boolean {
+  if (typeof referer !== 'string' || referer.length === 0) return false;
+  return isAllowedLocalOrigin(referer.replace(/\/+$/, ''));
+}
+
 export function registerCors(app: FastifyInstance): void {
   app.addHook('onSend', async (req, reply) => {
     const origin = req.headers.origin;

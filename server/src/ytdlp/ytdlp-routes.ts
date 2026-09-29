@@ -4,10 +4,11 @@ import { execFile } from 'node:child_process';
 import { createReadStream, existsSync, mkdirSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import type { DB } from '../db/index.js';
-import { isAllowedOrigin, isAllowedLocalOrigin } from '../http/cors.js';
+import { isAllowedOrigin, isAllowedLocalOrigin, isLocalPageReferer } from '../http/cors.js';
 import { clearLogs, getLogs, pushLog } from '../logs.js';
-import { createAudioItemsRepo, type AudioItemRow } from '../db/repo/audio-items.js';
+import { createAudioItemsRepo, type AudioItemRow, type AudioItemsRepo } from '../db/repo/audio-items.js';
 import { deleteAudioFile } from '../audio-files.js';
+import { coverMime, fetchAndStoreCover, findCoverFile, writeCoverViaYtdlp } from '../covers.js';
 import { createJobsRepo } from '../db/repo/jobs.js';
 import { createSettingsRepo } from '../db/repo/settings.js';
 import { BILI_COOKIE_KEY, SETTINGS_KEYS } from '../settings-keys.js';
@@ -49,7 +50,16 @@ export interface YtdlpDeps {
   binProvider: () => Promise<{ path: string | null }>;
   downloadManager: DownloadManager;
   audioDir: string; tempDir: string; token: string;
+  /** 封面抓取(2026-09-29):默认走 covers.ts 的真实实现(带 Referer 抓 B 站图床);单测注入桩,避免真发网络 */
+  coverFetcher?: CoverFetcher;
+  /** 封面兜底抓法:让 yt-dlp 自己写图(--write-thumbnail)。外网图床只能走它(Node fetch 不走系统代理) */
+  coverWriter?: CoverWriter;
 }
+
+/** 抓一张作品封面并落盘;返回是否成功(失败只记日志,不抛) */
+export type CoverFetcher = (opts: { url: string; coversDir: string; importId: number }) => Promise<boolean>;
+/** 让 yt-dlp 直接把封面写到 coversDir;返回是否成功 */
+export type CoverWriter = (opts: { url: string; coversDir: string; importId: number }) => Promise<boolean>;
 
 /** 下载任务载荷(jobs.payload 存的就是它,retry 直接复用):剧集两字段随行,入库时才写进 audio_items */
 export interface DownloadJobPayload {
@@ -73,6 +83,21 @@ function resolveCookiePath(db: DB, audioDir: string): string | undefined {
     pushLog('error', 'job', `cookie 文件物化失败，跳过 --cookies 注入: ${e instanceof Error ? e.message : String(e)}`);
     return undefined;
   }
+}
+
+/** 覆盖下载(2026-09-29 用户拍板:同一集/同一视频重下 → 删掉库里原来那一份,只留新的)。
+ *  调用时机必须是**新文件已成功入库之后**——顺序反过来,一旦重下失败,用户原来那份就白丢了。
+ *  删磁盘文件失败不改判结果(与 DELETE /api/audio/:id 同款语义:DB 行删了就算「删了」)。返回删掉的行数。 */
+function replaceSameItems(audioRepo: AudioItemsRepo, opts: { url: string; entryIndex: number | null; title: string; keepId: number }): number {
+  let removed = 0;
+  for (const old of audioRepo.findSameItem(opts.url, opts.entryIndex, opts.title)) {
+    if (old.id === opts.keepId) continue;
+    const fileResult = deleteAudioFile(old.id, audioRepo);
+    audioRepo.delete(old.id);
+    removed += 1;
+    pushLog('info', 'audio.replace', `id=${old.id} 被新 id=${opts.keepId} 覆盖 file=${old.file_path} deleted=${fileResult.deleted}`);
+  }
+  return removed;
 }
 
 // 模块级辅助(在 registerYtdlpRoutes 外,通过参数注入 deps 更易测;此处为可注入闭包工厂)
@@ -105,9 +130,16 @@ function createDownloadHandlers(deps: YtdlpDeps) {
         audioDir, exists: existsSync, audioRepo,
       });
       audioId = result.audioId;
+      // 覆盖下载(2026-09-29 用户拍板):用户在前端弹窗里确认过覆盖(force)→ 新文件已安全入库,现在才删库里旧的那一份
+      const replaced = (payload.options as { force?: unknown }).force === true
+        ? replaceSameItems(audioRepo, {
+            url: payload.url, entryIndex: payload.entryIndex ?? null,
+            title: payload.title ?? '下载音频', keepId: result.audioId,
+          })
+        : 0;
       jobsRepo.finish(jobId);
-      pushLog('info', 'job', `job ${jobId} done → audio ${result.audioId} @ ${result.finalPath}`); // 诊断日志:入库成败都要可见
-      emit(jobId, { type: 'done', audioId: result.audioId, filePath: result.finalPath, title: payload.title ?? '下载音频', format });
+      pushLog('info', 'job', `job ${jobId} done → audio ${result.audioId} @ ${result.finalPath}${replaced > 0 ? `(覆盖并删掉旧条目 ${replaced} 条)` : ''}`); // 诊断日志:入库成败都要可见
+      emit(jobId, { type: 'done', audioId: result.audioId, filePath: result.finalPath, title: payload.title ?? '下载音频', format, replaced: replaced > 0 });
       // spec §0.3 列了 status done,但 emit('done') 已断开连接并删除订阅表,紧随的 status done 无人可达——
       // 前端 subscribeJob 只监听 progress/done/status(error/cancelled),不消费 status done,故不再单独发(由 done 隐含)
     } catch (err) {
@@ -159,6 +191,12 @@ function createDownloadHandlers(deps: YtdlpDeps) {
           emit(jid, ev); // Critical 修复:进度事件推给该 job 的所有 SSE 连接(前端进度条依赖;emit 把 type 写进 event 行)
         }
         if (ev.type === 'status' && ev.state === 'done' && ev.producedPath) {
+          // 阶段信号(2026-09-29 用户拍板:进度条分两段——① 下载 ② 入库):
+          // 下载进程结束了,但东西还没进音频库——后面还有 ffprobe 测时长、改名、写库三步(实测约 4 秒)。
+          // 先把「进入入库」推给前端,进度条才能从下载段切到入库段;
+          // 否则进度条停在 100% 而库里还是空,用户会以为下好了跑去看列表(就是这次踩的坑)。
+          pushLog('info', 'job', `job ${jid} 下载完成 → 进入入库(ffprobe + rename + INSERT)`);
+          emit(jid, { type: 'phase', phase: 'ingest' });
           void finalizeDownload(jid, payload, ev.producedPath);
         }
         if (ev.type === 'status' && ev.state === 'error' && ev.message) {
@@ -176,6 +214,15 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
   const { db, binProvider, token, downloadManager, audioDir } = deps;
   const audioRepo = createAudioItemsRepo(db);
   const importsRepo = createImportsRepo(db);
+  // 封面目录:与音频同级(audioDir = <数据目录>/audio → <数据目录>/covers),沿用 D4「与 db 同数据目录」的约定
+  const coversDir = join(dirname(audioDir), 'covers');
+  const coverFetcher: CoverFetcher = deps.coverFetcher ?? fetchAndStoreCover;
+  // 兜底抓法:让 yt-dlp 自己写图(bin 在调用时才解析,和 parse/download 一致)
+  const coverWriter: CoverWriter = deps.coverWriter ?? (async (o) => {
+    const bin = await binProvider();
+    if (bin.path === null) return false;
+    return writeCoverViaYtdlp({ ...o, binPath: bin.path, cookiePath: resolveCookiePath(db, audioDir) });
+  });
   const { startDownload } = createDownloadHandlers(deps);
 
   app.post('/api/ytdlp/parse', async (req, reply) => {
@@ -200,7 +247,12 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
         kind: parsed.kind,
         duration_sec: parsed.durationSec ?? null,
         entries: parsed.entries ?? null,
+        thumbnail: parsed.thumbnail ?? null, // 封面原始地址(图片本体另落盘 covers/,见下)
       });
+      // 封面预热(2026-09-29 用户拍板「解析时抓 + 看图兜底」):后台跑,**不 await**——
+      // 解析接口该 1~5 秒返回还是 1~5 秒返回。ensureCover 内部还会处理"flat 解析根本没给封面地址"的情况
+      // (B 站番剧就是如此,它会单独问一次 yt-dlp 拿封面再抓),失败只记日志,卡片回退纯色。
+      void ensureCover({ id: importId, url, kind: parsed.kind, thumbnail: parsed.thumbnail ?? null });
       const existing = audioRepo.findBySourceUrl(url);
       // 注意:parse 内部用 durationSec(驼峰),对外契约 spec 0.3 是 duration_sec(下划线,与 audio_items 键风格一致)
       return {
@@ -250,13 +302,23 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
         return reply.code(400).send({ ok: false, error: { code: 'BAD_REQUEST', message: 'entryIndices 必须为单个正整数条目,多选请逐条提交', next: '重新勾选合集条目(逐条下载)' } });
       }
     }
-    // 判重只对"单视频整条"生效(2026-09-29 用户拍板修复批量下载闸门):
-    // 合集每集的请求共用同一个播放列表 URL(entryIndices 只是指定第几集)——若仍按 URL 判重,
-    // 第 1 集入库后第 2 集必被 409 拦停,批量永远下不完。条目级重复交给用户勾选自行控制。
-    const isEntryDownload = Array.isArray(opt.entryIndices) && opt.entryIndices.length > 0;
-    const existing = isEntryDownload ? null : audioRepo.findBySourceUrl(url);
-    if (existing && opt.force !== true) {
-      return reply.code(409).send({ ok: false, error: { code: 'DUPLICATE', message: `库中已存在《${existing.title}》`, next: '若确认重复下载请勾选"仍下载"' } });
+    // 判重(2026-09-29 用户拍板:条目也要判重,确认后可覆盖):
+    // 历史上只对「单视频整条」按网址判重——因为合集里每集共用同一个番剧网址,按网址一刀切会把第 2 集起全拦死,
+    // 于是当时干脆关掉了条目判重;后果是同一集重下会静默留下两份(用户实测踩到,手动删过一次)。
+    // 现在库里已记「第几集」,可按 网址 + 第几集 精确判重(老库没记集数的行按标题兜底,见 repo.findSameItem)。
+    // 命中且未确认覆盖 → 409(此时还没 spawn 下载,不浪费流量):前端弹窗问过用户后带 force 重发。
+    // 本请求的「第几集」:以真正驱动下载的 options.entryIndices 为准(前面已校验为单个正整数),兼容只带 body.entryIndex 的写法
+    const entryIndex = Array.isArray(opt.entryIndices) && typeof opt.entryIndices[0] === 'number'
+      ? opt.entryIndices[0]
+      : (typeof body.entryIndex === 'number' && Number.isInteger(body.entryIndex) && body.entryIndex > 0 ? body.entryIndex : null);
+    const existing = audioRepo.findSameItem(url, entryIndex, typeof body.title === 'string' ? body.title : '');
+    if (existing.length > 0 && opt.force !== true) {
+      const first = existing[0]!;
+      const what = entryIndex !== null ? `第 ${entryIndex} 集` : `《${first.title}》`;
+      return reply.code(409).send({
+        ok: false,
+        error: { code: 'DUPLICATE', message: `库中已存在${what}`, next: '确认重新下载会删掉库里原来那一份(文件也删),只保留新下的' },
+      });
     }
     // P1-1:同 URL 并发——已有 running/pending 的 ytdlp_download job 时拒绝(无论 force,防两进程写同一输出文件)
     const activeJob = createJobsRepo(db).findActiveByUrl(url);
@@ -268,9 +330,7 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
       return reply.code(409).send({ ok: false, error: { code: 'YTDLP_NOT_FOUND', message: 'yt-dlp 未找到或路径无效', next: '请到设置页配置 yt-dlp 路径后重试' } });
     }
     const jobsRepo = createJobsRepo(db);
-    // 剧集元数据(前端下载合集某集时带上):非法/缺省即视为单视频 → 落 NULL,不因它拦下载
-    const entryIndex =
-      typeof body.entryIndex === 'number' && Number.isInteger(body.entryIndex) && body.entryIndex > 0 ? body.entryIndex : null;
+    // 剧集元数据随任务存档(entryIndex 上面已算出):入库时写进 audio_items,retry 也据此复用
     const collectionTitle =
       typeof body.collectionTitle === 'string' && body.collectionTitle.trim().length > 0 ? body.collectionTitle.trim() : null;
     const payload: DownloadJobPayload = {
@@ -342,14 +402,90 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
   });
 
   // ---- 导入来源(2026-09-29 用户拍板:左列表持久化;parse 成功已自动落库) ----
-  app.get('/api/imports', async () => ({ ok: true, imports: importsRepo.list() }));
+  // has_cover:封面图**是否已落到本地**(信息字段)。前端不靠它当开关——见 library.tsx:
+  // 有来源记录就渲染 <img>,取不到图由 onError 回退纯色卡片(否则"没有本地图"的来源永远没机会去拿图)
+  // ---- 封面:统一获取入口(2026-09-29,两段式) ----
+  //   ① 本地已有图 → 直接给路径(日常都走这条)
+  //   ② 库里存了封面地址 → 自己 fetch 抓(国内图床最快,实测 0.3s)
+  //   ③ 自己抓不到 / 压根没地址 → **让 yt-dlp 自己写图**(--write-thumbnail)。
+  //      两个理由:外网图床(Node 的 fetch 不读 Windows 系统代理,直连 i.ytimg.com 10s 超时;yt-dlp 走代理 130ms),
+  //      以及合集(flat 解析对 B 站番剧不返回封面字段,库里没地址,只能让 yt-dlp 去问)
+  //   ④ 都不行 → null(前端回退纯色卡片)
+  // ③ 失败带 10 分钟冷却:避免每次开卡片墙都白跑一次几秒的 yt-dlp
+  // 另加一层**按域名**的记忆(2026-09-29):外网图床(Node fetch 不读系统代理,直连必超时)每张图都要白等 10s,
+  // 同一个域名失败过一次,10 分钟内直接跳到 yt-dlp——第二个 YouTube 作品从"12 秒出图"变成"2 秒出图"。
+  const coverFailedAt = new Map<number, number>();
+  const fetchHostFailedAt = new Map<string, number>();
+  const COVER_COOLDOWN_MS = 10 * 60_000;
+  const hostOf = (url: string): string => {
+    try { return new URL(url).host; } catch { return ''; }
+  };
+  async function ensureCover(row: { id: number; url: string; kind: 'single' | 'playlist'; thumbnail: string | null }): Promise<string | null> {
+    const local = findCoverFile(coversDir, row.id);
+    if (local !== null) return local;
+    // 冷却检查放在最前:失败过的来源连"自己 fetch"这一步也别重试——外网图床那一步要干等 10s,
+    // 不做冷却的话每次开卡片墙都白等一次(用户看到的就是"图迟迟不出来")
+    const failedAt = coverFailedAt.get(row.id);
+    if (failedAt !== undefined && Date.now() - failedAt < COVER_COOLDOWN_MS) return null;
+    if (row.thumbnail !== null) {
+      const host = hostOf(row.thumbnail);
+      const hostFailedAt = host === '' ? undefined : fetchHostFailedAt.get(host);
+      const hostCooling = hostFailedAt !== undefined && Date.now() - hostFailedAt < COVER_COOLDOWN_MS;
+      if (hostCooling) {
+        pushLog('debug', 'cover', `域名 ${host} 刚直连失败过,跳过自己抓,直接让 yt-dlp 写 id=${row.id}`);
+      } else if (await coverFetcher({ url: row.thumbnail, coversDir, importId: row.id })) {
+        const fetched = findCoverFile(coversDir, row.id);
+        if (fetched !== null) {
+          if (host !== '') fetchHostFailedAt.delete(host); // 这个域名又通了(比如代理开了)→ 清掉记忆
+          return fetched;
+        }
+      } else if (host !== '') {
+        fetchHostFailedAt.set(host, Date.now());
+      }
+    }
+    pushLog('info', 'cover', `让 yt-dlp 直接写封面 id=${row.id} url=${row.url}`);
+    if (!(await coverWriter({ url: row.url, coversDir, importId: row.id }))) {
+      coverFailedAt.set(row.id, Date.now());
+      return null;
+    }
+    return findCoverFile(coversDir, row.id);
+  }
+
+  app.get('/api/imports', async () => ({
+    ok: true,
+    imports: importsRepo.list().map((it) => ({ ...it, has_cover: findCoverFile(coversDir, it.id) !== null })),
+  }));
 
   app.get('/api/imports/:id', async (req, reply) => {
     const id = Number((req.params as { id: string }).id);
     if (!Number.isInteger(id) || id <= 0) return reply.code(404).send({ ok: false, error: { code: 'NOT_FOUND', message: '来源不存在', next: '' } });
     const row = importsRepo.get(id);
     if (row === null) return reply.code(404).send({ ok: false, error: { code: 'NOT_FOUND', message: '来源不存在', next: '' } });
-    return { ok: true, import: row };
+    return { ok: true, import: { ...row, has_cover: findCoverFile(coversDir, id) !== null } };
+  });
+
+  // 作品封面图(2026-09-29 用户拍板:分组视图要显示作品封面;图片本体落盘 covers/,不依赖外网、不怕防盗链)。
+  // token 规则与音频文件路由一致(query token 或本机来源);媒体元素(<img>)天生不带 Origin、页面也加不了 header,
+  // 故额外认「Referer 是本机页面」——否则本地开发裸开浏览器(URL 无 apiToken)时封面会 401、卡片全退成纯色
+  app.get('/api/imports/:id/cover', async (req, reply) => {
+    const id = Number((req.params as { id: string }).id);
+    const q = (req.query ?? {}) as { token?: string };
+    const origin = typeof req.headers.origin === 'string' ? req.headers.origin : '';
+    if (q.token !== token && !isAllowedLocalOrigin(origin) && !isLocalPageReferer(req.headers.referer)) {
+      // 诊断日志(规则:失败路径必须有日志):这条以前只在 http 摘要里留个 401,看不出原因——
+      // 是 token 错、还是既没 Origin 也没带本机 Referer(本地开发裸开浏览器时就是这种,播不出来)
+      pushLog('error', 'audio.file', `audio file 401 id=${id} origin=${origin || '(none)'} token=${q.token ? 'present' : 'missing'} referer=${req.headers.referer ?? '(none)'}`);
+      return reply.code(401).send({ ok: false, error: { code: 'UNAUTHORIZED', message: 'token 无效', next: '' } });
+    }
+    if (!Number.isInteger(id) || id <= 0) return reply.code(404).send({ ok: false, error: { code: 'NOT_FOUND', message: '来源不存在', next: '' } });
+    const row = importsRepo.get(id);
+    if (row === null) return reply.code(404).send({ ok: false, error: { code: 'NOT_FOUND', message: '来源不存在', next: '' } });
+    // 兜底自愈(用户拍板「解析时抓 + 看图兜底」):本地没有就现拿——可能是解析那次没抓成(断网/风控),
+    // 也可能压根没封面地址(B 站番剧的 flat 解析不返回封面字段,这里会单独问一次 yt-dlp,首次几秒后出图)
+    const file = await ensureCover(row);
+    if (file === null) return reply.code(404).send({ ok: false, error: { code: 'NOT_FOUND', message: '没有封面', next: '' } });
+    reply.header('content-type', coverMime(file)).header('cache-control', 'public, max-age=86400');
+    return reply.send(createReadStream(file));
   });
 
   app.delete('/api/imports/:id', async (req, reply) => {
@@ -385,8 +521,9 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
     };
     if (origin !== '') sseHeaders.vary = 'Origin';
     if (allowOrigin !== null) sseHeaders['access-control-allow-origin'] = allowOrigin;
-    // 诊断日志(规则正例):hijacked 端点必须留 CORS 摘要——curl 不查 CORS,只有这行能解释「为什么浏览器没收到事件」
-    pushLog('info', 'job', `SSE open job=${id} origin=${origin || '(none)'} acao=${allowOrigin ?? '(none)'} local=${isAllowedLocalOrigin(origin)}`);
+    // 诊断日志(规则正例,2026-09-29 起改为 debug 级):hijacked 端点必须留 CORS 摘要——curl 不查 CORS,
+    // 只有这行能解释「为什么浏览器没收到事件」。每建一条 SSE 连接就一行,所以归 debug、面板默认折叠
+    pushLog('debug', 'job', `SSE open job=${id} origin=${origin || '(none)'} acao=${allowOrigin ?? '(none)'} local=${isAllowedLocalOrigin(origin)}`);
     reply.raw.writeHead(200, sseHeaders);
     // 立即冲刷响应头:Node 的 writeHead 只排队,首个 write/end 才真正发出头字节;
     // 不冲刷则客户端 fetch 会一直等响应头(心跳 15s 前的空闲连接头也不到客户端)
@@ -499,7 +636,9 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
     if (typeof body.message !== 'string' || body.message.trim().length === 0) {
       return reply.code(400).send({ ok: false, error: { code: 'BAD_REQUEST', message: 'message 必填(非空字符串)', next: '' } });
     }
-    pushLog(body.level === 'error' ? 'error' : 'info', 'web', body.message);
+    // debug 也要透传(2026-09-29 加级别时补):否则前端的 debug 行会被降级成 info,面板过滤就白配了
+    const level = body.level === 'error' ? 'error' : body.level === 'debug' ? 'debug' : 'info';
+    pushLog(level, 'web', body.message);
     return { ok: true };
   });
 
@@ -517,8 +656,10 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
     const id = Number((req.params as { id: string }).id);
     const q = (req.query ?? {}) as { token?: string };
     // D3 更新(2026-09-29):同 SSE 路由,localhost 来源豁免 query token
+    // 又补(2026-09-29):<audio> 也不带 Origin、页面加不了 header → 额外认「Referer 是本机页面」。
+    // 实测日志里 /api/audio/:id/file 大量 401 就是这个坑:本地开发裸开浏览器时播放器根本拿不到文件。
     const origin = typeof req.headers.origin === 'string' ? req.headers.origin : '';
-    if (q.token !== token && !isAllowedLocalOrigin(origin)) {
+    if (q.token !== token && !isAllowedLocalOrigin(origin) && !isLocalPageReferer(req.headers.referer)) {
       return reply.code(401).send({ ok: false, error: { code: 'UNAUTHORIZED', message: 'token 无效', next: '' } });
     }
     // P2-5:id 非正整数(Number('abc')/0/负数)→ 404,避免 NaN 查询行为未定义

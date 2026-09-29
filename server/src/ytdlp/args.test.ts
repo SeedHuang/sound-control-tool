@@ -1,8 +1,17 @@
 import { describe, expect, it } from 'vitest';
-import { buildDownloadArgs, buildParseArgs } from './args.js';
+import { buildDownloadArgs, buildParseArgs, buildWriteThumbnailArgs } from './args.js';
 describe('buildParseArgs', () => {
   it('固定 -J --flat-playlist --no-warnings', () => {
     expect(buildParseArgs('https://b23.tv/abc')).toEqual(['-J', '--flat-playlist', '--no-warnings', 'https://b23.tv/abc']);
+  });
+});
+// 2026-09-29:封面改由 yt-dlp 自己写(--write-thumbnail)——Node fetch 不读系统代理,外网图床直连必超时
+describe('buildWriteThumbnailArgs', () => {
+  it('--skip-download + --write-thumbnail + 只取第 1 集 + -o 模板', () => {
+    const a = buildWriteThumbnailArgs('https://b23.tv/abc', 'D:/covers/cover-5.%(ext)s');
+    expect(a).toEqual(['--skip-download', '--write-thumbnail', '--playlist-items', '1', '--no-warnings', '-o', 'D:/covers/cover-5.%(ext)s', 'https://b23.tv/abc']);
+    expect(a).not.toContain('--flat-playlist');
+    expect(a).not.toContain('-J');
   });
 });
 describe('buildDownloadArgs', () => {

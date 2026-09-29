@@ -9,6 +9,13 @@ describe('mapYtdlpError', () => {
   it('binPath 为 null → YTDLP_NOT_FOUND', () => {
     expect(mapYtdlpError({ binPath: null }).code).toBe('YTDLP_NOT_FOUND');
   });
+  // 2026-09-29 实测:某 YouTube 视频 -J 输出 11MB 撑爆 4MB 缓冲 → 用户看到一串 Node 包名。给它一句人话。
+  it('输出撑爆缓冲(ERR_CHILD_PROCESS_STDIO_MAXBUFFER)→ OUTPUT_TOO_LARGE,不再是裸包名', () => {
+    const r = mapYtdlpError({ code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER', binPath: 'yt-dlp' });
+    expect(r.code).toBe('OUTPUT_TOO_LARGE');
+    expect(r.message).toContain('过大');
+    expect(r.message).not.toContain('MAXBUFFER');
+  });
   it('DRM 特征', () => {
     expect(mapYtdlpError({ stderr: 'ERROR: This video is DRM protected', binPath: 'yt-dlp' }).code).toBe('DRM');
   });

@@ -1,6 +1,6 @@
 import { Alert, Button, Card, Descriptions, Input, Modal, Typography, message } from 'antd';
 import { useEffect, useState } from 'react';
-import { ApiError, apiGet, apiPort, getCookieStatus, logFe, saveCookie, type CookieStatus } from '@/api';
+import { ApiError, apiGet, apiPort, clearServerLogs, getCookieStatus, logFe, saveCookie, type CookieStatus } from '@/api';
 
 interface BinProbe {
   path: string | null;
@@ -124,6 +124,43 @@ function CookieCard() {
   );
 }
 
+/**
+ * 日志卡片(2026-09-29 用户拍板):清空入口从「诊断日志抽屉」搬到这里。
+ * 抽屉只负责"看"(排查时随手翻),破坏性操作统一放设置页 —— 并且必须二次确认(仓库规则:危险操作必须二次确认)。
+ */
+function LogsCard() {
+  const [clearing, setClearing] = useState(false);
+  const confirmClear = (): void => {
+    Modal.confirm({
+      title: '清空全部日志?',
+      content: '将清空后端内存日志,并删除已按天/小时落盘的日志文件。',
+      okText: '清空',
+      okType: 'danger',
+      cancelText: '取消',
+      onOk: () => {
+        setClearing(true);
+        return clearServerLogs()
+          .then((r) => {
+            message.success(`已清空(内存 ${r.clearedEntries} 条,删除文件 ${r.deletedFiles.length} 个)`);
+            logFe('info', `日志已清空 clearedEntries=${r.clearedEntries} deletedFiles=${r.deletedFiles.length}`);
+          })
+          .catch((e: unknown) => message.error(e instanceof Error ? e.message : String(e)))
+          .finally(() => setClearing(false));
+      },
+    });
+  };
+  return (
+    <Card title="日志" style={{ marginBottom: 16 }}>
+      <Typography.Paragraph type="secondary">
+        清空后端内存日志,并删除已按天/小时落盘的日志文件。看日志请点右下角「日志」按钮。
+      </Typography.Paragraph>
+      <Button danger loading={clearing} onClick={confirmClear}>
+        清空所有日志
+      </Button>
+    </Card>
+  );
+}
+
 export default function SettingsPage() {
   const [bins, setBins] = useState<BinsResult | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -173,6 +210,7 @@ export default function SettingsPage() {
       <BinCard title="yt-dlp" bin={bins?.ytdlp ?? null} loading={loading} />
       <BinCard title="ffmpeg" bin={bins?.ffmpeg ?? null} loading={loading} />
       <CookieCard />
+      <LogsCard />
     </div>
   );
 }

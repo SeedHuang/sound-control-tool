@@ -6,6 +6,7 @@
 import { Outlet, useLocation, useNavigate } from '@umijs/max';
 import { Menu } from 'antd';
 import LogsButton from '@/components/LogsButton';
+import '@/global.css'; // 卡片墙动效等全局样式(显式引入,不依赖框架的全局样式约定)
 
 const NAV_ITEMS = [
   { key: '/', label: '首页' },

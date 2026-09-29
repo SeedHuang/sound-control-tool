@@ -3,8 +3,8 @@
 import type { DB } from '../index.js';
 
 export interface ImportEntry { index: number; title: string }
-export interface ImportUpsert { url: string; title: string; site: string; kind: 'single' | 'playlist'; duration_sec: number | null; entries: ImportEntry[] | null }
-export interface ImportSummaryRow { id: number; url: string; title: string; site: string; kind: 'single' | 'playlist'; entry_count: number; created_at: string }
+export interface ImportUpsert { url: string; title: string; site: string; kind: 'single' | 'playlist'; duration_sec: number | null; entries: ImportEntry[] | null; thumbnail?: string | null }
+export interface ImportSummaryRow { id: number; url: string; title: string; site: string; kind: 'single' | 'playlist'; entry_count: number; thumbnail: string | null; created_at: string }
 export interface ImportDetailRow extends ImportSummaryRow { duration_sec: number | null; entries: ImportEntry[] | null }
 
 /** 从 URL 识别来源站点(域名匹配,用于左列表 logo;非 URL → other) */
@@ -27,9 +27,11 @@ export function createImportsRepo(db: DB) {
   const upsertByUrl = (s: ImportUpsert): number => {
     const entriesJson = s.entries ? JSON.stringify(s.entries) : null;
     db.prepare(
-      'INSERT INTO imported_sources (url, title, site, kind, duration_sec, entries_json) VALUES (?, ?, ?, ?, ?, ?) ' +
-      'ON CONFLICT(url) DO UPDATE SET title=excluded.title, site=excluded.site, kind=excluded.kind, duration_sec=excluded.duration_sec, entries_json=excluded.entries_json',
-    ).run(s.url, s.title, s.site, s.kind, s.duration_sec, entriesJson);
+      'INSERT INTO imported_sources (url, title, site, kind, duration_sec, entries_json, thumbnail) VALUES (?, ?, ?, ?, ?, ?, ?) ' +
+      // thumbnail 用 COALESCE:这次解析没带封面地址时,保留上一次存的那个(否则一次抓不到图就把已有封面地址抹了)
+      'ON CONFLICT(url) DO UPDATE SET title=excluded.title, site=excluded.site, kind=excluded.kind, duration_sec=excluded.duration_sec, ' +
+      'entries_json=excluded.entries_json, thumbnail=COALESCE(excluded.thumbnail, imported_sources.thumbnail)',
+    ).run(s.url, s.title, s.site, s.kind, s.duration_sec, entriesJson, s.thumbnail ?? null);
     const row = db.prepare('SELECT id FROM imported_sources WHERE url = ?').get(s.url) as { id: number } | undefined;
     if (!row) throw new Error('imported_sources upsert 后查不到行');
     return row.id;
@@ -37,13 +39,14 @@ export function createImportsRepo(db: DB) {
 
   /** 左列表(新→旧);entries_json 不整包返回,只算条数(列表轻量) */
   const list = (): ImportSummaryRow[] =>
-    (db.prepare('SELECT id, url, title, site, kind, entries_json, created_at FROM imported_sources ORDER BY created_at DESC, id DESC').all() as Array<Record<string, unknown>>).map((r) => ({
+    (db.prepare('SELECT id, url, title, site, kind, entries_json, thumbnail, created_at FROM imported_sources ORDER BY created_at DESC, id DESC').all() as Array<Record<string, unknown>>).map((r) => ({
       id: r.id as number,
       url: r.url as string,
       title: r.title as string,
       site: r.site as string,
       kind: r.kind as 'single' | 'playlist',
       entry_count: r.entries_json !== null ? (JSON.parse(r.entries_json as string) as ImportEntry[]).length : 1,
+      thumbnail: r.thumbnail === null || r.thumbnail === undefined ? null : String(r.thumbnail),
       created_at: r.created_at as string,
     }));
 
@@ -56,6 +59,7 @@ export function createImportsRepo(db: DB) {
       site: r.site as string,
       kind: r.kind as 'single' | 'playlist',
       entry_count: entries?.length ?? 1,
+      thumbnail: r.thumbnail === null || r.thumbnail === undefined ? null : String(r.thumbnail),
       duration_sec: (r.duration_sec as number | null) ?? null,
       entries,
       created_at: r.created_at as string,

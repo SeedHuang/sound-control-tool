@@ -15,6 +15,14 @@ const BRANDS: Record<string, { label: string; color: string; path: string }> = {
   },
 };
 
+/** 品牌主色 + 同色系的浅底(2026-09-29:分组卡片用它做封面兜底底色/进度条)。
+ *  与上面 BRANDS 同源,不要在别处再写一份颜色表。 */
+export function siteColor(site: string): { fg: string; bg: string } {
+  const brand = BRANDS[site];
+  if (brand) return { fg: brand.color, bg: `${brand.color}14` }; // 8 位 hex 的末两位是 alpha(约 8%)
+  return { fg: '#8c8c8c', bg: '#fafafa' };
+}
+
 export default function SiteLogo({ site, size = 16 }: { site: string; size?: number }) {
   const s = { width: size, height: size, flexShrink: 0 };
   const brand = BRANDS[site];

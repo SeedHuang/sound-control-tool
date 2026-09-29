@@ -85,6 +85,9 @@ export async function createServer(opts: CreateServerOpts): Promise<{
       // D3:SSE 与音频文件端点无法设 header(EventSource/<audio>),token 走 query——豁免 header 校验,由路由内 query 校验接管
       if (/^\/api\/jobs\/\d+\/events$/.test(pathname)) return;
       if (/^\/api\/audio\/\d+\/file$/.test(pathname)) return;
+      // 作品封面同属这一类(<img> 也加不了 header):2026-09-29 浏览器实测漏网——守卫没豁免它,
+      // 于是封面一律 401、卡片全退成纯色(路由内的 query token / Referer 判定根本没机会跑)
+      if (/^\/api\/imports\/\d+\/cover$/.test(pathname)) return;
       const origin = req.headers.origin;
       if (typeof origin === 'string' && isAllowedLocalOrigin(origin)) return; // dev 浏览器豁免(D12)
       if (req.headers['x-sct-token'] !== token) {

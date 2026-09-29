@@ -7,8 +7,10 @@ import { join } from 'node:path';
 
 export interface LogRow {
   ts: string; // ISO 时间戳
-  level: 'info' | 'error';
-  source: 'server' | 'job' | 'http' | 'audio.delete' | 'web';
+  // debug(2026-09-29 增):例行但排查时有用的一类——hijacked 端点的 CORS 摘要、跳过某个慢路径的决定等。
+  // 这类日志一屏好几条,默认在前端面板里折叠,需要时一键展开(仓库规则里说的"debug 级"就是这一档)
+  level: 'debug' | 'info' | 'error';
+  source: 'server' | 'job' | 'http' | 'audio.file' | 'audio.delete' | 'audio.replace' | 'cover' | 'web';
   message: string;
 }
 

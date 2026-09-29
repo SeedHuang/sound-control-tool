@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { normalizeParse, parseMetadata } from './parse.js';
+import { normalizeParse, parseMetadata, pickThumbnail } from './parse.js';
 describe('normalizeParse', () => {
   it('单视频', () => {
     const r = normalizeParse({ title: '课 01', duration: 61.5, thumbnail: 'http://t' });
@@ -10,6 +10,12 @@ describe('normalizeParse', () => {
     const r = normalizeParse({ title: '合集', entries: [{ title: 'A' }, { title: 'B' }] });
     expect(r.kind).toBe('playlist');
     expect(r.entries).toEqual([{ index: 1, title: 'A' }, { index: 2, title: 'B' }]);
+  });
+  it('封面地址两种形状都认:thumbnail 字符串优先,只有 thumbnails 数组时从后往前取', () => {
+    expect(pickThumbnail({ thumbnail: 'http://a.jpg', thumbnails: [{ url: 'http://b.jpg' }] })).toBe('http://a.jpg');
+    expect(pickThumbnail({ thumbnails: [{ url: 'http://lo.jpg' }, { url: 'http://hi.jpg' }] })).toBe('http://hi.jpg');
+    expect(pickThumbnail({})).toBeUndefined();
+    expect(pickThumbnail({ thumbnail: '' })).toBeUndefined(); // 空串不算
   });
 });
 describe('parseMetadata', () => {
