@@ -3,7 +3,8 @@ import type { FastifyInstance } from 'fastify';
 import { createReadStream, existsSync, mkdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import type { DB } from '../db/index.js';
-import { isAllowedLocalOrigin } from '../http/cors.js';
+import { isAllowedOrigin, isAllowedLocalOrigin } from '../http/cors.js';
+import { getLogs, pushLog } from '../logs.js';
 import { createAudioItemsRepo } from '../db/repo/audio-items.js';
 import { createJobsRepo } from '../db/repo/jobs.js';
 import { createSettingsRepo } from '../db/repo/settings.js';
@@ -20,6 +21,8 @@ type SseConn = { write: (s: string) => void; end: () => void };
 const sseConnections = new Map<number, Set<SseConn>>();
 // 终态:done/error/cancelled 事件后断开连接(progress/running 不断开)
 const TERMINAL_STATES = new Set(['done', 'error', 'cancelled']);
+// 诊断日志:每个 job 只在 25/50/75/100 档位变化时记一行进度(逐条进度行会把日志面板刷成噪声)
+const lastProgressBucket = new Map<number, number>();
 function emit(jobId: number, ev: unknown): void {
   const set = sseConnections.get(jobId);
   if (!set) return;
@@ -29,6 +32,7 @@ function emit(jobId: number, ev: unknown): void {
   if (type === 'done' || (type === 'status' && state && TERMINAL_STATES.has(state))) {
     for (const conn of set) conn.end();
     sseConnections.delete(jobId);
+    lastProgressBucket.delete(jobId); // 终态清理,防 Map 无界增长
   }
 }
 
@@ -72,6 +76,7 @@ function createDownloadHandlers(deps: YtdlpDeps) {
       });
       audioId = result.audioId;
       jobsRepo.finish(jobId);
+      pushLog('info', 'job', `job ${jobId} done → audio ${result.audioId} @ ${result.finalPath}`); // 诊断日志:入库成败都要可见
       emit(jobId, { type: 'done', audioId: result.audioId, filePath: result.finalPath, title: payload.title ?? '下载音频', format });
       // spec §0.3 列了 status done,但 emit('done') 已断开连接并删除订阅表,紧随的 status done 无人可达——
       // 前端 subscribeJob 只监听 progress/done/status(error/cancelled),不消费 status done,故不再单独发(由 done 隐含)
@@ -90,6 +95,7 @@ function createDownloadHandlers(deps: YtdlpDeps) {
     if (!bin.path) {
       const msg = mapYtdlpError({ binPath: null }).message;
       jobsRepo.fail(jobId, msg);
+      pushLog('error', 'job', `job ${jobId} error: ${msg}`); // 诊断日志:bin 缺失也要在面板可见
       emit(jobId, { type: 'status', state: 'error', message: msg }); // 补 SSE 终态,否则订阅连接悬挂
       return;
     }
@@ -107,11 +113,18 @@ function createDownloadHandlers(deps: YtdlpDeps) {
       },
       outDir: jobOutDir,
     });
+    pushLog('info', 'job', `job ${jobId} spawn yt-dlp bin=${bin.path}`); // 诊断日志:记录实际用的二进制路径
     downloadManager.start({
       jobId, binPath: bin.path, args, outDir: jobOutDir,
       onEvent: (jid, ev) => {
         if (ev.type === 'progress') {
           jobsRepo.update(jid, { progress: ev.percent });
+          // 诊断日志只记 25/50/75/100 档位变化(逐条进度行会把日志面板刷成噪声)
+          const bucket = Math.floor(ev.percent / 25);
+          if (lastProgressBucket.get(jid) !== bucket) {
+            lastProgressBucket.set(jid, bucket);
+            pushLog('info', 'job', `job ${jid} 进度 ${Math.round(ev.percent)}%`);
+          }
           emit(jid, ev); // Critical 修复:进度事件推给该 job 的所有 SSE 连接(前端进度条依赖;emit 把 type 写进 event 行)
         }
         if (ev.type === 'status' && ev.state === 'done' && ev.producedPath) {
@@ -119,6 +132,7 @@ function createDownloadHandlers(deps: YtdlpDeps) {
         }
         if (ev.type === 'status' && ev.state === 'error' && ev.message) {
           jobsRepo.fail(jid, ev.message);
+          pushLog('error', 'job', `job ${jid} error: ${ev.message}`); // 诊断日志:下载进程报错留痕
           emit(jid, { type: 'status', state: 'error', message: ev.message });
         }
       },
@@ -144,6 +158,8 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
     }
     try {
       const parsed = await parseMetadata(bin.path, url);
+      // 诊断日志:解析成功一行(kind + 条目数),面板里能看到"解析了什么"
+      pushLog('info', 'job', `parse ${url} → ${parsed.kind} (${parsed.entries?.length ?? 0} entries)`);
       const existing = audioRepo.findBySourceUrl(url);
       // 注意:parse 内部用 durationSec(驼峰),对外契约 spec 0.3 是 duration_sec(下划线,与 audio_items 键风格一致)
       return {
@@ -156,7 +172,10 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
         existing: existing ? { audioId: existing.id, title: existing.title } : undefined,
       };
     } catch (e) {
-      if (e instanceof YtdlpRunError) return reply.code(502).send({ ok: false, error: e.info });
+      if (e instanceof YtdlpRunError) {
+        pushLog('error', 'job', `parse ${url} 失败: ${e.info.message}`); // 诊断日志:解析失败要能看到原因
+        return reply.code(502).send({ ok: false, error: e.info });
+      }
       throw e;
     }
   });
@@ -201,6 +220,7 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
     }
     const jobsRepo = createJobsRepo(db);
     const jobId = jobsRepo.create('ytdlp_download', { url, options: body.options, title: body.title ?? null, durationSec: body.durationSec ?? null });
+    pushLog('info', 'job', `job ${jobId} created url=${url} format=${String(opt.format)}`); // 诊断日志:任务创建留痕
     await startDownload(jobId, { url, options: body.options ?? {}, title: typeof body.title === 'string' ? body.title : undefined, durationSec: typeof body.durationSec === 'number' ? body.durationSec : undefined });
     return reply.code(201).send({ ok: true, jobId });
   });
@@ -221,9 +241,16 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
     const job = jobsRepo.get(id);
     if (!job) return reply.code(404).send({ ok: false, error: { code: 'NOT_FOUND', message: 'job 不存在', next: '' } });
     const raw = reply.raw;
-    reply.raw.writeHead(200, {
+    // CORS 修复(2026-09-29 用户反馈):hijack reply 后 Fastify 的 onSend 钩子不会运行,
+    // cors.ts 里依赖 onSend 下发的 access-control-allow-origin 因此缺失 → 浏览器拦截跨源 EventSource,进度事件全丢。
+    // 此处在 writeHead 复刻 cors.ts onSend 的同款语义:origin 存在 → vary: Origin;白名单内(含 file:// 的 null)→ 反射 ACAO。
+    const allowOrigin = origin !== '' && isAllowedOrigin(origin) ? origin : null;
+    const sseHeaders: Record<string, string> = {
       'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive',
-    });
+    };
+    if (origin !== '') sseHeaders.vary = 'Origin';
+    if (allowOrigin !== null) sseHeaders['access-control-allow-origin'] = allowOrigin;
+    reply.raw.writeHead(200, sseHeaders);
     // 立即冲刷响应头:Node 的 writeHead 只排队,首个 write/end 才真正发出头字节;
     // 不冲刷则客户端 fetch 会一直等响应头(心跳 15s 前的空闲连接头也不到客户端)
     raw.flushHeaders();
@@ -257,6 +284,7 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
     if (!job) return reply.code(404).send({ ok: false, error: { code: 'NOT_FOUND', message: 'job 不存在', next: '' } });
     await downloadManager.cancel(id);
     jobsRepo.update(id, { status: 'cancelled', message: '用户取消' });
+    pushLog('info', 'job', `job ${id} cancelled by user`); // 诊断日志:取消也要留痕(用户反馈"取消没反应"要能查日志)
     emit(id, { type: 'status', state: 'cancelled', message: '用户取消' });
     return { ok: true };
   });
@@ -299,6 +327,11 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
 
   // Task 7:音频列表——spec 0.3:返回数组(非 {ok,items});list() 已按 created_at DESC(§0.4)
   app.get('/api/audio', async () => audioRepo.list());
+
+  // 诊断日志(2026-09-29 用户反馈):环形缓冲最近 500 条,前端"日志"按钮拉取。
+  // 守卫不需要改——index.ts 的 onRequest 对 /api/* 校验 token(localhost 来源豁免),
+  // 浏览器直连(localhost)与 Electron(file:// + x-sct-token 头)都可达。
+  app.get('/api/logs', async () => ({ ok: true, logs: getLogs() }));
 
   // Task 7:音频文件流——D3 query token(<audio> 标签无法设 header);P2-5:非正整数 id → 404,避免 NaN 查询行为未定义
   app.get('/api/audio/:id/file', async (req, reply) => {

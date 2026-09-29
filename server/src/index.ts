@@ -7,6 +7,7 @@ import { createSettingsRepo } from './db/repo/settings.js';
 import { initSchema } from './db/schema.js';
 import { isAllowedLocalOrigin, registerCors } from './http/cors.js';
 import { registerSettingsRoutes } from './http/settings-routes.js';
+import { pushLog, registerRequestLogging } from './logs.js';
 import { findFreePort } from './net/find-free-port.js';
 import { probeBin } from './bins.js';
 import { SETTINGS_KEYS } from './settings-keys.js';
@@ -43,6 +44,7 @@ export async function createServer(opts: CreateServerOpts): Promise<{
 
     app = Fastify({ logger: false });
     registerCors(app);
+    registerRequestLogging(app); // 诊断日志:/api/* 每请求一行(2026-09-29 用户反馈)
     registerSettingsRoutes(app, db);
 
     let port = opts.port;
@@ -101,6 +103,7 @@ export async function createServer(opts: CreateServerOpts): Promise<{
     listening = true;
     const addr = app.server.address();
     if (typeof addr === 'object' && addr !== null) port = addr.port;
+    pushLog('info', 'server', `listening on 127.0.0.1:${port}`); // 诊断日志:启动即有一行,面板打开不至于空白
 
     if (opts.portFile) {
       writeFileSync(opts.portFile, JSON.stringify({ port, pid: process.pid, token }));

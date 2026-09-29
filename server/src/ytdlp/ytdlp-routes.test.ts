@@ -11,6 +11,7 @@ import { registerYtdlpRoutes } from './ytdlp-routes.js';
 import { createDownloadManager } from './download.js';
 import { createJobsRepo } from '../db/repo/jobs.js';
 import { createAudioItemsRepo } from '../db/repo/audio-items.js';
+import { registerRequestLogging } from '../logs.js';
 
 // parse success 用例:mock parseMetadata 返回成功,避免真实 execFile 拉 yt-dlp;
 // YtdlpRunError 保留真身(importOriginal 展开),不影响既有 400/409 用例(它们不触达 parseMetadata)
@@ -288,5 +289,79 @@ describe('GET /api/audio 与 GET /api/audio/:id/file', () => {
     const res = await app.inject({ method: 'GET', url: '/api/audio' });
     expect(res.json()).toHaveLength(1);
     expect(res.json()[0].title).toBe('a');
+  });
+});
+
+// CORS 修复(2026-09-29 用户反馈):SSE 路由 hijack reply 后,Fastify 的 onSend 钩子不会运行,
+// cors.ts 依赖 onSend 下发的 access-control-allow-origin 因此缺失 → 浏览器拦截跨源 EventSource,进度事件全丢。
+// 修复后 hijack 的 writeHead 必须自带同款 CORS 头;用终态 job 让路由走 hijack 分支并立即 end(inject 可返回)。
+describe('GET /api/jobs/:id/events SSE CORS 头(hijack 路径)', () => {
+  it('白名单 origin → 反射 access-control-allow-origin + vary: Origin,终态补发不受影响', async () => {
+    const jobsRepo = createJobsRepo(db);
+    const jid = jobsRepo.create('ytdlp_download', { url: 'https://a/1', options: { format: 'mp3' } });
+    jobsRepo.finish(jid); // done:路由走 hijack + 终态补发 + end
+    makeApp('yt-dlp', 'tok2');
+    const res = await app.inject({
+      method: 'GET', url: `/api/jobs/${jid}/events?token=tok2`,
+      headers: { origin: 'http://localhost:8000' },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.headers['access-control-allow-origin']).toBe('http://localhost:8000');
+    expect(res.headers['vary']).toBe('Origin');
+    expect(res.body).toContain('event: status'); // 终态补发仍在(CORS 头不改变 SSE 行为)
+  });
+  it('file:// origin(null) → 反射 access-control-allow-origin: null(isAllowedOrigin 放行 file://)', async () => {
+    const jobsRepo = createJobsRepo(db);
+    const jid = jobsRepo.create('ytdlp_download', { url: 'https://a/1', options: { format: 'mp3' } });
+    jobsRepo.finish(jid);
+    makeApp('yt-dlp', 'tok2');
+    const res = await app.inject({
+      method: 'GET', url: `/api/jobs/${jid}/events?token=tok2`,
+      headers: { origin: 'null' },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.headers['access-control-allow-origin']).toBe('null');
+  });
+  it('非白名单 origin → 不下发 access-control-allow-origin(vary: Origin 仍在)', async () => {
+    const jobsRepo = createJobsRepo(db);
+    const jid = jobsRepo.create('ytdlp_download', { url: 'https://a/1', options: { format: 'mp3' } });
+    jobsRepo.finish(jid);
+    makeApp('yt-dlp', 'tok2');
+    const res = await app.inject({
+      method: 'GET', url: `/api/jobs/${jid}/events?token=tok2`,
+      headers: { origin: 'http://evil.example' },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.headers['access-control-allow-origin']).toBeUndefined();
+    expect(res.headers['vary']).toBe('Origin');
+  });
+});
+
+// 诊断日志(2026-09-29 用户反馈):GET /api/logs 返回环形缓冲;/api/* 请求留痕(http 行)+ job 生命周期留痕
+describe('GET /api/logs', () => {
+  it('返回 ok:true + logs 数组;400 parse 请求留下一行 http 日志(路径剥离 query,不泄 token)', async () => {
+    makeApp('yt-dlp');
+    registerRequestLogging(app); // 与 index.ts createServer 同款请求日志钩子
+    await app.inject({ method: 'POST', url: '/api/ytdlp/parse', payload: {} }); // 400
+    const res = await app.inject({ method: 'GET', url: '/api/logs?token=tok2' });
+    expect(res.statusCode).toBe(200);
+    const j = res.json() as { ok: boolean; logs: { level: string; source: string; message: string }[] };
+    expect(j.ok).toBe(true);
+    expect(Array.isArray(j.logs)).toBe(true);
+    const httpLine = j.logs.find((l) => l.source === 'http' && l.message.includes('POST /api/ytdlp/parse'));
+    expect(httpLine).toBeDefined();
+    expect(httpLine?.message).toContain('400');
+    expect(httpLine?.level).toBe('info'); // 4xx 不算 server 错误(≥500 才 error)
+  });
+  it('download 成功 → job created/spawn 两行 job 日志可在 /api/logs 查到', async () => {
+    const dm = { start: vi.fn(), cancel: vi.fn(async () => {}), dispose: vi.fn(async () => {}) };
+    makeApp('yt-dlp', 'tok2', dm as unknown as ReturnType<typeof createDownloadManager>);
+    const res = await app.inject({ method: 'POST', url: '/api/ytdlp/download', payload: { url: 'https://a/9', options: { format: 'mp3' }, title: '课' } });
+    expect(res.statusCode).toBe(201);
+    const jobId = res.json().jobId as number;
+    const logsRes = await app.inject({ method: 'GET', url: '/api/logs' });
+    const logs = (logsRes.json() as { logs: { source: string; message: string }[] }).logs;
+    expect(logs.some((l) => l.source === 'job' && l.message === `job ${jobId} created url=https://a/9 format=mp3`)).toBe(true);
+    expect(logs.some((l) => l.source === 'job' && l.message.includes(`job ${jobId} spawn yt-dlp bin=`))).toBe(true);
   });
 });
