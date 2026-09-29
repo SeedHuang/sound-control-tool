@@ -3,6 +3,7 @@ import type { FastifyInstance } from 'fastify';
 import { createReadStream, existsSync, mkdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import type { DB } from '../db/index.js';
+import { isAllowedLocalOrigin } from '../http/cors.js';
 import { createAudioItemsRepo } from '../db/repo/audio-items.js';
 import { createJobsRepo } from '../db/repo/jobs.js';
 import { createSettingsRepo } from '../db/repo/settings.js';
@@ -210,7 +211,12 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
     // M3:id 非正整数(Number('abc')/0/负数)→ 404,与 audio 文件路由 P2-5 守卫一致
     if (!Number.isInteger(id) || id <= 0) return reply.code(404).send({ ok: false, error: { code: 'NOT_FOUND', message: 'job 不存在', next: '' } });
     const q = (req.query ?? {}) as { token?: string };
-    if (q.token !== token) return reply.code(401).send({ ok: false, error: { code: 'UNAUTHORIZED', message: 'token 无效', next: '' } });
+    // D3 更新(2026-09-29):localhost 来源(浏览器直连 dev 无 apiToken)豁免 query token;
+    // 非 localhost(含 file://)仍需 token——本地请求只能来自本机,不新增攻击面
+    const origin = typeof req.headers.origin === 'string' ? req.headers.origin : '';
+    if (q.token !== token && !isAllowedLocalOrigin(origin)) {
+      return reply.code(401).send({ ok: false, error: { code: 'UNAUTHORIZED', message: 'token 无效', next: '' } });
+    }
     const jobsRepo = createJobsRepo(db);
     const job = jobsRepo.get(id);
     if (!job) return reply.code(404).send({ ok: false, error: { code: 'NOT_FOUND', message: 'job 不存在', next: '' } });
@@ -298,7 +304,11 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
   app.get('/api/audio/:id/file', async (req, reply) => {
     const id = Number((req.params as { id: string }).id);
     const q = (req.query ?? {}) as { token?: string };
-    if (q.token !== token) return reply.code(401).send({ ok: false, error: { code: 'UNAUTHORIZED', message: 'token 无效', next: '' } });
+    // D3 更新(2026-09-29):同 SSE 路由,localhost 来源豁免 query token
+    const origin = typeof req.headers.origin === 'string' ? req.headers.origin : '';
+    if (q.token !== token && !isAllowedLocalOrigin(origin)) {
+      return reply.code(401).send({ ok: false, error: { code: 'UNAUTHORIZED', message: 'token 无效', next: '' } });
+    }
     // P2-5:id 非正整数(Number('abc')/0/负数)→ 404,避免 NaN 查询行为未定义
     if (!Number.isInteger(id) || id <= 0) return reply.code(404).send({ ok: false, error: { code: 'NOT_FOUND', message: '音频不存在', next: '' } });
     const item = audioRepo.get(id);

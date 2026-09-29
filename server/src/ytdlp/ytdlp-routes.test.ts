@@ -123,6 +123,22 @@ describe('GET /api/jobs/:id/events', () => {
     const res = await app.inject({ method: 'GET', url: '/api/jobs/1/events?token=bad' });
     expect(res.statusCode).toBe(401);
   });
+  // D3 更新(2026-09-29):localhost 来源豁免 query token——浏览器直连 dev(无 apiToken)SSE 可连
+  it('events localhost origin + 无 token → 守卫放行(不存在 job → 404,证明未 401)', async () => {
+    makeApp('yt-dlp', 'tok2');
+    const res = await app.inject({ method: 'GET', url: '/api/jobs/999/events', headers: { origin: 'http://localhost:8000' } });
+    expect(res.statusCode).toBe(404);
+  });
+  it('events localhost origin + token 错误 → 守卫放行(404)', async () => {
+    makeApp('yt-dlp', 'tok2');
+    const res = await app.inject({ method: 'GET', url: '/api/jobs/999/events?token=bad', headers: { origin: 'http://127.0.0.1:8000' } });
+    expect(res.statusCode).toBe(404);
+  });
+  it('events 非 localhost origin + 无 token → 401', async () => {
+    makeApp('yt-dlp', 'tok2');
+    const res = await app.inject({ method: 'GET', url: '/api/jobs/1/events', headers: { origin: 'http://evil.example' } });
+    expect(res.statusCode).toBe(401);
+  });
   it('events job 不存在 → 404', async () => {
     makeApp('yt-dlp', 'tok2');
     const res = await app.inject({ method: 'GET', url: '/api/jobs/999/events?token=tok2' });
@@ -254,6 +270,17 @@ describe('GET /api/audio 与 GET /api/audio/:id/file', () => {
     expect(ok.statusCode).toBe(200);
     expect(ok.headers['content-type']).toBe('audio/mpeg');
     expect(ok.body).toBe('abc');
+  });
+  // D3 更新(2026-09-29):localhost 来源豁免 query token——<audio> 标签无法设 header,浏览器直连 dev 需免 token
+  it('audio 文件 localhost origin + 无 token → 守卫放行(不存在 id → 404,证明未 401)', async () => {
+    makeApp('yt-dlp', 'tok2');
+    const res = await app.inject({ method: 'GET', url: '/api/audio/999/file', headers: { origin: 'http://localhost:8000' } });
+    expect(res.statusCode).toBe(404);
+  });
+  it('audio 文件非 localhost origin + 无 token → 401', async () => {
+    makeApp('yt-dlp', 'tok2');
+    const res = await app.inject({ method: 'GET', url: '/api/audio/999/file', headers: { origin: 'http://evil.example' } });
+    expect(res.statusCode).toBe(401);
   });
   it('audio 列表返回全部', async () => {
     createAudioItemsRepo(db).create({ title: 'a', source_type: 'download', source_url: 'u', file_path: 'C:/x/a.mp3', format: 'mp3', duration_sec: null, file_size: 1 });
