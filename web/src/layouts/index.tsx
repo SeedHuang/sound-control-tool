@@ -1,7 +1,7 @@
 // web/src/layouts/index.tsx(全局导航:Umi 约定布局,自动包裹全部路由——2026-09-29 用户反馈"内页无导航回不去")
+// 注:导航读写用原生 window.location.hash,与各页面既有模式一致(@umijs/max 未导出 history/useLocation)
 import { Menu } from 'antd';
 import type { ReactNode } from 'react';
-import { history } from '@umijs/max';
 import LogsButton from '@/components/LogsButton';
 
 const NAV_ITEMS = [
@@ -11,17 +11,22 @@ const NAV_ITEMS = [
   { key: '/settings', label: '设置' },
 ];
 
+/** 当前 hash 内路径:'#/acquire?x' → '/acquire';空 hash → '/' */
+function currentPath(): string {
+  const h = window.location.hash.replace(/^#/, '');
+  return (h.split('?')[0] ?? '') || '/';
+}
+
 export default function GlobalLayout({ children }: { children: ReactNode }) {
-  // hash 路由:history.location.pathname 即 hash 内路径;路由切换时布局随 children 重渲染,读值即当前页
-  const pathname = history.location.pathname;
-  const selected = NAV_ITEMS.find((i) => i.key === pathname)?.key ?? '/';
+  // 路由切换时布局随 children 重渲染,渲染期读 hash 即当前页
+  const selected = NAV_ITEMS.find((i) => i.key === currentPath())?.key ?? '/';
   return (
     <div style={{ minHeight: '100vh' }}>
       <Menu
         mode="horizontal"
         selectedKeys={[selected]}
         items={NAV_ITEMS}
-        onClick={({ key }) => history.push(key)}
+        onClick={({ key }) => { window.location.hash = key; }}
         style={{ paddingInline: 16 }}
       />
       {children}
