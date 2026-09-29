@@ -42,4 +42,14 @@ describe('ingestDownloadedFile', () => {
     expect(p2.endsWith('-2.mp3')).toBe(true);
     expect(p2).not.toBe(p1);
   });
+  it('rename 失败 → 已 INSERT 的行回滚删除(修复:不留指向 temp 的悬空行)', () => {
+    const audioRepo = createAudioItemsRepo(db);
+    // tmpPath 不存在 → renameSync 抛 ENOENT;此时行已 INSERT,必须回滚删除
+    const tmpPath = join(dir, 'missing.mp3');
+    expect(() => ingestDownloadedFile({
+      tmpPath, title: '回滚', format: 'mp3', durationSec: null, fileSize: 1,
+      sourceUrl: 'u', audioDir: dir, exists: existsSync, audioRepo,
+    })).toThrow();
+    expect(audioRepo.list()).toHaveLength(0);
+  });
 });

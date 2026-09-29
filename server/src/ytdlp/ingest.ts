@@ -16,7 +16,14 @@ export function ingestDownloadedFile(opts: {
   const id8 = String(audioId).padStart(8, '0').slice(-8);
   const finalName = `${slugify(opts.title)}-${id8}.${opts.format}`;
   const finalPath = resolveUniquePath(opts.audioDir, finalName, opts.exists);
-  renameSync(opts.tmpPath, finalPath);
+  try {
+    renameSync(opts.tmpPath, finalPath);
+  } catch (err) {
+    // P1-2 回滚补洞:rename 失败(被占/权限/IO)时,已 INSERT 的行必须在这里删除——
+    // 路由层 catch 里 audioId 仍是 null(ingest 未返回),不会补删,否则 DB 残留指向 temp 的悬空行
+    opts.audioRepo.delete(audioId);
+    throw err;
+  }
   opts.audioRepo.updateFilePath(audioId, finalPath);
   return { audioId, finalPath };
 }

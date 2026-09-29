@@ -1,6 +1,7 @@
 // server/src/ytdlp/ytdlp-routes.test.ts
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import type { AddressInfo } from 'node:net';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import Fastify, { type FastifyInstance } from 'fastify';
@@ -23,18 +24,23 @@ vi.mock('./parse.js', async (importOriginal) => {
 
 let db: DB;
 let app: FastifyInstance;
+let tempDir: string; // 每用例独立真实 tempDir(startDownload 会 mkdirSync 子目录;用 'C:/tmp' 会在机器上留残余)
 beforeEach(async () => {
   db = openDatabase(':memory:'); initSchema(db);
   app = Fastify({ logger: false });
+  tempDir = mkdtempSync(join(tmpdir(), 'sct-ytdlp-tmp-'));
 });
-afterEach(async () => { await app.close(); db.close(); });
+afterEach(async () => {
+  app.server.closeAllConnections?.(); // 强制关闭残留 SSE/keep-alive 连接,防 app.close() 悬挂
+  await app.close(); db.close(); rmSync(tempDir, { recursive: true, force: true });
+});
 
 function makeApp(binPath: string | null, token = 'tok', dm?: ReturnType<typeof createDownloadManager>) {
   return registerYtdlpRoutes(app, {
     db,
     binProvider: async () => ({ path: binPath }),
     downloadManager: dm ?? createDownloadManager(),
-    audioDir: 'C:/audio', tempDir: 'C:/tmp', token,
+    audioDir: 'C:/audio', tempDir, token,
   });
 }
 
@@ -102,11 +108,11 @@ describe('POST /api/ytdlp/download', () => {
     // job 已建且 running
     const job = createJobsRepo(db).get(res.json().jobId)!;
     expect(job.status).toBe('running');
-    // startDownload 正确接线:jobId/outDir 传给 downloadManager.start
+    // startDownload 正确接线:jobId/outDir 传给 downloadManager.start(per-job 子目录)
     expect(dm.start).toHaveBeenCalledTimes(1);
     const startOpts = dm.start.mock.calls[0]?.[0] as { jobId: number; outDir: string } | undefined;
     expect(startOpts?.jobId).toBe(res.json().jobId);
-    expect(startOpts?.outDir).toBe('C:/tmp');
+    expect(startOpts?.outDir).toBe(join(tempDir, 'job' + res.json().jobId));
   });
 });
 
@@ -122,6 +128,54 @@ describe('GET /api/jobs/:id/events', () => {
     const res = await app.inject({ method: 'GET', url: '/api/jobs/999/events?token=tok2' });
     expect(res.statusCode).toBe(404);
   });
+  it('events id 非正整数 → 404(M3)', async () => {
+    makeApp('yt-dlp', 'tok2');
+    const res = await app.inject({ method: 'GET', url: '/api/jobs/abc/events?token=tok2' });
+    expect(res.statusCode).toBe(404);
+  });
+  // Critical 修复:progress 事件必须推送到 SSE 连接(此前只写 jobsRepo 不 emit,前端进度条恒 0%)
+  // app.inject 会缓冲整个响应,SSE 永不断开无法用 inject 测 → 真实 listen + fetch 读流
+  it('SSE 连接收到 progress 事件(emit 接线)', async () => {
+    let fireProgress: (() => void) | undefined;
+    let fireEnd: (() => void) | undefined;
+    const dm = {
+      start: vi.fn((opts: { jobId: number; onEvent: (jid: number, ev: unknown) => void }) => {
+        // 捕获 onEvent,等 SSE 连接建立后再触发,模拟下载中途的进度行
+        fireProgress = () => opts.onEvent(opts.jobId, { type: 'progress', percent: 42, downloadedBytes: 1024, totalBytes: 2048 });
+        // 断言读完后触发终态,让服务端主动 end 连接——否则 app.close() 会等这条 SSE 连接悬挂
+        fireEnd = () => opts.onEvent(opts.jobId, { type: 'status', state: 'cancelled', message: '测试收尾' });
+      }),
+      cancel: vi.fn(async () => {}),
+      dispose: vi.fn(async () => {}),
+    };
+    makeApp('yt-dlp', 'tok2', dm as unknown as ReturnType<typeof createDownloadManager>);
+    const res = await app.inject({ method: 'POST', url: '/api/ytdlp/download', payload: { url: 'https://a/1', options: { format: 'mp3' } } });
+    expect(res.statusCode).toBe(201);
+    const jobId = res.json().jobId as number;
+    await app.listen({ port: 0, host: '127.0.0.1' });
+    const port = (app.server.address() as AddressInfo).port;
+    const ac = new AbortController();
+    const sse = await fetch(`http://127.0.0.1:${port}/api/jobs/${jobId}/events?token=tok2`, { signal: ac.signal });
+    const reader = sse.body!.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    try {
+      // SSE 路由 handler 同步写完 writeHead/注册连接后 fetch 才 resolve,此时触发进度事件必达连接
+      fireProgress!();
+      const deadline = Date.now() + 3000;
+      while (Date.now() < deadline && !buf.includes('event: progress')) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+      }
+      fireEnd!(); // 服务端 end 连接(终态事件),app.close() 不再悬挂
+    } finally {
+      await reader.cancel().catch(() => {});
+      ac.abort();
+    }
+    expect(buf).toContain('event: progress');
+    expect(buf).toContain('"percent":42');
+  });
 });
 
 describe('POST /api/jobs/:id/cancel', () => {
@@ -130,9 +184,19 @@ describe('POST /api/jobs/:id/cancel', () => {
     const res = await app.inject({ method: 'POST', url: '/api/jobs/999/cancel' });
     expect(res.statusCode).toBe(404);
   });
+  it('cancel id 非正整数 → 404(M3)', async () => {
+    makeApp('yt-dlp', 'tok2');
+    const res = await app.inject({ method: 'POST', url: '/api/jobs/abc/cancel' });
+    expect(res.statusCode).toBe(404);
+  });
 });
 
 describe('POST /api/jobs/:id/retry', () => {
+  it('retry id 非正整数 → 404(M3)', async () => {
+    makeApp('yt-dlp', 'tok2');
+    const res = await app.inject({ method: 'POST', url: '/api/jobs/abc/retry' });
+    expect(res.statusCode).toBe(404);
+  });
   it('retry 非 error job → 409 NOT_RETRYABLE(P1-4)', async () => {
     const jobsRepo = createJobsRepo(db);
     const jid = jobsRepo.create('ytdlp_download', { url: 'https://a/1', options: { format: 'mp3' } });

@@ -1,6 +1,7 @@
 // server/src/ytdlp/ytdlp-routes.ts(Task 5:download 路由 + 两段式入库;Task 6 续 SSE/cancel/retry)
 import type { FastifyInstance } from 'fastify';
-import { createReadStream, existsSync, statSync } from 'node:fs';
+import { createReadStream, existsSync, mkdirSync, statSync } from 'node:fs';
+import { join } from 'node:path';
 import type { DB } from '../db/index.js';
 import { createAudioItemsRepo } from '../db/repo/audio-items.js';
 import { createJobsRepo } from '../db/repo/jobs.js';
@@ -71,7 +72,8 @@ function createDownloadHandlers(deps: YtdlpDeps) {
       audioId = result.audioId;
       jobsRepo.finish(jobId);
       emit(jobId, { type: 'done', audioId: result.audioId, filePath: result.finalPath, title: payload.title ?? '下载音频', format });
-      emit(jobId, { type: 'status', state: 'done' });
+      // spec §0.3 列了 status done,但 emit('done') 已断开连接并删除订阅表,紧随的 status done 无人可达——
+      // 前端 subscribeJob 只监听 progress/done/status(error/cancelled),不消费 status done,故不再单独发(由 done 隐含)
     } catch (err) {
       // 回滚:已 INSERT 的行删除 + job 置 error + SSE error(禁止残留指向 temp 的悬空行)
       if (audioId !== null) audioRepo.delete(audioId);
@@ -90,6 +92,10 @@ function createDownloadHandlers(deps: YtdlpDeps) {
       emit(jobId, { type: 'status', state: 'error', message: msg }); // 补 SSE 终态,否则订阅连接悬挂
       return;
     }
+    // Important 修复:每 job 独立子目录——DownloadManager 的 cleanJobOutputs/findLatest 假设"一 job 一 outDir",
+    // 并发不同 URL 共享 tempDir 时,取消会误删别的 job 产物、close 会 findLatest 到对方文件(title/content 串库)
+    const jobOutDir = join(tempDir, 'job' + jobId);
+    mkdirSync(jobOutDir, { recursive: true });
     const args = buildDownloadArgs({
       url: payload.url,
       options: {
@@ -98,12 +104,15 @@ function createDownloadHandlers(deps: YtdlpDeps) {
         format: (opt.format ?? 'mp3') as 'mp3' | 'm4a' | 'wav',
         quality: opt.quality,
       },
-      outDir: tempDir,
+      outDir: jobOutDir,
     });
     downloadManager.start({
-      jobId, binPath: bin.path, args, outDir: tempDir,
+      jobId, binPath: bin.path, args, outDir: jobOutDir,
       onEvent: (jid, ev) => {
-        if (ev.type === 'progress') jobsRepo.update(jid, { progress: ev.percent });
+        if (ev.type === 'progress') {
+          jobsRepo.update(jid, { progress: ev.percent });
+          emit(jid, ev); // Critical 修复:进度事件推给该 job 的所有 SSE 连接(前端进度条依赖;emit 把 type 写进 event 行)
+        }
         if (ev.type === 'status' && ev.state === 'done' && ev.producedPath) {
           void finalizeDownload(jid, payload, ev.producedPath);
         }
@@ -198,6 +207,8 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
   // Task 6:SSE 事件流——query token(D3,EventSource 无法设 header);终态 job 立即补发并关闭
   app.get('/api/jobs/:id/events', async (req, reply) => {
     const id = Number((req.params as { id: string }).id);
+    // M3:id 非正整数(Number('abc')/0/负数)→ 404,与 audio 文件路由 P2-5 守卫一致
+    if (!Number.isInteger(id) || id <= 0) return reply.code(404).send({ ok: false, error: { code: 'NOT_FOUND', message: 'job 不存在', next: '' } });
     const q = (req.query ?? {}) as { token?: string };
     if (q.token !== token) return reply.code(401).send({ ok: false, error: { code: 'UNAUTHORIZED', message: 'token 无效', next: '' } });
     const jobsRepo = createJobsRepo(db);
@@ -207,11 +218,15 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
     reply.raw.writeHead(200, {
       'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive',
     });
-    const conn: SseConn = { write: (s) => raw.write(s), end: () => raw.end() };
+    // 立即冲刷响应头:Node 的 writeHead 只排队,首个 write/end 才真正发出头字节;
+    // 不冲刷则客户端 fetch 会一直等响应头(心跳 15s 前的空闲连接头也不到客户端)
+    raw.flushHeaders();
+    // M2:写前判 writableEnded——终态后连接已 end,心跳/补发再写会触发 ERR_STREAM_WRITE_AFTER_END
+    const conn: SseConn = { write: (s) => { if (!raw.writableEnded) raw.write(s); }, end: () => raw.end() };
     if (!sseConnections.has(id)) sseConnections.set(id, new Set());
     sseConnections.get(id)!.add(conn);
-    // 心跳:15s 一次,保连接不被中间代理掐断
-    const heartbeat = setInterval(() => { raw.write(': ping\n\n'); }, 15_000);
+    // 心跳:15s 一次,保连接不被中间代理掐断(writableEnded 守卫同上)
+    const heartbeat = setInterval(() => { if (!raw.writableEnded) raw.write(': ping\n\n'); }, 15_000);
     req.raw.on('close', () => {
       clearInterval(heartbeat);
       sseConnections.get(id)?.delete(conn);
@@ -221,6 +236,7 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
     if (['done', 'error', 'cancelled'].includes(job.status)) {
       conn.write(`event: status\ndata: ${JSON.stringify({ state: job.status, message: job.message ?? undefined })}\n\n`);
       conn.end();
+      clearInterval(heartbeat); // 终态已发,心跳无意义且可能写已 end 的流(close 事件里再清一次是幂等)
     }
     return reply; // 已 hijack reply.raw,返回 reply 对象防 Fastify 二次响应
   });
@@ -228,6 +244,8 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
   // Task 6:取消——taskkill 杀进程树(cancel)+ job 置 cancelled + SSE 终态
   app.post('/api/jobs/:id/cancel', async (req, reply) => {
     const id = Number((req.params as { id: string }).id);
+    // M3:id 非正整数 → 404,避免 NaN 查询行为未定义
+    if (!Number.isInteger(id) || id <= 0) return reply.code(404).send({ ok: false, error: { code: 'NOT_FOUND', message: 'job 不存在', next: '' } });
     const jobsRepo = createJobsRepo(db);
     const job = jobsRepo.get(id);
     if (!job) return reply.code(404).send({ ok: false, error: { code: 'NOT_FOUND', message: 'job 不存在', next: '' } });
@@ -240,6 +258,8 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
   // Task 6:重试——仅 error 可重试(P1-4);建新 job 前同 URL 并发检查;复用 Task 5 的 startDownload
   app.post('/api/jobs/:id/retry', async (req, reply) => {
     const id = Number((req.params as { id: string }).id);
+    // M3:id 非正整数 → 404,避免 NaN 查询行为未定义
+    if (!Number.isInteger(id) || id <= 0) return reply.code(404).send({ ok: false, error: { code: 'NOT_FOUND', message: 'job 不存在', next: '' } });
     const jobsRepo = createJobsRepo(db);
     const old = jobsRepo.get(id);
     if (!old) return reply.code(404).send({ ok: false, error: { code: 'NOT_FOUND', message: 'job 不存在', next: '' } });
