@@ -1,4 +1,4 @@
-import { Alert, Card, Spin, Typography } from 'antd';
+import { Alert, Button, Card, Space, Spin, Typography } from 'antd';
 import { useEffect, useState } from 'react';
 import { apiGet } from '@/api';
 
@@ -20,7 +20,8 @@ export default function IndexPage() {
   const ok = health !== null && health.ok === true && health.sqlite !== null;
 
   return (
-    <Card title="音频库(骨架)" style={{ margin: 16 }}>
+    <>
+      <Card title="音频库(骨架)" style={{ margin: 16 }}>
       {error && <Alert type="error" showIcon message="无法连接本地服务" description={error} />}
       {!error && !health && <Spin />}
       {!error && health && ok && (
@@ -37,5 +38,10 @@ export default function IndexPage() {
         />
       )}
     </Card>
+    <Space style={{ marginTop: 16 }}>
+      <Button type="primary" onClick={() => (window.location.hash = '#/acquire')}>去获取</Button>
+      <Button onClick={() => (window.location.hash = '#/library')}>去音频库</Button>
+    </Space>
+    </>
   );
 }

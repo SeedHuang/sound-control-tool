@@ -8,5 +8,7 @@ export default defineConfig({
   routes: [
     { path: '/', component: 'index' },
     { path: '/settings', component: 'settings' },
+    { path: '/acquire', component: 'acquire' },
+    { path: '/library', component: 'library' },
   ],
 });
