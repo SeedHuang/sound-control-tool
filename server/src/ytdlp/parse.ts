@@ -11,12 +11,14 @@ export interface ParseResult {
 export class YtdlpRunError extends Error {
   constructor(public info: YtdlpErrorInfo) { super(info.message); }
 }
-export function parseMetadata(binPath: string, url: string, timeoutMs = 20_000, doExec: typeof execFile = execFile): Promise<ParseResult> {
+export function parseMetadata(binPath: string, url: string, timeoutMs = 20_000, doExec: typeof execFile = execFile, cookiePath?: string): Promise<ParseResult> {
   return new Promise((resolve, reject) => {
-    doExec(binPath, buildParseArgs(url), { timeout: timeoutMs, windowsHide: true, maxBuffer: 4 * 1024 * 1024 }, (err, stdout) => {
+    // 修复(2026-09-29):execFile 回调第三参才是 stderr——旧实现只读 err.stderr(Node 不保证挂载,实测为空,
+    // B 站 412 的报错信息全丢)。第三参优先,err.stderr 兜底(测试桩可能只传两参)。
+    doExec(binPath, buildParseArgs(url, cookiePath), { timeout: timeoutMs, windowsHide: true, maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderr) => {
       if (err) {
         const e = err as NodeJS.ErrnoException & { stderr?: string };
-        reject(new YtdlpRunError(mapYtdlpError({ code: e.code, stderr: e.stderr, binPath })));
+        reject(new YtdlpRunError(mapYtdlpError({ code: e.code, stderr: stderr ?? e.stderr, binPath })));
         return;
       }
       try {

@@ -32,3 +32,21 @@ describe('buildDownloadArgs', () => {
     expect(a).not.toContain('--audio-quality');
   });
 });
+describe('cookiePath 注入(--cookies,B 站风控)', () => {
+  it('buildParseArgs 带 cookiePath → --cookies + 路径插在 url 之前', () => {
+    expect(buildParseArgs('u', 'D:/sct-data/cookies.txt')).toEqual(['--cookies', 'D:/sct-data/cookies.txt', '-J', '--flat-playlist', '--no-warnings', 'u']);
+  });
+  it('buildParseArgs 无 cookiePath → 不含 --cookies(原形态不变)', () => {
+    expect(buildParseArgs('u')).toEqual(['-J', '--flat-playlist', '--no-warnings', 'u']);
+  });
+  it('buildDownloadArgs 带 cookiePath → 含 --cookies 且位于 url 之前', () => {
+    const a = buildDownloadArgs({ url: 'u', options: { format: 'mp3' }, outDir: 'D:/tmp', cookiePath: 'D:/sct-data/cookies.txt' });
+    expect(a).toContain('--cookies');
+    expect(a[a.indexOf('--cookies') + 1]).toBe('D:/sct-data/cookies.txt');
+    expect(a.indexOf('--cookies')).toBeLessThan(a.lastIndexOf('u'));
+  });
+  it('buildDownloadArgs 无 cookiePath → 不含 --cookies', () => {
+    const a = buildDownloadArgs({ url: 'u', options: { format: 'mp3' }, outDir: 'D:/tmp' });
+    expect(a).not.toContain('--cookies');
+  });
+});

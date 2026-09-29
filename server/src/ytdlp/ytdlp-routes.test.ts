@@ -1,6 +1,6 @@
 // server/src/ytdlp/ytdlp-routes.test.ts
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import type { AddressInfo } from 'node:net';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -12,6 +12,9 @@ import { createDownloadManager } from './download.js';
 import { createJobsRepo } from '../db/repo/jobs.js';
 import { createAudioItemsRepo } from '../db/repo/audio-items.js';
 import { registerRequestLogging } from '../logs.js';
+import { createSettingsRepo } from '../db/repo/settings.js';
+import { BILI_COOKIE_KEY, SETTINGS_KEYS } from '../settings-keys.js';
+import { registerSettingsRoutes } from '../http/settings-routes.js';
 
 // parse success 用例:mock parseMetadata 返回成功,避免真实 execFile 拉 yt-dlp;
 // YtdlpRunError 保留真身(importOriginal 展开),不影响既有 400/409 用例(它们不触达 parseMetadata)
@@ -37,11 +40,15 @@ afterEach(async () => {
 });
 
 function makeApp(binPath: string | null, token = 'tok', dm?: ReturnType<typeof createDownloadManager>) {
+  // audioDir 用临时子目录:Cookie 注入会把 cookies.txt 物化到 dirname(audioDir),不能写真机 C:/ 根
+  const audioDir = join(tempDir, 'audio');
+  mkdirSync(audioDir, { recursive: true });
+  registerSettingsRoutes(app, db); // /api/settings 白名单用例需要真实 settings 路由
   return registerYtdlpRoutes(app, {
     db,
     binProvider: async () => ({ path: binPath }),
     downloadManager: dm ?? createDownloadManager(),
-    audioDir: 'C:/audio', tempDir, token,
+    audioDir, tempDir, token,
   });
 }
 
@@ -363,5 +370,74 @@ describe('GET /api/logs', () => {
     const logs = (logsRes.json() as { logs: { source: string; message: string }[] }).logs;
     expect(logs.some((l) => l.source === 'job' && l.message === `job ${jobId} created url=https://a/9 format=mp3`)).toBe(true);
     expect(logs.some((l) => l.source === 'job' && l.message.includes(`job ${jobId} spawn yt-dlp bin=`))).toBe(true);
+  });
+});
+
+// B 站 Cookie(2026-09-29 用户拍板):/api/cookie 元数据读写 + parse/download 的 --cookies 注入
+describe('GET/PUT /api/cookie', () => {
+  it('GET 未设置 → ok:true set:false length:0', async () => {
+    makeApp('yt-dlp');
+    const res = await app.inject({ method: 'GET', url: '/api/cookie' });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ ok: true, set: false, length: 0 });
+  });
+  it('PUT content 缺失/空白/非字符串 → 400', async () => {
+    makeApp('yt-dlp');
+    for (const payload of [{}, { content: '' }, { content: '   ' }, { content: 123 }]) {
+      const res = await app.inject({ method: 'PUT', url: '/api/cookie', payload });
+      expect(res.statusCode).toBe(400);
+    }
+  });
+  it('PUT 成功 → ok:true;GET set:true length 一致;凭据不出 /api/settings 白名单', async () => {
+    makeApp('yt-dlp');
+    const content = '# Netscape HTTP Cookie File\n.bilibili.com\tTRUE\t/\tTRUE\t1790000000\tSESSDATA\tx';
+    const put = await app.inject({ method: 'PUT', url: '/api/cookie', payload: { content } });
+    expect(put.statusCode).toBe(200);
+    expect(put.json().ok).toBe(true);
+    const j = (await app.inject({ method: 'GET', url: '/api/cookie' })).json() as { set: boolean; length: number };
+    expect(j.set).toBe(true);
+    expect(j.length).toBe(content.length);
+    // 凭据不出白名单:GET /api/settings 只回 SETTINGS_KEYS 内的键,绝无 bili_cookie
+    const settings = (await app.inject({ method: 'GET', url: '/api/settings' })).json() as Record<string, string>;
+    expect(Object.keys(settings)).not.toContain('bili_cookie');
+    // 通用 settings PUT 对白名单外键拒绝(凭据无法经该通道写入)
+    expect((await app.inject({ method: 'PUT', url: '/api/settings', payload: { bili_cookie: 'x' } })).statusCode).toBe(400);
+    // 键常量本身也不在白名单数组里(双保险)
+    expect(Object.values(SETTINGS_KEYS)).not.toContain(BILI_COOKIE_KEY);
+  });
+});
+
+describe('Cookie 注入(parse/download)', () => {
+  it('已存 Cookie → parse 物化 cookies.txt 于 dirname(audioDir)', async () => {
+    makeApp('yt-dlp');
+    await app.inject({ method: 'PUT', url: '/api/cookie', payload: { content: '.bilibili.com\tTRUE\t/\tTRUE\t1790000000\tSESSDATA\tx' } });
+    const res = await app.inject({ method: 'POST', url: '/api/ytdlp/parse', payload: { url: 'https://www.bilibili.com/x' } });
+    expect(res.statusCode).toBe(200);
+    expect(existsSync(join(tempDir, 'cookies.txt'))).toBe(true); // audioDir=join(tempDir,'audio') → dirname=tempDir
+  });
+  it('settings 存的是空白 Cookie → 不物化、parse 照常成功', async () => {
+    makeApp('yt-dlp');
+    createSettingsRepo(db).set(BILI_COOKIE_KEY, '   ');
+    const res = await app.inject({ method: 'POST', url: '/api/ytdlp/parse', payload: { url: 'https://a' } });
+    expect(res.statusCode).toBe(200);
+    expect(existsSync(join(tempDir, 'cookies.txt'))).toBe(false);
+  });
+  it('download 已存 Cookie → spawn args 含 --cookies + cookies.txt 路径', async () => {
+    const dm = { start: vi.fn(), cancel: vi.fn(async () => {}), dispose: vi.fn(async () => {}) };
+    makeApp('yt-dlp', 'tok2', dm as unknown as ReturnType<typeof createDownloadManager>);
+    await app.inject({ method: 'PUT', url: '/api/cookie', payload: { content: '.bilibili.com\tTRUE\t/\tTRUE\t1790000000\tSESSDATA\tx' } });
+    const res = await app.inject({ method: 'POST', url: '/api/ytdlp/download', payload: { url: 'https://www.bilibili.com/x', options: { format: 'mp3' } } });
+    expect(res.statusCode).toBe(201);
+    const startOpts = dm.start.mock.calls[0]?.[0] as { args: string[] };
+    expect(startOpts.args).toContain('--cookies');
+    expect(startOpts.args).toContain(join(tempDir, 'cookies.txt'));
+  });
+  it('download 未存 Cookie → args 不含 --cookies(原形态不变)', async () => {
+    const dm = { start: vi.fn(), cancel: vi.fn(async () => {}), dispose: vi.fn(async () => {}) };
+    makeApp('yt-dlp', 'tok2', dm as unknown as ReturnType<typeof createDownloadManager>);
+    const res = await app.inject({ method: 'POST', url: '/api/ytdlp/download', payload: { url: 'https://a/1', options: { format: 'mp3' } } });
+    expect(res.statusCode).toBe(201);
+    const startOpts = dm.start.mock.calls[0]?.[0] as { args: string[] };
+    expect(startOpts.args).not.toContain('--cookies');
   });
 });

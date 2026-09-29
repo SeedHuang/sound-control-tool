@@ -1,15 +1,17 @@
 // server/src/ytdlp/ytdlp-routes.ts(Task 5:download 路由 + 两段式入库;Task 6 续 SSE/cancel/retry)
 import type { FastifyInstance } from 'fastify';
+import { execFile } from 'node:child_process';
 import { createReadStream, existsSync, mkdirSync, statSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import type { DB } from '../db/index.js';
 import { isAllowedOrigin, isAllowedLocalOrigin } from '../http/cors.js';
 import { getLogs, pushLog } from '../logs.js';
 import { createAudioItemsRepo } from '../db/repo/audio-items.js';
 import { createJobsRepo } from '../db/repo/jobs.js';
 import { createSettingsRepo } from '../db/repo/settings.js';
-import { SETTINGS_KEYS } from '../settings-keys.js';
+import { BILI_COOKIE_KEY, SETTINGS_KEYS } from '../settings-keys.js';
 import { buildDownloadArgs } from './args.js';
+import { materializeCookieFile } from './cookies.js';
 import type { DownloadManager } from './download.js';
 import { mapYtdlpError } from './errors.js';
 import { probeDuration } from './ffprobe.js';
@@ -44,6 +46,20 @@ export interface YtdlpDeps {
   binProvider: () => Promise<{ path: string | null }>;
   downloadManager: DownloadManager;
   audioDir: string; tempDir: string; token: string;
+}
+
+// B 站 Cookie 注入(parse/download 两处共用):settings 里存了 Cookie → 物化 cookies.txt 到数据目录
+// (dirname(audioDir),与 db 同级,不进仓库);未设置/全空白/物化失败 → 返回 undefined 并留痕,不阻断下载
+// (Cookie 只是增强,不能因为它让无 Cookie 场景挂掉)。
+function resolveCookiePath(db: DB, audioDir: string): string | undefined {
+  const content = createSettingsRepo(db).get(BILI_COOKIE_KEY);
+  if (!content || content.trim().length === 0) return undefined;
+  try {
+    return materializeCookieFile(content, dirname(audioDir));
+  } catch (e) {
+    pushLog('error', 'job', `cookie 文件物化失败，跳过 --cookies 注入: ${e instanceof Error ? e.message : String(e)}`);
+    return undefined;
+  }
 }
 
 // 模块级辅助(在 registerYtdlpRoutes 外,通过参数注入 deps 更易测;此处为可注入闭包工厂)
@@ -112,6 +128,7 @@ function createDownloadHandlers(deps: YtdlpDeps) {
         quality: opt.quality,
       },
       outDir: jobOutDir,
+      cookiePath: resolveCookiePath(db, audioDir), // B 站 Cookie:设置里有就注入 --cookies(未设置/物化失败 → undefined,照常下载)
     });
     pushLog('info', 'job', `job ${jobId} spawn yt-dlp bin=${bin.path}`); // 诊断日志:记录实际用的二进制路径
     downloadManager.start({
@@ -142,7 +159,7 @@ function createDownloadHandlers(deps: YtdlpDeps) {
 }
 
 export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void {
-  const { db, binProvider, token, downloadManager } = deps;
+  const { db, binProvider, token, downloadManager, audioDir } = deps;
   const audioRepo = createAudioItemsRepo(db);
   const { startDownload } = createDownloadHandlers(deps);
 
@@ -157,7 +174,7 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
       return reply.code(409).send({ ok: false, error: { code: 'YTDLP_NOT_FOUND', message: 'yt-dlp 未找到或路径无效', next: '请到设置页配置 yt-dlp 路径后重试' } });
     }
     try {
-      const parsed = await parseMetadata(bin.path, url);
+      const parsed = await parseMetadata(bin.path, url, 20_000, execFile, resolveCookiePath(db, audioDir));
       // 诊断日志:解析成功一行(kind + 条目数),面板里能看到"解析了什么"
       pushLog('info', 'job', `parse ${url} → ${parsed.kind} (${parsed.entries?.length ?? 0} entries)`);
       const existing = audioRepo.findBySourceUrl(url);
@@ -223,6 +240,24 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
     pushLog('info', 'job', `job ${jobId} created url=${url} format=${String(opt.format)}`); // 诊断日志:任务创建留痕
     await startDownload(jobId, { url, options: body.options ?? {}, title: typeof body.title === 'string' ? body.title : undefined, durationSec: typeof body.durationSec === 'number' ? body.durationSec : undefined });
     return reply.code(201).send({ ok: true, jobId });
+  });
+
+  // B 站 Cookie(2026-09-29 用户拍板:设置页粘贴 → server 保存 → yt-dlp --cookies 注入):
+  // GET 只回元数据(set/length),内容永不回传(键不在 SETTINGS_KEYS 白名单,GET /api/settings 也拿不到)
+  app.get('/api/cookie', async () => {
+    const content = createSettingsRepo(db).get(BILI_COOKIE_KEY);
+    return { ok: true, set: content !== null && content.trim().length > 0, length: content?.length ?? 0 };
+  });
+
+  app.put('/api/cookie', async (req, reply) => {
+    const body = (req.body ?? {}) as { content?: unknown };
+    if (typeof body.content !== 'string' || body.content.trim().length === 0) {
+      return reply.code(400).send({ ok: false, error: { code: 'BAD_REQUEST', message: 'content 必填(非空字符串)', next: '粘贴 B 站 Cookie 内容后保存' } });
+    }
+    createSettingsRepo(db).set(BILI_COOKIE_KEY, body.content);
+    // 日志只记长度不记内容(凭据不进诊断日志)
+    pushLog('info', 'job', `cookie saved (length=${body.content.length})`);
+    return { ok: true };
   });
 
   // Task 6:SSE 事件流——query token(D3,EventSource 无法设 header);终态 job 立即补发并关闭

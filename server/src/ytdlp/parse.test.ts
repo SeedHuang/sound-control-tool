@@ -20,3 +20,18 @@ describe('parseMetadata', () => {
     await expect(parseMetadata('yt-dlp', 'u', 20000, doExec)).rejects.toMatchObject({ info: { code: 'YTDLP_NOT_FOUND' } });
   });
 });
+// 回归(2026-09-29):B 站 412 报错信息为空——execFile 回调第三参才是 stderr,旧实现只读 err.stderr(Node 不保证挂载,实测为空)
+describe('parseMetadata stderr 捕获(execFile 回调第三参)', () => {
+  it('第三参 stderr 参与映射:412 → RISK_CONTROL', async () => {
+    const doExec = ((_b: string, _a: string[], _o: unknown, cb: (e: NodeJS.ErrnoException, stdout: string, stderr: string) => void) => {
+      cb(Object.assign(new Error('failed'), { code: '1' }) as NodeJS.ErrnoException, '', 'ERROR: HTTP Error 412: Precondition Failed');
+    }) as never;
+    await expect(parseMetadata('yt-dlp', 'u', 20000, doExec)).rejects.toMatchObject({ info: { code: 'RISK_CONTROL' } });
+  });
+  it('第三参缺省时 err.stderr 兜底', async () => {
+    const doExec = ((_b: string, _a: string[], _o: unknown, cb: (e: NodeJS.ErrnoException) => void) => {
+      cb(Object.assign(new Error('failed'), { code: '1', stderr: 'HTTP Error 412: Precondition Failed' }) as NodeJS.ErrnoException);
+    }) as never;
+    await expect(parseMetadata('yt-dlp', 'u', 20000, doExec)).rejects.toMatchObject({ info: { code: 'RISK_CONTROL' } });
+  });
+});
