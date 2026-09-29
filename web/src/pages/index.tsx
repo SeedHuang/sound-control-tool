@@ -1,6 +1,7 @@
 import { Alert, Button, Card, Space, Spin, Typography } from 'antd';
 import { useEffect, useState } from 'react';
 import { apiGet } from '@/api';
+import LogsButton from '@/components/LogsButton';
 
 interface Health {
   ok: boolean;
@@ -42,6 +43,7 @@ export default function IndexPage() {
       <Button type="primary" onClick={() => (window.location.hash = '#/acquire')}>去获取</Button>
       <Button onClick={() => (window.location.hash = '#/library')}>去音频库</Button>
     </Space>
+    <LogsButton />
     </>
   );
 }

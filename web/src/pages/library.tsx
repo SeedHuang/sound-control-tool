@@ -1,6 +1,7 @@
 import { Empty, List, Typography } from 'antd';
 import { useEffect, useState } from 'react';
 import { apiGet, audioFileUrl } from '@/api';
+import LogsButton from '@/components/LogsButton';
 
 interface AudioRow { id: number; title: string; source_type: string; format: string; duration_sec: number | null; created_at: string }
 export default function LibraryPage() {

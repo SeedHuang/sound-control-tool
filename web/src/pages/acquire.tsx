@@ -1,6 +1,7 @@
 import { Alert, Button, Card, Checkbox, Input, List, Progress, Radio, Space, Spin, Typography } from 'antd';
 import { useEffect, useState } from 'react';
 import { cancelJob, parseUrl, startDownload, subscribeJob, type ParseResponse } from '@/api';
+import LogsButton from '@/components/LogsButton';
 
 export default function AcquirePage() {
   const [url, setUrl] = useState('');
@@ -114,6 +115,7 @@ export default function AcquirePage() {
       )}
       {done && <Alert type="success" showIcon message={`完成：《${done.title}》已入库`} style={{ marginTop: 16 }} />}
       {parsing && <Spin style={{ marginTop: 16 }} />}
+      <LogsButton />
     </Card>
   );
 }
