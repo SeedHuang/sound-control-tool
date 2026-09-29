@@ -42,6 +42,7 @@ export default function IndexPage() {
     <Space style={{ marginTop: 16 }}>
       <Button type="primary" onClick={() => (window.location.hash = '#/acquire')}>去获取</Button>
       <Button onClick={() => (window.location.hash = '#/library')}>去音频库</Button>
+      <Button onClick={() => (window.location.hash = '#/settings')}>去设置</Button>
     </Space>
     <LogsButton />
     </>
