@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { coverMime, fetchAndStoreCover, findCoverFile, writeCoverViaYtdlp } from './covers.js';
+import { coverMime, fetchAndStoreCover, findCoverFile, listCoverImportIds, writeCoverViaYtdlp } from './covers.js';
 
 let dir: string;
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'sct-covers-')); });
@@ -39,6 +39,47 @@ describe('covers 封面抓取与落盘', () => {
     const doFetch = vi.fn(async () => new Response(new Uint8Array([1])));
     expect(await fetchAndStoreCover({ url: 'file:///etc/passwd', coversDir: dir, importId: 10, doFetch })).toBe(false);
     expect(doFetch).not.toHaveBeenCalled();
+  });
+  // SSRF(2026-09-29 评审):封面地址来自远端元数据(源页面可指定),不挡就成了"拿本机当跳板"
+  it('地址指向本机/内网 → 拒绝且不发请求', async () => {
+    const doFetch = vi.fn(async () => new Response(new Uint8Array([1]), { headers: { 'content-type': 'image/jpeg' } }));
+    const blocked = [
+      'http://127.0.0.1:7310/api/logs', // 本机后端自己的接口
+      'http://localhost/x.jpg',
+      'http://169.254.169.254/latest/meta-data/', // 云厂商元数据(链路本地)
+      'http://192.168.1.10/x.jpg',
+      'http://172.16.0.9/x.jpg',
+      'http://10.0.0.5/x.jpg',
+      'http://[::1]/x.jpg',
+    ];
+    for (const url of blocked) {
+      expect(await fetchAndStoreCover({ url, coversDir: dir, importId: 14, doFetch })).toBe(false);
+    }
+    expect(doFetch).not.toHaveBeenCalled();
+  });
+  it('响应不是图片(反爬页/错误页 200 + text/html)→ false 不落盘(落下去就是永久坏图,不会再重试)', async () => {
+    const doFetch = vi.fn(async () => new Response('<html>verify</html>', { headers: { 'content-type': 'text/html; charset=utf-8' } }));
+    expect(await fetchAndStoreCover({ url: 'https://x/y.jpg', coversDir: dir, importId: 13, doFetch })).toBe(false);
+    expect(findCoverFile(dir, 13)).toBeNull();
+  });
+  it('体积超上限 → false(有 content-length 提前拦;没有则读完再拦)', async () => {
+    const huge = new ArrayBuffer(8 * 1024 * 1024 + 1);
+    const stub = (headers: Record<string, string>): Response => ({
+      ok: true, status: 200, headers: new Headers(headers), arrayBuffer: async () => huge,
+    }) as unknown as Response;
+    const declared = vi.fn(async () => stub({ 'content-type': 'image/jpeg', 'content-length': String(9 * 1024 * 1024) }));
+    expect(await fetchAndStoreCover({ url: 'https://x/big.jpg', coversDir: dir, importId: 15, doFetch: declared })).toBe(false);
+    const undeclared = vi.fn(async () => stub({ 'content-type': 'image/jpeg' }));
+    expect(await fetchAndStoreCover({ url: 'https://x/big2.jpg', coversDir: dir, importId: 16, doFetch: undeclared })).toBe(false);
+    expect(findCoverFile(dir, 15)).toBeNull();
+    expect(findCoverFile(dir, 16)).toBeNull();
+  });
+  it('listCoverImportIds:一次读目录列出"已有封面"的来源 id', () => {
+    writeFileSync(join(dir, 'cover-31.png'), 'a');
+    writeFileSync(join(dir, 'cover-32.jpg'), 'b');
+    writeFileSync(join(dir, 'not-a-cover.txt'), 'c');
+    expect([...listCoverImportIds(dir)].sort((a, b) => a - b)).toEqual([31, 32]);
+    expect(listCoverImportIds(join(dir, 'nope')).size).toBe(0);
   });
   it('响应体为空 → false(避免落一个 0 字节的破图)', async () => {
     const doFetch = vi.fn(async () => new Response(new Uint8Array([]), { headers: { 'content-type': 'image/png' } }));
@@ -84,5 +125,15 @@ describe('writeCoverViaYtdlp(让 yt-dlp 写封面)', () => {
       cb(null, '[info] x: has no thumbnail', '');
     }) as never;
     expect(await writeCoverViaYtdlp({ binPath: 'yt-dlp', url: 'u', coversDir: dir, importId: 23, doExec })).toBe(false);
+  });
+  it('写出新格式后清掉旧扩展名(与 fetch 那条口径一致,避免 findCoverFile 命中旧图却报成功)', async () => {
+    writeFileSync(join(dir, 'cover-24.jpg'), 'OLD');
+    const doExec = ((_b: string, _a: string[], _o: unknown, cb: (e: null, stdout: string, stderr: string) => void) => {
+      writeFileSync(join(dir, 'cover-24.png'), 'NEW');
+      cb(null, '', '');
+    }) as never;
+    expect(await writeCoverViaYtdlp({ binPath: 'yt-dlp', url: 'u', coversDir: dir, importId: 24, doExec })).toBe(true);
+    expect(existsSync(join(dir, 'cover-24.jpg'))).toBe(false);
+    expect(findCoverFile(dir, 24)).toBe(join(dir, 'cover-24.png'));
   });
 });

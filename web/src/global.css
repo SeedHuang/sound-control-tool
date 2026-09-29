@@ -20,7 +20,9 @@
 }
 
 @media (hover: hover) and (pointer: fine) {
-  .sct-card:hover {
+  /* :not(:active) 是必须的(2026-09-29 评审修)::hover 与 :active 权重相同(都是 0,2,0),而这条写在后面——
+     鼠标按住时两者同时成立,不加 :not(:active) 就会让"悬停上浮"盖掉"按下微缩",按压反馈等于从未生效。 */
+  .sct-card:hover:not(:active) {
     transform: translateY(-2px);
     box-shadow: 0 6px 16px rgba(0, 0, 0, 0.1);
   }
@@ -38,6 +40,8 @@
 
 @media (prefers-reduced-motion: reduce) {
   .sct-card { transition: none; }
+  /* 选择器必须与上面那条悬停规则**同权重**(所以也带 :not(:active)):否则这里的 0,2,0 会被它的 0,3,0 压住,
+     结果是"系统里开了减弱动效"的用户反而还会看到卡片浮起。 */
   .sct-card:active,
-  .sct-card:hover { transform: none; box-shadow: none; }
+  .sct-card:hover:not(:active) { transform: none; box-shadow: none; }
 }

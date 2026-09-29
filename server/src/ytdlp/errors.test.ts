@@ -16,6 +16,12 @@ describe('mapYtdlpError', () => {
     expect(r.message).toContain('过大');
     expect(r.message).not.toContain('MAXBUFFER');
   });
+  // 2026-09-29 评审补:溢出时的 stderr 是被截断的半截输出,常含 connection/403 这类字样。
+  // 这条靠错误码判断,必须排在 stderr 特征之前,否则会被 NETWORK 抢走 → 用户拿到错的提示。
+  it('撑爆缓冲且截断 stderr 里带网络字样 → 仍判 OUTPUT_TOO_LARGE(不被 NETWORK 抢走)', () => {
+    const r = mapYtdlpError({ code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER', binPath: 'yt-dlp', stderr: 'WARNING: connection reset while reading 403' });
+    expect(r.code).toBe('OUTPUT_TOO_LARGE');
+  });
   it('DRM 特征', () => {
     expect(mapYtdlpError({ stderr: 'ERROR: This video is DRM protected', binPath: 'yt-dlp' }).code).toBe('DRM');
   });

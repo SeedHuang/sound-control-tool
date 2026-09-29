@@ -729,6 +729,27 @@ describe('作品封面:解析预热 / has_cover / cover 路由', () => {
     expect(res.body).toBe('HEALED');
   });
 
+  // 2026-09-29 评审补:预热那发是 fire-and-forget(可能正卡在 10s 的 fetch),用户此时打开卡片墙会对
+  // 同一个来源再来一次——不去重就会起两个 yt-dlp 写同一个输出路径,还可能把写了一半的图流回浏览器
+  it('同一来源并发请求封面 → 只抓一次,两个请求拿到同一结果', async () => {
+    const id = upsertImport('https://a/pl', 'https://t/1.jpg');
+    let calls = 0;
+    makeApp('yt-dlp', 'tok2', undefined, async (o) => {
+      calls += 1;
+      await new Promise((r) => setTimeout(r, 30)); // 慢抓取:制造"第二个请求在抓取期间进来"的窗口
+      mkdirSync(o.coversDir, { recursive: true });
+      writeFileSync(join(o.coversDir, `cover-${o.importId}.jpg`), 'ONCE');
+      return true;
+    });
+    const [a, b] = await Promise.all([
+      app.inject({ method: 'GET', url: `/api/imports/${id}/cover?token=tok2` }),
+      app.inject({ method: 'GET', url: `/api/imports/${id}/cover?token=tok2` }),
+    ]);
+    expect(calls).toBe(1);
+    expect(a.body).toBe('ONCE');
+    expect(b.body).toBe('ONCE');
+  });
+
   // 2026-09-29 实测补的关键一条:自己 fetch 抓不到(外网图床——Node fetch 不读 Windows 系统代理,直连 i.ytimg.com
   // 10s 超时)或压根没地址(B 站番剧的 flat 解析不给封面字段)→ 兜底让 yt-dlp 自己写图。
   // 用户真实场景:YouTube 视频下载完了却一直没封面,就是这条兜底在修。

@@ -100,10 +100,13 @@ export default function AcquirePage() {
     const duplicates: number[] = []; // 服务端判为「已在库里」的条目(这一遍没真下)
     let okCount = 0;
     let cancelled = false;
-    /** 跑一批条目;forceReplace=true 时带 force 提交 → 服务端放行并覆盖库里旧的那份 */
-    const runBatch = async (idxs: number[], forceReplace: boolean): Promise<void> => {
+    /** 跑一批条目;forceReplace=true 时带 force 提交 → 服务端放行并覆盖库里旧的那份。
+     *  返回**本批真正成功的条数**(2026-09-29 评审修:调用方要用它算"覆盖了几条",
+     *  不能拿 duplicates.length 充数——那是在下载开始前就数出来的,覆盖失败也会被算成已完成) */
+    const runBatch = async (idxs: number[], forceReplace: boolean): Promise<number> => {
+      let batchOk = 0;
       for (const entryIndex of idxs) {
-        if (detail === null) return;
+        if (detail === null) return batchOk;
         setDone(null); // 每条开始前重置,避免上一条 onDone 的成功提示误报
         setPhase('download'); setPercent(0); // 进度条两段也复位:下一条从「① 下载 0%」重新开始
         // 合集条目的「第几集 + 所属合集」随下载一起落库(2026-09-29 用户拍板:音频库要显示第几集/集名)
@@ -123,7 +126,7 @@ export default function AcquirePage() {
           });
           setJobId(jid);
           const end = await waitJobEnd(jid);
-          if (end === 'cancelled') { cancelled = true; return; } // 用户主动取消 → 停整批(不是失败)
+          if (end === 'cancelled') { cancelled = true; return batchOk; } // 用户主动取消 → 停整批(不是失败)
           if (end !== 'done') {
             failed.push(`条目 ${entryIndex}`);
             continue; // 单条 error 跳过继续,不再 break
@@ -132,12 +135,14 @@ export default function AcquirePage() {
           // 用户往往在进度条刚满就切到音频库,那一瞬库里还没这行,靠这条通知补上(2026-09-29 用户反馈修复)
           notifyAudioChanged(`job ${jid} 入库完成`);
           okCount += 1;
+          batchOk += 1;
         } catch (e) {
           const err = e as ApiError;
           if (err.code === 'DUPLICATE') { duplicates.push(entryIndex); continue; } // 已存在 → 不算失败,交给下面的弹窗
           failed.push(`条目 ${entryIndex}: ${err.message}`); // 提交阶段失败(网络/409 等)同样跳过继续
         }
       }
+      return batchOk;
     };
     const targets = isPlaylist ? checked : [0]; // [0] = 单视频(不带 entryIndices)
     try {
@@ -157,7 +162,9 @@ export default function AcquirePage() {
             onCancel: () => resolve(false),
           });
         });
-        if (ok) { replacedCount = duplicates.length; await runBatch(duplicates, true); }
+        // 按**实际成功**数计(2026-09-29 评审修):原来直接写 duplicates.length,是下载开始前的预估值,
+        // 覆盖失败也会被算成"已删旧的那份"。整批的成功数同样并入 okCount(下面「成功 N 条」的总数)。
+        if (ok) replacedCount = await runBatch(duplicates, true);
         else skipped = duplicates.length;
       }
       const parts: string[] = [];

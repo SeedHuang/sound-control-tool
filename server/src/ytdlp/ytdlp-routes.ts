@@ -8,7 +8,7 @@ import { isAllowedOrigin, isAllowedLocalOrigin, isLocalPageReferer } from '../ht
 import { clearLogs, getLogs, pushLog } from '../logs.js';
 import { createAudioItemsRepo, type AudioItemRow, type AudioItemsRepo } from '../db/repo/audio-items.js';
 import { deleteAudioFile } from '../audio-files.js';
-import { coverMime, fetchAndStoreCover, findCoverFile, writeCoverViaYtdlp } from '../covers.js';
+import { coverMime, fetchAndStoreCover, findCoverFile, listCoverImportIds, writeCoverViaYtdlp } from '../covers.js';
 import { createJobsRepo } from '../db/repo/jobs.js';
 import { createSettingsRepo } from '../db/repo/settings.js';
 import { BILI_COOKIE_KEY, SETTINGS_KEYS } from '../settings-keys.js';
@@ -252,7 +252,8 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
       // 封面预热(2026-09-29 用户拍板「解析时抓 + 看图兜底」):后台跑,**不 await**——
       // 解析接口该 1~5 秒返回还是 1~5 秒返回。ensureCover 内部还会处理"flat 解析根本没给封面地址"的情况
       // (B 站番剧就是如此,它会单独问一次 yt-dlp 拿封面再抓),失败只记日志,卡片回退纯色。
-      void ensureCover({ id: importId, url, kind: parsed.kind, thumbnail: parsed.thumbnail ?? null });
+      // 它的 try/catch 兜底与"同来源只跑一次"去重都在 ensureCover 那边,这里 fire-and-forget 是安全的。
+      void ensureCover({ id: importId, url, thumbnail: parsed.thumbnail ?? null });
       const existing = audioRepo.findBySourceUrl(url);
       // 注意:parse 内部用 durationSec(驼峰),对外契约 spec 0.3 是 duration_sec(下划线,与 audio_items 键风格一致)
       return {
@@ -416,45 +417,68 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
   // 同一个域名失败过一次,10 分钟内直接跳到 yt-dlp——第二个 YouTube 作品从"12 秒出图"变成"2 秒出图"。
   const coverFailedAt = new Map<number, number>();
   const fetchHostFailedAt = new Map<string, number>();
+  // 同一来源正在抓 → 复用同一个 Promise(2026-09-29 评审补)。为什么必须去重:预热那发是 fire-and-forget,
+  // 它可能正卡在 10s 的 fetch(后面还有最长 30s 的 yt-dlp),这期间用户打开卡片墙会对同一个 id 再来一次 ——
+  // 结果会起两个 yt-dlp 写同一个输出路径,而且先到的那个请求可能把**写了一半的图**以 image/jpeg 流回浏览器。
+  const coverInFlight = new Map<number, Promise<string | null>>();
   const COVER_COOLDOWN_MS = 10 * 60_000;
   const hostOf = (url: string): string => {
     try { return new URL(url).host; } catch { return ''; }
   };
-  async function ensureCover(row: { id: number; url: string; kind: 'single' | 'playlist'; thumbnail: string | null }): Promise<string | null> {
-    const local = findCoverFile(coversDir, row.id);
-    if (local !== null) return local;
-    // 冷却检查放在最前:失败过的来源连"自己 fetch"这一步也别重试——外网图床那一步要干等 10s,
-    // 不做冷却的话每次开卡片墙都白等一次(用户看到的就是"图迟迟不出来")
-    const failedAt = coverFailedAt.get(row.id);
-    if (failedAt !== undefined && Date.now() - failedAt < COVER_COOLDOWN_MS) return null;
-    if (row.thumbnail !== null) {
-      const host = hostOf(row.thumbnail);
-      const hostFailedAt = host === '' ? undefined : fetchHostFailedAt.get(host);
-      const hostCooling = hostFailedAt !== undefined && Date.now() - hostFailedAt < COVER_COOLDOWN_MS;
-      if (hostCooling) {
-        pushLog('debug', 'cover', `域名 ${host} 刚直连失败过,跳过自己抓,直接让 yt-dlp 写 id=${row.id}`);
-      } else if (await coverFetcher({ url: row.thumbnail, coversDir, importId: row.id })) {
-        const fetched = findCoverFile(coversDir, row.id);
-        if (fetched !== null) {
-          if (host !== '') fetchHostFailedAt.delete(host); // 这个域名又通了(比如代理开了)→ 清掉记忆
-          return fetched;
-        }
-      } else if (host !== '') {
-        fetchHostFailedAt.set(host, Date.now());
-      }
-    }
-    pushLog('info', 'cover', `让 yt-dlp 直接写封面 id=${row.id} url=${row.url}`);
-    if (!(await coverWriter({ url: row.url, coversDir, importId: row.id }))) {
-      coverFailedAt.set(row.id, Date.now());
-      return null;
-    }
-    return findCoverFile(coversDir, row.id);
+
+  /** 封面统一入口:同一个来源并发调用只跑一次,后来者共享同一个 Promise */
+  function ensureCover(row: { id: number; url: string; thumbnail: string | null }): Promise<string | null> {
+    const running = coverInFlight.get(row.id);
+    if (running !== undefined) return running;
+    const p = runEnsureCover(row).finally(() => { coverInFlight.delete(row.id); });
+    coverInFlight.set(row.id, p);
+    return p;
   }
 
-  app.get('/api/imports', async () => ({
-    ok: true,
-    imports: importsRepo.list().map((it) => ({ ...it, has_cover: findCoverFile(coversDir, it.id) !== null })),
-  }));
+  async function runEnsureCover(row: { id: number; url: string; thumbnail: string | null }): Promise<string | null> {
+    try {
+      const local = findCoverFile(coversDir, row.id);
+      if (local !== null) return local;
+      // 冷却检查放在最前:失败过的来源连"自己 fetch"这一步也别重试——外网图床那一步要干等 10s,
+      // 不做冷却的话每次开卡片墙都白等一次(用户看到的就是"图迟迟不出来")
+      const failedAt = coverFailedAt.get(row.id);
+      if (failedAt !== undefined && Date.now() - failedAt < COVER_COOLDOWN_MS) return null;
+      if (row.thumbnail !== null) {
+        const host = hostOf(row.thumbnail);
+        const hostFailedAt = host === '' ? undefined : fetchHostFailedAt.get(host);
+        const hostCooling = hostFailedAt !== undefined && Date.now() - hostFailedAt < COVER_COOLDOWN_MS;
+        if (hostCooling) {
+          pushLog('debug', 'cover', `域名 ${host} 刚直连失败过,跳过自己抓,直接让 yt-dlp 写 id=${row.id}`);
+        } else if (await coverFetcher({ url: row.thumbnail, coversDir, importId: row.id })) {
+          const fetched = findCoverFile(coversDir, row.id);
+          if (fetched !== null) {
+            if (host !== '') fetchHostFailedAt.delete(host); // 这个域名又通了(比如代理开了)→ 清掉记忆
+            return fetched;
+          }
+        } else if (host !== '') {
+          fetchHostFailedAt.set(host, Date.now());
+        }
+      }
+      pushLog('info', 'cover', `让 yt-dlp 直接写封面 id=${row.id} url=${row.url}`);
+      if (!(await coverWriter({ url: row.url, coversDir, importId: row.id }))) {
+        coverFailedAt.set(row.id, Date.now());
+        return null;
+      }
+      return findCoverFile(coversDir, row.id);
+    } catch (e) {
+      // 兜底(2026-09-29 评审补):coverFetcher / coverWriter 是可注入的,类型只写了 Promise<boolean>;
+      // 哪天某个实现 reject,这两条路径(尤其预热那发 fire-and-forget)就成了未处理拒绝 —— Node 默认直接终止进程。
+      pushLog('error', 'cover', `抓封面异常(兜底) id=${row.id} url=${row.url}: ${e instanceof Error ? e.message : String(e)}`);
+      return null;
+    }
+  }
+
+  app.get('/api/imports', async () => {
+    // 目录只读一次(2026-09-29 评审补):原来是每个来源调一次 findCoverFile → 一次列表 = 来源数 × 目录扫描,
+    // 而这一页有 focus/visibilitychange 自动刷新,重复扫描很亏
+    const covered = listCoverImportIds(coversDir);
+    return { ok: true, imports: importsRepo.list().map((it) => ({ ...it, has_cover: covered.has(it.id) })) };
+  });
 
   app.get('/api/imports/:id', async (req, reply) => {
     const id = Number((req.params as { id: string }).id);
@@ -474,7 +498,8 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
     if (q.token !== token && !isAllowedLocalOrigin(origin) && !isLocalPageReferer(req.headers.referer)) {
       // 诊断日志(规则:失败路径必须有日志):这条以前只在 http 摘要里留个 401,看不出原因——
       // 是 token 错、还是既没 Origin 也没带本机 Referer(本地开发裸开浏览器时就是这种,播不出来)
-      pushLog('error', 'audio.file', `audio file 401 id=${id} origin=${origin || '(none)'} token=${q.token ? 'present' : 'missing'} referer=${req.headers.referer ?? '(none)'}`);
+      // 来源是 cover 不是 audio.file(2026-09-29 评审补):这是封面路由,写错来源会让按来源筛日志时张冠李戴
+      pushLog('error', 'cover', `cover 401 id=${id} origin=${origin || '(none)'} token=${q.token ? 'present' : 'missing'} referer=${req.headers.referer ?? '(none)'}`);
       return reply.code(401).send({ ok: false, error: { code: 'UNAUTHORIZED', message: 'token 无效', next: '' } });
     }
     if (!Number.isInteger(id) || id <= 0) return reply.code(404).send({ ok: false, error: { code: 'NOT_FOUND', message: '来源不存在', next: '' } });
@@ -491,7 +516,11 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
   app.delete('/api/imports/:id', async (req, reply) => {
     const id = Number((req.params as { id: string }).id);
     if (!Number.isInteger(id) || id <= 0) return reply.code(404).send({ ok: false, error: { code: 'NOT_FOUND', message: '来源不存在', next: '' } });
-    return { ok: importsRepo.delete(id) };
+    const ok = importsRepo.delete(id);
+    // 顺手清掉这个来源的封面失败冷却(2026-09-29 评审补):id 是自增的,不清就会随进程一直攒着(慢泄漏)。
+    // 正在抓的那发不动 —— 它的 finally 自己会从 coverInFlight 里摘掉。
+    coverFailedAt.delete(id);
+    return { ok };
   });
 
   // Task 6:SSE 事件流——query token(D3,EventSource 无法设 header);终态 job 立即补发并关闭

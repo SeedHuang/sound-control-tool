@@ -109,6 +109,13 @@ M1 前半使命：**贴一个网页 URL（B 站课程/YouTube/播客等）→ �
   - 触发时机：**解析成功后台预热一次**（不 await，不拖慢解析）+ **本条路由按需兜底**（自愈：老来源、上次没抓成、或压根没有地址的番剧，打开分组视图就会补上；实测 YouTube 那条首次 12.3s 出图，第二次 2ms）
 - 鉴权同 `/api/audio/:id/file`（query token / 本机 origin / **本机页面 Referer**）；**且必须在 index.ts 守卫的豁免名单里**——漏了就是实测踩到的那个 401（守卫先拦、路由根本没跑）
 - 本地没图且库里也没封面地址 → 404（前端回退纯色卡片）；来源不存在 → 404
+- **2026-09-29 代码评审加固（5 条，均已补测）**：
+  - **SSRF 防护**：封面地址来自远端元数据（yt-dlp 的 `thumbnail`，**源页面可指定**），所以只放行 http/https 还不够 —— 主机是本机/内网/链路本地的一律不去请求（`127/8`、`10/8`、`172.16/12`、`192.168/16`、`169.254/16`（含云元数据 `169.254.169.254`）、`localhost`/`.local`、`::1`、`fc00::/7`、`fe80::/10`）。不挡的话，一个恶意来源把缩略图指向 `http://127.0.0.1:7310/api/logs`，服务端就会替它取本机接口、再当封面交回来
+  - **响应必须像图**：`content-type` 不是 `image/*` 直接判失败（`''` 仍按 jpg 容错）；体积上限 8MB（有 `content-length` 提前拦，没有则读完再拦）。原因：反爬页/错误页会以 200 + `text/html` 返回，存下去就是一张**永久**坏图 —— 本地一有文件 `ensureCover` 第 ① 步立刻命中，第 ②③ 步再也不会重试
+  - **同一来源并发只抓一次**：`coverInFlight` 复用同一个 Promise。预热是 fire-and-forget（可能正卡在 10s fetch），期间用户打开卡片墙会对同一 id 再来一次 —— 不去重就是两个 yt-dlp 写同一个输出路径，且先到的请求可能把**写了一半的图**流回浏览器
+  - **yt-dlp 那条开跑前先清旧图**：成功判据是"文件真出现了"，而 `findCoverFile` 取的是 `readdirSync` 的**第一个**匹配 —— 旧图是 jpg、新图写成 png 时会命中旧那张，"报成功但仍是旧图"。先清干净，跑完还能找到就必然是新写出来的
+  - **`ensureCover` 整体 try/catch**：`coverFetcher`/`coverWriter` 可注入且类型只写 `Promise<boolean>`，一旦某实现 reject，这条 fire-and-forget 就成了未处理拒绝（Node 默认直接终止进程）
+- 同日一并小修：`/api/imports` 的 `has_cover` 改为**一次读目录**（`listCoverImportIds`，原先是每个来源一次 `readdirSync`，而这个接口被 focus/visibilitychange 高频调用）；`DELETE /api/imports/:id` 顺手清掉该来源的封面失败冷却（id 自增，不清就是进程内的慢泄漏）；cover 路由的 401 日志 source 由 `audio.file` 改回 `cover`（原先复制粘贴错了，按来源筛日志会张冠李戴）；前端 `ImportSource` 契约**不再声明** `thumbnail`/`has_cover`（前端本来就不读，留着只会诱导误用 `has_cover` 当开关）。
 
 ### 0.4 数据模型增量（repo 方法）
 
@@ -178,7 +185,7 @@ M1 前半使命：**贴一个网页 URL（B 站课程/YouTube/播客等）→ �
 - `errors.ts` 特征映射（DRM/需登录/站点不支持/网络/ENOENT/未知）
 - `audio-items.ts` repo CRUD + 重复检测 + updateFilePath + delete
 - `jobs.ts` 增补方法（update/finish/fail 的状态与 finished_at + findActiveByUrl：命中/未命中/仅 finished 不命中）
-- HTTP：parse（mock binProvider，成功/失败/重复）、download（校验/409 DUPLICATE/**409 BUSY 并发**/201/**确认覆盖后删旧行旧文件**）、SSE（真实 listen + fetch 读流，token 401、补发终态）、cancel、**retry（仅 error 可重试 / 非 error 409 / 建前 BUSY 检查）**、audio 列表/文件流（token 401/404/**非正整数 id 404**/200 + Content-Type）、**封面（`covers.ts`：fetch 抓图落盘 / 失败回退 / 换格式清旧图 + `writeCoverViaYtdlp` 成功与"退出码 0 但没写出文件"不误报；解析预热触发；`has_cover`；cover 路由 200/404/401 + 自己抓不到时兜底让 yt-dlp 写图；createServer 端到端「本机 Referer 过守卫取图」）**
+- HTTP：parse（mock binProvider，成功/失败/重复）、download（校验/409 DUPLICATE/**409 BUSY 并发**/201/**确认覆盖后删旧行旧文件**）、SSE（真实 listen + fetch 读流，token 401、补发终态）、cancel、**retry（仅 error 可重试 / 非 error 409 / 建前 BUSY 检查）**、audio 列表/文件流（token 401/404/**非正整数 id 404**/200 + Content-Type）、**封面（`covers.ts`：fetch 抓图落盘 / 失败回退 / 换格式清旧图 / **SSRF 拦截** / **非图片体拒绝** / **体积上限** / `writeCoverViaYtdlp` 成功与"退出码 0 但没写出文件"不误报 / **跑前清旧图**；解析预热触发；`has_cover`；**同一来源并发只抓一次**；cover 路由 200/404/401 + 自己抓不到时兜底让 yt-dlp 写图；createServer 端到端「本机 Referer 过守卫取图」）**
 - 下载全链路（mock spawn 回调模拟进度/完成，断言入库 rename 后 file_path 为 `{slug}-{id前8位}.{ext}`；**finalize 抛错时 job→error 且 audio_items 回滚删除**，P1-2；**片段下载忽略 durationSec 强制 ffprobe**，P1-3）
 
 **手工目验**（自动化不可达）：真实 B 站课程 URL 端到端——parse 出合集 → 勾选单条 → 下载 mp3 → 库页播放（含 SSE 进度条动画）。

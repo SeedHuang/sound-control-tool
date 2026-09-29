@@ -129,9 +129,16 @@ export default function LibraryPage() {
   // 导入来源一起拉:分组视图要拿它算「共 N 集」和封面。
   useEffect(() => {
     const load = (): void => {
-      void Promise.all([apiGet<AudioRow[]>('/api/audio'), listImports()])
-        .then(([rows, imps]) => { setItems(rows); setImports(imps); })
+      // 两个请求分开发(2026-09-29 评审修):原来用 Promise.all 绑死 —— 导入来源只是用来算「共 N 集」和
+      // 取封面,它失败不该把已经拿到的主列表一起丢掉(整页只剩错误文字)。
+      apiGet<AudioRow[]>('/api/audio')
+        // 成功必须清 error:否则一次瞬时失败(切回窗口那一下超时之类)会把整页**永久**钉在错误文字上,
+        // 后面的自动刷新即使成功也照样白屏(2026-09-29 评审修)
+        .then((rows) => { setItems(rows); setError(null); })
         .catch((e: Error) => setError(e.message));
+      void listImports()
+        .then(setImports)
+        .catch((e: Error) => logFe('error', `拉取导入来源失败(不影响音频列表): ${e.message}`));
     };
     load();
     const off = onAudioChanged(load);
@@ -178,7 +185,9 @@ export default function LibraryPage() {
     const byUrl = new Map(imports.map((i) => [i.url, i]));
     const map = new Map<string, WorkGroup>();
     for (const it of items) {
-      const key = it.source_url ?? `#item-${it.id}`;
+      // 空串也要当"没有网址"(2026-09-29 评审修):下面 renderRow 判的是 `!== null && !== ''`,
+      // 这里只用 ?? 会把所有空串来源并成 key='' 的一张假作品卡(标题和「已下 N 集」都是错的)
+      const key = it.source_url !== null && it.source_url !== '' ? it.source_url : `#item-${it.id}`;
       const cur = map.get(key);
       if (cur) {
         cur.items.push(it);
@@ -205,6 +214,12 @@ export default function LibraryPage() {
   const from = (safePage - 1) * pageSize;
   const pageWorks = cardLevel ? shownWorks.slice(from, from + pageSize) : [];
   const pageRows = cardLevel ? [] : (openWork === null ? flatRows : openRows).slice(from, from + pageSize);
+
+  // 「全部 N」取的是**当前这一层**的未过滤数(2026-09-29 评审修):原来一律写 items.length,
+  // 进入某作品后一搜索就会显示成「共 3 条(全部 57 条)」,读起来像"这部作品有 57 集"。
+  let allCount = items.length;
+  if (cardLevel) allCount = works.length;
+  else if (openWork !== null) allCount = openWork.items.length;
 
   const switchView = (v: ViewKind): void => { setView(v); setOpenKey(null); setPage(1); };
   const openCard = (key: string): void => { setOpenKey(key); setPage(1); };
@@ -288,7 +303,7 @@ export default function LibraryPage() {
         )}
         <Typography.Text type="secondary">
           {cardLevel ? `共 ${shownWorks.length} 部` : `共 ${total} 条`}
-          {q !== '' ? `(全部 ${cardLevel ? works.length : items.length} ${cardLevel ? '部' : '条'})` : ''}
+          {q !== '' ? `(全部 ${allCount} ${cardLevel ? '部' : '条'})` : ''}
         </Typography.Text>
       </div>
 
@@ -302,11 +317,13 @@ export default function LibraryPage() {
       )}
 
       {/* 身:自己滚(上下自适应)。key 让「切视图 / 进作品 / 返回」时重新挂载 → 触发一次淡入,
-          同一层内翻页/搜索不重播(那种高频动作不该有动效) */}
+          同一层内翻页/搜索不重播(那种高频动作不该有动效)。
+          paddingTop 12(2026-09-29 评审修):overflow 容器按 padding box 裁切,不留出空间的话,
+          首行卡片悬停上浮的 2px 与阴影上半截会被切掉——恰好切在最想显精致的那一下。 */}
       <div
         key={cardLevel ? 'cards' : openWork === null ? 'flat' : `work-${openWork.key}`}
         className="sct-view-enter"
-        style={{ boxSizing: 'border-box', flex: 1, minHeight: 0, overflowY: 'auto', paddingRight: 4 }}
+        style={{ boxSizing: 'border-box', flex: 1, minHeight: 0, overflowY: 'auto', paddingRight: 4, paddingTop: 12 }}
       >
         {items.length === 0 ? emptyNode : cardLevel ? (
           pageWorks.length === 0 ? emptyNode : (
