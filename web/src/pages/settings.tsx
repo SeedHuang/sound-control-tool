@@ -191,7 +191,8 @@ export default function SettingsPage() {
   }, []);
 
   return (
-    <div style={{ margin: 16 }}>
+    /* 设置页自管滚动(spec D3):锁死高度 + 自己滚,不再依赖布局的内容区 */
+    <div style={{ boxSizing: 'border-box', height: '100%', minHeight: 0, overflowY: 'auto', padding: 16 }}>
       {error && (
         <Alert
           type="error"

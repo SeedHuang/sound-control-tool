@@ -22,22 +22,25 @@ export default function IndexPage() {
   const ok = health !== null && health.ok === true && health.sqlite !== null;
 
   return (
-    <Card title="首页" style={{ margin: 16 }}>
-      {error && <Alert type="error" showIcon message="无法连接本地服务" description={error} />}
-      {!error && !health && <Spin />}
-      {!error && health && ok && (
-        <Typography.Text>
-          后端 OK · SQLite 读写成功 · API 端口 {health.port}
-        </Typography.Text>
-      )}
-      {!error && health && !ok && (
-        <Alert
-          type="error"
-          showIcon
-          message="后端异常"
-          description={`health.ok=${String(health.ok)}, sqlite=${String(health.sqlite)}`}
-        />
-      )}
-    </Card>
+    /* 首页自管滚动(spec D3):根容器锁死高度,超出的部分由内部这层滚 */
+    <div style={{ height: '100%', minHeight: 0, overflowY: 'auto', padding: 16 }}>
+      <Card title="首页">
+        {error && <Alert type="error" showIcon message="无法连接本地服务" description={error} />}
+        {!error && !health && <Spin />}
+        {!error && health && ok && (
+          <Typography.Text>
+            后端 OK · SQLite 读写成功 · API 端口 {health.port}
+          </Typography.Text>
+        )}
+        {!error && health && !ok && (
+          <Alert
+            type="error"
+            showIcon
+            message="后端异常"
+            description={`health.ok=${String(health.ok)}, sqlite=${String(health.sqlite)}`}
+          />
+        )}
+      </Card>
+    </div>
   );
 }

@@ -46,8 +46,10 @@ export default function GlobalLayout() {
         {/* 日志按钮全局唯一,从三个页面收拢到此 */}
         <LogsButton />
       </div>
-      {/* 内容区:minHeight 0 是 flex 子项允许收缩、内部滚动生效的关键 */}
-      <div style={{ flex: 1, minHeight: 0, overflowY: 'auto' }}>
+      {/* 内容区(spec m2-workspace D3):这里**不再滚**——滚动交给每个页面自己的容器。
+          留 overflow:hidden 是为了把"页面超出"这件事挡在内容区里,不让它顶到 body。
+          minHeight 0 是 flex 子项允许收缩的关键,少了它子页面的 height:100% 会失效。 */}
+      <div style={{ flex: 1, minHeight: 0, overflow: 'hidden' }}>
         <Outlet /> {/* Umi 4 子页面唯一正确渲染方式(参考项目同款) */}
       </div>
     </div>
