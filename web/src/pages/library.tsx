@@ -1,357 +1,349 @@
-// web/src/pages/library.tsx(音频库)
-// 2026-09-29 用户拍板:列表 + 名称搜索 + 分页 + 平台 logo + 原视频地址 + 剧集「第几集/该集名字」;
-// 又在搜索栏右侧加了「视图切换」:平铺(逐条列表)/ 剧集分组(作品聚合卡片墙,点卡片进该作品自己的音频列表)。
-// 布局与获取页同款:整页锁死内容区高度 —— 头(搜索/切换/计数)、身(自己滚)、脚(分页)三段;
-// 行内 flexWrap + maxWidth,窄窗自动折行。
-// 注意:本项目没有全局 reset,div 默认 content-box —— 凡「height:100% + padding」的这一层都要 boxSizing: border-box,
-// 否则会比外框高出内边距那几像素、外框出现滚动条(2026-09-29 实测踩过:内容区 778 vs 本层 810)。
-import { Button, Empty, Input, Modal, Pagination, Progress, Segmented, Tag, Typography } from 'antd';
-import { AppstoreOutlined, ArrowLeftOutlined, SearchOutlined, UnorderedListOutlined } from '@ant-design/icons';
-import { useEffect, useRef, useState } from 'react';
-import { apiGet, audioFileUrl, coverUrl, deleteAudio, listImports, logFe, onAudioChanged, type AudioRow, type ImportSource } from '@/api';
-import SiteLogo, { siteColor } from '@/components/SiteLogo';
-
-const PAGE_SIZE_OPTIONS = ['10', '20', '50'];
-const CARD_MIN_WIDTH = 190;   // 卡片最小宽:窗口越宽列数越多(auto-fill),不是把列数写死
-const CARDS_MAX_WIDTH = 1160; // 内容区最大宽:超宽屏上整块居中,不让卡片/正文被拉成巨幅
-
-/** 主名:合集条目显示合集名(用户心里的「这张专辑」),单视频/录制显示自身标题 */
-function mainTitle(it: AudioRow): string {
-  return it.collection_title ?? it.title;
-}
-/** 「第 N 集」标签;单视频 → null。
-    用 Number.isInteger 判定而不是 `=== null`:字段缺失(老版本 server 不返回 entry_index 时是 undefined)
-    也曾被渲染成「第 undefined 集」——实测踩到过,判定收严后缺字段一律不显示。 */
-function episodeTag(it: AudioRow): string | null {
-  return Number.isInteger(it.entry_index) ? `第 ${it.entry_index} 集` : null;
-}
-/** 解析器给「平台没给标题的分集」的兜底名(server 侧 parse.ts 的 `条目 N`)——
-    它不是集名,当集名显示出来就是「第 94 集 条目 94」这种废话,故识别为占位符不显示。 */
-const PLACEHOLDER_TITLE = /^条目\s*\d+$/;
-/** 该集自己的名字(合集条目才有;与合集名相同、或是占位名 → 不显示) */
-function episodeTitle(it: AudioRow): string | null {
-  if (!it.collection_title || it.title === it.collection_title) return null;
-  if (PLACEHOLDER_TITLE.test(it.title.trim())) return null;
-  return it.title;
-}
-function formatDuration(sec: number): string {
-  const m = Math.floor(sec / 60);
-  const s = Math.floor(sec % 60);
-  return `${m}:${String(s).padStart(2, '0')}`;
-}
-
-/** 一个「作品」= 同一来源网址下的全部入库音频(番剧/课程/合集)。没有来源网址的(理论上只有录制)各自成卡 */
-interface WorkGroup {
-  key: string;                 // 来源网址
-  title: string;               // 作品名(合集名)
-  site: string;                // 平台(算 logo 与品牌色)
-  items: AudioRow[];           // 已下载的音频
-  importRow: ImportSource | null; // 解析时落库的来源行(拿封面 + 总集数);来源被删了就是 null
-  latest: string;              // 最近入库时间
-}
-/** 「已下 N 集 / 共 M 集」文案;单条作品/无来源记录各有说法 */
-function workCountText(w: WorkGroup): string {
-  if (w.importRow === null) return `已下 ${w.items.length} 条`;
-  if (w.importRow.kind === 'single') return `${w.items.length} 条`;
-  return `已下 ${w.items.length} 集 / 共 ${w.importRow.entry_count} 集`;
-}
-
-/** 作品聚合卡片:封面(没图退纯色底 + 平台 logo)+ 作品名 + 已下/共集数 + 细进度条 + 最近入库 */
-function WorkCard({ work, onOpen }: { work: WorkGroup; onOpen: () => void }) {
-  const [coverBroken, setCoverBroken] = useState(false);
-  const [coverLoaded, setCoverLoaded] = useState(false);
-  const imp = work.importRow;
-  // 是否渲染 <img>:有来源记录就试——本地有图秒出;没有的话服务端会现拿(可能要先单独问一次 yt-dlp,首次几秒后出图);
-  // 真拿不到 → onError → 回退纯色卡片。**不要用 has_cover 当开关**:那样"还没图的来源"永远没机会去拿图
-  const showCover = imp !== null && !coverBroken;
-  const tint = siteColor(work.site);
-  const total = imp === null || imp.kind === 'single' ? null : imp.entry_count;
-  return (
-    <div
-      className="sct-card"
-      role="button"
-      tabIndex={0}
-      aria-label={work.title}
-      onClick={onOpen}
-      onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onOpen(); } }}
-      style={{ border: '1px solid #f0f0f0', borderRadius: 10, background: '#fff', overflow: 'hidden', cursor: 'pointer', display: 'flex', flexDirection: 'column' }}
-    >
-      {/* 封面区:固定 16:9 占位,图从透明淡入——避免图片加载完成时把整行卡片顶一下 */}
-      <div style={{ position: 'relative', aspectRatio: '16 / 9', background: tint.bg, overflow: 'hidden' }}>
-        {showCover ? (
-          <img
-            src={coverUrl(imp.id)}
-            alt=""
-            onError={() => setCoverBroken(true)}
-            onLoad={() => setCoverLoaded(true)}
-            style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block', opacity: coverLoaded ? 1 : 0, transition: 'opacity 200ms cubic-bezier(0.23, 1, 0.32, 1)' }}
-          />
-        ) : (
-          <div style={{ width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-            <SiteLogo site={work.site} size={44} />
-          </div>
-        )}
-        {/* 平台角标:封面上的白 logo 会看不见,垫一层半透明黑底 */}
-        <span style={{ position: 'absolute', left: 8, top: 8, display: 'flex', background: 'rgba(0, 0, 0, 0.45)', borderRadius: 6, padding: 3 }}>
-          <SiteLogo site={work.site} size={14} />
-        </span>
-      </div>
-      <div style={{ padding: '10px 12px', display: 'flex', flexDirection: 'column', gap: 4 }}>
-        <Typography.Text strong ellipsis={{ tooltip: work.title }} style={{ minWidth: 0 }}>{work.title}</Typography.Text>
-        <Typography.Text type="secondary" style={{ fontSize: 12 }}>{workCountText(work)}</Typography.Text>
-        {total !== null && total > 0 && (
-          <Progress percent={Math.min(100, Math.round((work.items.length / total) * 100))} showInfo={false} size="small" strokeColor={tint.fg} />
-        )}
-        <Typography.Text type="secondary" style={{ fontSize: 12 }}>最近入库 {work.latest}</Typography.Text>
-      </div>
-    </div>
-  );
-}
-
-type ViewKind = 'flat' | 'group';
+// web/src/pages/library.tsx(资料库 2026-09-30:P1 仅改名搬文件,职责仍是"只负责下载")
+// 左列表持久化(imported_sources 表,parse 成功自动落库);点来源直接看缓存集数,不重新解析
+import { Alert, Badge, Button, Card, Checkbox, Empty, Input, Modal, Progress, Radio, Segmented, Space, Spin, Typography } from 'antd';
+import { useEffect, useState } from 'react';
+import { ApiError, apiGet, cancelJob, deleteImport, getImport, listImports, logFe, notifyAudioChanged, parseUrl, startDownload, subscribeJob, type ImportDetail, type ImportSource } from '@/api';
+import SiteLogo from '@/components/SiteLogo';
+import VideoClipPanel from '@/components/VideoClipPanel';
 
 export default function LibraryPage() {
-  const [items, setItems] = useState<AudioRow[]>([]);
   const [imports, setImports] = useState<ImportSource[]>([]);
+  const [selectedId, setSelectedId] = useState<number | null>(null);
+  const [detail, setDetail] = useState<ImportDetail | null>(null);
+  const [modalOpen, setModalOpen] = useState(false);
+  const [url, setUrl] = useState('');
+  const [parsing, setParsing] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [query, setQuery] = useState('');
-  const [view, setView] = useState<ViewKind>('flat');
-  const [openKey, setOpenKey] = useState<string | null>(null); // 进入了哪个作品(用来源网址当 key)
-  const [page, setPage] = useState(1);
-  const [pageSize, setPageSize] = useState(10);
-  const audioRefs = useRef<Map<number, HTMLAudioElement | null>>(new Map());
+  const [checked, setChecked] = useState<number[]>([]);
+  const [format, setFormat] = useState<'mp3' | 'm4a' | 'wav'>('mp3');
+  const [jobId, setJobId] = useState<number | null>(null);
+  const [percent, setPercent] = useState(0);
+  const [phase, setPhase] = useState<'download' | 'ingest'>('download'); // 进度条第二段:下载结束→入库中(2026-09-29 用户拍板)
+  const [done, setDone] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false); // 提交 in-flight 守卫 + 逐条串行中
+  const [mode, setMode] = useState<'audio' | 'video'>('audio'); // 顶部模式切换(Task 13):audio=下载音频(原流程),video=视频预览剪音频
 
-  // 列表拉取收口成 load():挂载时拉一次,之后两个时机自动重拉——
-  //   ① 下载入库完成时的进程内通知(用户很可能正开着这一页等新文件);
-  //   ② 窗口重新可见 / 重新获得焦点(例如另开窗口把文件下完再切回来,或①的通知没送到)。
-  // 2026-09-29 用户反馈「下载结束后点音频库,刚下的文件不在列表里」——根因就是缺这两个时机:
-  // 切页那一下确实拉过列表,但后端 rename+ffprobe+INSERT 比它晚几秒(实测差 4 秒),此后页面不再刷新。
-  // 导入来源一起拉:分组视图要拿它算「共 N 集」和封面。
+  const refreshImports = (): Promise<ImportSource[]> =>
+    listImports().then((list) => { setImports(list); return list; });
+
+  const selectSource = (id: number): void => {
+    setSelectedId(id); setError(null); setDone(null);
+    getImport(id)
+      .then((d) => {
+        setDetail(d);
+        setChecked(d.kind === 'playlist' && d.entries !== null && d.entries.length > 0 ? [d.entries[0]!.index] : []);
+      })
+      .catch((e: Error) => setError(e.message));
+  };
+
   useEffect(() => {
-    const load = (): void => {
-      // 两个请求分开发(2026-09-29 评审修):原来用 Promise.all 绑死 —— 导入来源只是用来算「共 N 集」和
-      // 取封面,它失败不该把已经拿到的主列表一起丢掉(整页只剩错误文字)。
-      apiGet<AudioRow[]>('/api/audio')
-        // 成功必须清 error:否则一次瞬时失败(切回窗口那一下超时之类)会把整页**永久**钉在错误文字上,
-        // 后面的自动刷新即使成功也照样白屏(2026-09-29 评审修)
-        .then((rows) => { setItems(rows); setError(null); })
-        .catch((e: Error) => setError(e.message));
-      void listImports()
-        .then(setImports)
-        .catch((e: Error) => logFe('error', `拉取导入来源失败(不影响音频列表): ${e.message}`));
-    };
-    load();
-    const off = onAudioChanged(load);
-    const onVisible = (): void => { if (document.visibilityState === 'visible') load(); };
-    document.addEventListener('visibilitychange', onVisible);
-    window.addEventListener('focus', load);
-    return () => {
-      off();
-      document.removeEventListener('visibilitychange', onVisible);
-      window.removeEventListener('focus', load);
-    };
+    void refreshImports().then((list) => { if (list.length > 0) selectSource(list[0]!.id); });
+    // 仅首挂载拉一次列表
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // 2026-09-29:删除按钮 → antd Modal.confirm 弹窗(用户拍板);
-  // 先把对应行的 <audio> 暂停并清 src,避免删除瞬间 audio 还在请求 /api/audio/:id/file(range 请求 404 噪声)
-  const onDelete = (id: number, title: string) => {
-    Modal.confirm({
-      title: `删除《${title}》?`,
-      content: '此操作会同时删除音频文件和数据库记录,不可恢复。',
-      okText: '删除',
-      okType: 'danger',
-      cancelText: '取消',
-      onOk: async () => {
-        // 先停播放,再调接口(2026-09-29 用户体感优化 + 日志去噪声)
-        const a = audioRefs.current.get(id);
-        if (a) { a.pause(); a.removeAttribute('src'); a.load(); }
-        logFe('info', `删除请求 id=${id} title=${title.slice(0, 60)}`);
+  // jobId 变化时建立 EventSource 订阅;done/error 后关闭
+  useEffect(() => {
+    if (jobId === null) return undefined;
+    return subscribeJob(jobId, {
+      onProgress: (p) => setPercent(Math.round(p.percent)),
+      onPhase: () => setPhase('ingest'), // 下载进程结束 → 第二段(入库)开始动
+      onDone: (d) => {
+        if (d.kind === 'video') { setDone(`《${d.title}》视频素材已下好`); return; }
+        setDone(d.replaced ? `《${d.title}》已入库(库里原来那一份已替换)` : `《${d.title}》已入库`);
+      },
+      onStatus: (s) => { if (s.state === 'error' || s.state === 'cancelled') setError(s.message ?? s.state); },
+    });
+  }, [jobId]);
+
+  // 等待单个 job 终结的 Promise(供逐条串行用);resolve 前必清定时器。
+  // 2026-09-29 修复(用户拍板):兜底定时器此前只计一次、不随进度重置——超过 60s 的正常下载
+  // 会被误判 error 中断整批。现按注释本意"60s 无任何事件才放行":进度事件续期,
+  // 只有 SSE 真断连或服务端卡死(60s 零事件)才兜底放行。
+  const waitJobEnd = (jid: number): Promise<'done' | 'error' | 'cancelled'> =>
+    new Promise((resolve) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const arm = (): void => {
+        clearTimeout(timer);
+        timer = setTimeout(() => { close(); resolve('error'); }, 60_000); // 60s 零事件(SSE 断连/卡死)才兜底
+      };
+      arm();
+      const close = subscribeJob(jid, {
+        onProgress: arm, // 有进度就续期——正常下载无论多长都不会被误杀
+        onDone: () => { clearTimeout(timer); close(); resolve('done'); },
+        onStatus: (s) => { if (s.state === 'error' || s.state === 'cancelled') { clearTimeout(timer); close(); resolve(s.state); } },
+      });
+    });
+
+  // 弹窗内解析:成功 → server 已自动落库 → 关弹窗 → 刷新左列表 → 选中新来源
+  const onParseInModal = async (): Promise<void> => {
+    setParsing(true); setError(null);
+    logFe('info', `onParse url=${url.slice(0, 80)}`);
+    try {
+      const r = await parseUrl(url);
+      setModalOpen(false); setUrl('');
+      const list = await refreshImports();
+      if (r.import_id !== undefined) selectSource(r.import_id);
+      else if (list.length > 0) selectSource(list[0]!.id);
+    } catch (e) { setError((e as Error).message); }
+    finally { setParsing(false); }
+  };
+
+  // D8:合集多选逐条提交——每条一个 job,串行下载(单产物入库模型)。
+  // 2026-09-29 修复(用户拍板):单条失败不再中断整批——失败条目记入 failed 继续下一条,结束后汇总。
+  // 用户主动取消(cancelled)仍停整批——那是"别下了"的意思,不是失败。
+  // 2026-09-29 增(用户拍板):服务端判重(同一集/同一视频已在库里 → 409 DUPLICATE;此时还没开始下载、不耗流量),
+  // 命中的条目先记下来,整批跑完弹**一次**窗问用户;确认后按「覆盖」再下一遍(服务端在新文件入库成功后才删旧的那份)。
+  // 起因:条目下载以前完全不判重,同一集重下会静默留两份(用户实测踩到,手动删过一次)。
+  const onDownload = async (): Promise<void> => {
+    if (detail === null || busy) return;
+    const isPlaylist = detail.kind === 'playlist' && detail.entries !== null;
+    if (isPlaylist && checked.length === 0) { setError('请至少勾选一个条目'); return; }
+    setBusy(true); setError(null); setDone(null); setPercent(0);
+    logFe('info', `onDownload entries=${isPlaylist ? checked.length : 1}`);
+    const failed: string[] = [];
+    const duplicates: number[] = []; // 服务端判为「已在库里」的条目(这一遍没真下)
+    let okCount = 0;
+    let cancelled = false;
+    /** 跑一批条目;forceReplace=true 时带 force 提交 → 服务端放行并覆盖库里旧的那份。
+     *  返回**本批真正成功的条数**(2026-09-29 评审修:调用方要用它算"覆盖了几条",
+     *  不能拿 duplicates.length 充数——那是在下载开始前就数出来的,覆盖失败也会被算成已完成) */
+    const runBatch = async (idxs: number[], forceReplace: boolean): Promise<number> => {
+      let batchOk = 0;
+      for (const entryIndex of idxs) {
+        if (detail === null) return batchOk;
+        setDone(null); // 每条开始前重置,避免上一条 onDone 的成功提示误报
+        setPhase('download'); setPercent(0); // 进度条两段也复位:下一条从「① 下载 0%」重新开始
+        // 合集条目的「第几集 + 所属合集」随下载一起落库(2026-09-29 用户拍板:音频库要显示第几集/集名)
+        const entry = entryIndex === 0 ? null : detail.entries?.find((e) => e.index === entryIndex) ?? null;
         try {
-          await deleteAudio(id);
-          setItems((prev) => prev.filter((it) => it.id !== id)); // 本地移除,避免再拉一次列表
-          logFe('info', `删除完成 id=${id}`);
+          const { jobId: jid } = await startDownload({
+            url: detail.url,
+            title: entry === null ? detail.title : entry.title,
+            durationSec: entryIndex === 0 ? detail.duration_sec ?? undefined : undefined, // 合集条目无时长 → ffprobe 兜底
+            entryIndex: entryIndex === 0 ? undefined : entryIndex,
+            collectionTitle: detail.kind === 'playlist' ? detail.title : undefined,
+            options: {
+              entryIndices: entryIndex === 0 ? undefined : [entryIndex],
+              format,
+              force: forceReplace,
+            },
+          });
+          setJobId(jid);
+          const end = await waitJobEnd(jid);
+          if (end === 'cancelled') { cancelled = true; return batchOk; } // 用户主动取消 → 停整批(不是失败)
+          if (end !== 'done') {
+            failed.push(`条目 ${entryIndex}`);
+            continue; // 单条 error 跳过继续,不再 break
+          }
+          // 入库已成 → 喊一声让音频库刷新。用的是「切页后这段异步循环仍活着」这一事实:
+          // 用户往往在进度条刚满就切到音频库,那一瞬库里还没这行,靠这条通知补上(2026-09-29 用户反馈修复)
+          notifyAudioChanged(`job ${jid} 入库完成`);
+          okCount += 1;
+          batchOk += 1;
         } catch (e) {
-          // 失败保留行(让用户看到原列表,可重试)
-          logFe('error', `删除失败 id=${id}: ${(e as Error).message}`);
-          throw e; // 让 Modal 显示原生错误
+          const err = e as ApiError;
+          if (err.code === 'DUPLICATE') { duplicates.push(entryIndex); continue; } // 已存在 → 不算失败,交给下面的弹窗
+          failed.push(`条目 ${entryIndex}: ${err.message}`); // 提交阶段失败(网络/409 等)同样跳过继续
         }
+      }
+      return batchOk;
+    };
+    const targets = isPlaylist ? checked : [0]; // [0] = 单视频(不带 entryIndices)
+    try {
+      await runBatch(targets, false);
+      let replacedCount = 0;
+      let skipped = 0;
+      if (!cancelled && duplicates.length > 0) {
+        const names = duplicates.map((i) => (i === 0 ? '该音频' : `第 ${i} 集`)).join('、');
+        const ok = await new Promise<boolean>((resolve) => {
+          Modal.confirm({
+            title: '这些已经在音频库里了',
+            content: `${names} 已存在。重新下载会删掉库里原来那一份(文件也删掉),只保留新下的。要继续吗?`,
+            okText: '重新下载并替换',
+            okType: 'danger',
+            cancelText: '取消',
+            onOk: () => resolve(true),
+            onCancel: () => resolve(false),
+          });
+        });
+        // 按**实际成功**数计(2026-09-29 评审修):原来直接写 duplicates.length,是下载开始前的预估值,
+        // 覆盖失败也会被算成"已删旧的那份"。整批的成功数同样并入 okCount(下面「成功 N 条」的总数)。
+        if (ok) replacedCount = await runBatch(duplicates, true);
+        else skipped = duplicates.length;
+      }
+      const parts: string[] = [];
+      if (okCount > 0) parts.push(`成功 ${okCount} 条${replacedCount > 0 ? `(其中 ${replacedCount} 条是覆盖下载,旧的那份已删)` : ''}`);
+      if (skipped > 0) parts.push(`跳过 ${skipped} 条(库里已存在)`);
+      if (failed.length > 0) parts.push(`失败 ${failed.length} 条:${failed.slice(0, 3).join('、')}${failed.length > 3 ? ' 等' : ''}`);
+      if (cancelled) parts.push('已取消');
+      if (failed.length > 0 && okCount === 0 && skipped === 0) setError(failed[0] ?? '下载失败'); // 全失败 → 沿用原报错体验
+      else if (targets.length > 1 || skipped > 0 || failed.length > 0 || replacedCount > 0) setDone(parts.join(';'));
+      // 单条成功:不移交汇总,保留 per-entry 的「《x》已入库」提示
+    } catch (e) { setError((e as Error).message); }
+    finally { setBusy(false); setJobId(null); }
+  };
+
+  const onDeleteSource = (id: number): void => {
+    Modal.confirm({
+      title: '删除这个导入来源?',
+      content: '会一并删除该来源的视频素材文件（已剪出的音频不受影响）。',
+      okText: '删除', okType: 'danger', cancelText: '取消',
+      onOk: async () => {
+        await deleteImport(id);
+        const list = await refreshImports();
+        if (selectedId === id) { setDetail(null); setSelectedId(null); if (list.length > 0) selectSource(list[0]!.id); }
       },
     });
   };
 
-  // 按来源网址聚合成作品(2026-09-29 用户拍板)。刻意按网址而不是按名字:同名作品不会错并,
-  // 单视频也各自成卡;代价是同一作品被两种网址变体下载过会分成两张卡(取语义正确优先)。
-  const works: WorkGroup[] = (() => {
-    const byUrl = new Map(imports.map((i) => [i.url, i]));
-    const map = new Map<string, WorkGroup>();
-    for (const it of items) {
-      // 空串也要当"没有网址"(2026-09-29 评审修):下面 renderRow 判的是 `!== null && !== ''`,
-      // 这里只用 ?? 会把所有空串来源并成 key='' 的一张假作品卡(标题和「已下 N 集」都是错的)
-      const key = it.source_url !== null && it.source_url !== '' ? it.source_url : `#item-${it.id}`;
-      const cur = map.get(key);
-      if (cur) {
-        cur.items.push(it);
-        if (it.created_at > cur.latest) cur.latest = it.created_at;
-      } else {
-        map.set(key, { key, title: mainTitle(it), site: it.site, items: [it], importRow: byUrl.get(key) ?? null, latest: it.created_at });
-      }
-    }
-    return [...map.values()].sort((a, b) => (a.latest < b.latest ? 1 : -1)); // 最近入库在前
-  })();
-
-  // 搜索:平铺层按条匹配;分组层按作品名或任意一集匹配;进入作品后只搜这一部
-  const q = query.trim().toLowerCase();
-  const matches = (it: AudioRow): boolean => q === '' || `${mainTitle(it)} ${it.title} ${it.entry_index ?? ''}`.toLowerCase().includes(q);
-  const flatRows = items.filter(matches);
-  const shownWorks = works.filter((w) => q === '' || w.title.toLowerCase().includes(q) || w.items.some(matches));
-  const openWork = openKey === null ? null : works.find((w) => w.key === openKey) ?? null;
-  const openRows = openWork === null ? [] : openWork.items.filter(matches);
-
-  const cardLevel = view === 'group' && openWork === null; // 卡片墙层
-  const total = cardLevel ? shownWorks.length : openWork === null ? flatRows.length : openRows.length;
-  const maxPage = Math.max(1, Math.ceil(total / pageSize)); // 页码渲染期收敛:搜索/删除后越界不出现空白页
-  const safePage = Math.min(page, maxPage);
-  const from = (safePage - 1) * pageSize;
-  const pageWorks = cardLevel ? shownWorks.slice(from, from + pageSize) : [];
-  const pageRows = cardLevel ? [] : (openWork === null ? flatRows : openRows).slice(from, from + pageSize);
-
-  // 「全部 N」取的是**当前这一层**的未过滤数(2026-09-29 评审修):原来一律写 items.length,
-  // 进入某作品后一搜索就会显示成「共 3 条(全部 57 条)」,读起来像"这部作品有 57 集"。
-  let allCount = items.length;
-  if (cardLevel) allCount = works.length;
-  else if (openWork !== null) allCount = openWork.items.length;
-
-  const switchView = (v: ViewKind): void => { setView(v); setOpenKey(null); setPage(1); };
-  const openCard = (key: string): void => { setOpenKey(key); setPage(1); };
-  const backToCards = (): void => { setOpenKey(null); setPage(1); };
-
-  const emptyNode = (
-    <Empty
-      description={
-        items.length === 0 ? '暂无音频,先去获取页下载吧'
-          : cardLevel ? `没有匹配「${query.trim()}」的作品`
-            : `没有匹配「${query.trim()}」的音频`
-      }
-      style={{ marginTop: 64 }}
-    />
-  );
-
-  /** 平铺层/作品内的同一条行 UI(播放器、原视频、删除都在这一行) */
-  const renderRow = (it: AudioRow) => (
-    <div
-      key={it.id}
-      style={{ border: '1px solid #f0f0f0', borderRadius: 8, padding: '12px 16px', marginBottom: 8, display: 'flex', flexDirection: 'column', gap: 8 }}
-    >
-      {/* 第 1 行:平台 logo + 名称 + 第几集 + 该集名字 + 格式/时长/入库时间 */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-        <SiteLogo site={it.site} size={18} />
-        <Typography.Text strong ellipsis={{ tooltip: mainTitle(it) }} style={{ maxWidth: 420, minWidth: 0 }}>
-          {mainTitle(it)}
-        </Typography.Text>
-        {episodeTag(it) !== null && <Tag color="blue" style={{ marginInlineEnd: 0 }}>{episodeTag(it)}</Tag>}
-        {episodeTitle(it) !== null && (
-          <Typography.Text type="secondary" ellipsis={{ tooltip: episodeTitle(it) ?? '' }} style={{ maxWidth: 320, minWidth: 0 }}>
-            {episodeTitle(it)}
-          </Typography.Text>
-        )}
-        <Typography.Text type="secondary" style={{ fontSize: 12, marginInlineStart: 'auto' }}>
-          {it.format} · {it.duration_sec ? formatDuration(it.duration_sec) : '时长未知'} · {it.created_at}
-        </Typography.Text>
-      </div>
-      {/* 第 2 行:原视频地址 + 播放器 + 删除;窄窗自动折行,地址过长省略号 + 悬停看全文 */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
-        {it.source_url !== null && it.source_url !== '' && (
-          <a
-            href={it.source_url}
-            target="_blank"
-            rel="noreferrer"
-            title={it.source_url}
-            style={{ flex: '0 1 360px', minWidth: 160, fontSize: 12, color: '#1677ff', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
-          >
-            原视频:{it.source_url}
-          </a>
-        )}
-        <audio ref={(el) => { audioRefs.current.set(it.id, el); }} controls src={audioFileUrl(it.id)} style={{ flex: '1 1 280px', minWidth: 220 }} />
-        <Button danger size="small" onClick={() => onDelete(it.id, mainTitle(it))}>删除</Button>
-      </div>
-    </div>
-  );
-
-  if (error) return <Typography.Text type="danger">{error}</Typography.Text>;
   return (
-    <div style={{ boxSizing: 'border-box', height: '100%', minHeight: 0, overflow: 'hidden', display: 'flex', flexDirection: 'column', padding: 16, gap: 12 }}>
-      {/* 头:搜索框 + 视图切换(用户拍板:切换器在搜索栏右侧);进了作品就换成「返回分组」 */}
-      <div style={{ flexShrink: 0, display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
-        {openWork !== null && <Button icon={<ArrowLeftOutlined />} onClick={backToCards}>返回分组</Button>}
-        <Input
-          allowClear
-          prefix={<SearchOutlined />}
-          placeholder={openWork !== null ? '搜索这一部的集名' : '搜索作品名 / 音频名'}
-          value={query}
-          onChange={(e) => { setQuery(e.target.value); setPage(1); }}
-          style={{ flex: '0 1 320px', minWidth: 180, maxWidth: 420 }}
-        />
-        {openWork === null && (
-          <Segmented
-            value={view}
-            onChange={(v) => switchView(v as ViewKind)}
-            options={[
-              { value: 'flat', label: '平铺', icon: <UnorderedListOutlined /> },
-              { value: 'group', label: '剧集分组', icon: <AppstoreOutlined /> },
-            ]}
-          />
-        )}
-        <Typography.Text type="secondary">
-          {cardLevel ? `共 ${shownWorks.length} 部` : `共 ${total} 条`}
-          {q !== '' ? `(全部 ${allCount} ${cardLevel ? '部' : '条'})` : ''}
-        </Typography.Text>
-      </div>
-
-      {/* 进了作品:一行作品信息(平台 logo + 作品名 + 已下/共),让用户清楚"现在在看哪一部" */}
-      {openWork !== null && (
-        <div style={{ flexShrink: 0, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-          <SiteLogo site={openWork.site} size={20} />
-          <Typography.Text strong ellipsis={{ tooltip: openWork.title }} style={{ maxWidth: 480, minWidth: 0 }}>{openWork.title}</Typography.Text>
-          <Typography.Text type="secondary" style={{ fontSize: 12 }}>{workCountText(openWork)}</Typography.Text>
-        </div>
-      )}
-
-      {/* 身:自己滚(上下自适应)。key 让「切视图 / 进作品 / 返回」时重新挂载 → 触发一次淡入,
-          同一层内翻页/搜索不重播(那种高频动作不该有动效)。
-          paddingTop 12(2026-09-29 评审修):overflow 容器按 padding box 裁切,不留出空间的话,
-          首行卡片悬停上浮的 2px 与阴影上半截会被切掉——恰好切在最想显精致的那一下。 */}
-      <div
-        key={cardLevel ? 'cards' : openWork === null ? 'flat' : `work-${openWork.key}`}
-        className="sct-view-enter"
-        style={{ boxSizing: 'border-box', flex: 1, minHeight: 0, overflowY: 'auto', paddingRight: 4, paddingTop: 12 }}
-      >
-        {items.length === 0 ? emptyNode : cardLevel ? (
-          pageWorks.length === 0 ? emptyNode : (
-            /* 卡片墙:auto-fill + 最小宽 —— 窗口宽了自动加列;整块居中限宽,超宽屏不把卡片拉成巨幅 */
-            <div style={{ display: 'grid', gridTemplateColumns: `repeat(auto-fill, minmax(${CARD_MIN_WIDTH}px, 1fr))`, gap: 12, width: '100%', maxWidth: CARDS_MAX_WIDTH, margin: '0 auto' }}>
-              {pageWorks.map((w) => <WorkCard key={w.key} work={w} onOpen={() => openCard(w.key)} />)}
-            </div>
-          )
-        ) : pageRows.length === 0 ? emptyNode : (
-          /* 列表:整块居中限宽,超宽屏上播放器/文字不横跨整屏 */
-          <div style={{ width: '100%', maxWidth: CARDS_MAX_WIDTH, minWidth: 0, margin: '0 auto' }}>
-            {pageRows.map(renderRow)}
+    /* 高度锁死为布局内容区高度、overflow hidden:body 不滚,滚动全部收敛到内部容器;
+       外层改纵向(Task 13 模式切换):顶部 Segmented 横条,下面才是「左列表 + 主区」的横向排布 */
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0, overflow: 'hidden' }}>
+      {/* 模式切换(2026-09-30 Task 13):video 模式主区渲染 VideoClipPanel;左列表两个模式共用(选来源) */}
+      <Segmented
+        value={mode}
+        onChange={(v) => { setMode(v as 'audio' | 'video'); setError(null); setDone(null); }}
+        options={[{ value: 'audio', label: '下载音频' }, { value: 'video', label: '视频预览剪音频' }]}
+        style={{ alignSelf: 'flex-start', margin: '12px 16px 8px' }}
+      />
+      <div style={{ display: 'flex', flex: 1, minHeight: 0 }}>
+        {/* 左:导入来源列表(持久化;项 = 站点 logo + 标题 + 条目数徽标) */}
+        <div style={{ width: 240, flexShrink: 0, borderRight: '1px solid #f0f0f0', display: 'flex', flexDirection: 'column' }}>
+          <Button type="primary" onClick={() => { setUrl(''); setError(null); setModalOpen(true); }} style={{ margin: 8 }}>+ 新导入</Button>
+          <div style={{ overflowY: 'auto', flex: 1, minHeight: 0 }}>
+            {imports.map((it) => (
+              <div
+                key={it.id}
+                onClick={() => selectSource(it.id)}
+                style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', cursor: 'pointer', background: selectedId === it.id ? '#e6f4ff' : 'transparent' }}
+              >
+                <SiteLogo site={it.site} />
+                <Typography.Text ellipsis style={{ flex: 1 }} title={it.title}>{it.title}</Typography.Text>
+                <Badge count={it.entry_count} overflowCount={999} color="#1677ff" />
+              </div>
+            ))}
+            {imports.length === 0 && <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无导入" style={{ marginTop: 40 }} />}
           </div>
-        )}
+        </div>
+
+        {/* 右:音频模式=选中来源详情(占满内容区宽高;卡内只有集数网格一个滚动区,body 不滚);
+            视频模式=VideoClipPanel(2026-09-30 Task 13),detail 直接当 source(组件只用到 id/url/title) */}
+        <div style={{ flex: 1, minWidth: 0, padding: 16, display: 'flex', flexDirection: 'column', minHeight: 0, overflow: 'hidden' }}>
+          {error !== null && <Alert type="error" showIcon message={error} style={{ marginBottom: 12, flexShrink: 0 }} />}
+          {/* 视频模式:内容高度不定(视频 + 素材列表),给独立滚动区,沿用「body 不滚」的口径 */}
+          {mode === 'video' && (
+            <div style={{ flex: 1, minHeight: 0, overflowY: 'auto' }}>
+              <VideoClipPanel source={detail} />
+            </div>
+          )}
+          {mode === 'audio' && detail === null && error === null && <Empty description="从左侧选择一个来源,或点「+ 新导入」" style={{ marginTop: 80 }} />}
+          {mode === 'audio' && detail !== null && (
+            <Card
+              title={<Space><SiteLogo site={detail.site} size={18} /><span>{detail.title}</span></Space>}
+              extra={(
+                <Space wrap size={8}>
+                  {/* 音频格式 + 下载 + 删除来源(2026-09-29 用户拍板:两个按钮统一为同一种类型——都走实心 primary,
+                      删除保留 danger 红;此前「删除来源」是小号 text 按钮,与下载按钮视觉上不是一路) */}
+                  <Radio.Group value={format} onChange={(e) => setFormat(e.target.value)}>
+                    <Radio value="mp3">mp3</Radio><Radio value="m4a">m4a</Radio><Radio value="wav">wav</Radio>
+                  </Radio.Group>
+                  <Button type="primary" onClick={() => onDownload()} loading={busy} disabled={busy}>
+                    {detail.kind === 'playlist' ? `下载(${checked.length})` : '下载'}
+                  </Button>
+                  <Button type="primary" danger onClick={() => onDeleteSource(detail.id)}>删除来源</Button>
+                </Space>
+              )}
+              style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}
+              styles={{ body: { flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' } }}
+            >
+              {detail.duration_sec !== null && (
+                <Typography.Text type="secondary" style={{ flexShrink: 0 }}>
+                  时长 {Math.floor(detail.duration_sec / 60)} 分 {Math.round(detail.duration_sec % 60)} 秒
+                </Typography.Text>
+              )}
+              {/* 集数区 = 卡内唯一滚动区:标题固定在上,格子网格在本区内滚 */}
+              {detail.kind === 'playlist' && detail.entries !== null && (
+                <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0, marginTop: 12 }}>
+                  <Typography.Title level={5} style={{ marginTop: 0, flexShrink: 0 }}>集数({detail.entries.length})</Typography.Title>
+                  {/* display:block 覆盖 antd 默认的 inline-block —— 否则内层 grid 按内容宽度收缩,
+                      表现就是「几集挤在左边、离右边滚动条很远」(2026-09-29 用户反馈) */}
+                  <Checkbox.Group
+                    value={checked}
+                    onChange={(v) => setChecked(v as number[])}
+                    style={{ display: 'block', width: '100%', flex: 1, minHeight: 0, overflowY: 'auto', paddingRight: 4 }}
+                  >
+                    {/* 自适应网格(2026-09-29 用户拍板,替换原「一行固定 5 列」):auto-fit + minmax(160px,1fr)——
+                        列数随容器宽度自动增减,剩余空间摊平到每格,格子永远铺满整行(不出现右侧空白);
+                        窄窗自动降列,标题过长用 ellipsis 截断 */}
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 8, width: '100%' }}>
+                      {detail.entries.map((e) => (
+                        <Checkbox
+                          key={e.index}
+                          value={e.index}
+                          style={{ marginInlineEnd: 0, minWidth: 0, border: '1px solid #f0f0f0', borderRadius: 8, padding: '6px 10px' }}
+                        >
+                          <Typography.Text ellipsis style={{ maxWidth: '100%' }} title={e.title}>{e.title}</Typography.Text>
+                        </Checkbox>
+                      ))}
+                    </div>
+                  </Checkbox.Group>
+                </div>
+              )}
+              {jobId !== null && done === null && (
+                <div style={{ marginTop: 16, flexShrink: 0 }}>
+                  {/* 两段式进度条(2026-09-29 用户拍板):① 下载(蓝) ② 入库(绿)。
+                      为什么必须分段:下载字节跑完 ≠ 已经进音频库——后端还要 ffprobe 测时长、改名、写库(实测约 4 秒),
+                      这段没有可上报的百分比,所以第二段用 antd 的 active 动画表示「正在进行中」(不是假进度)。
+                      之前只有一根条:它停在 100% 而库里还是空的,用户以为下好了就切走(真实踩的坑)。
+                      strokeLinecap=butt 让两段并排时看起来是一根连续的条。 */}
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 2 }}>
+                    <Progress
+                      percent={percent}
+                      showInfo={false}
+                      strokeColor="#1677ff"
+                      strokeLinecap="butt"
+                      status={phase === 'download' ? 'active' : undefined}
+                      style={{ flex: 1, marginBottom: 0 }}
+                    />
+                    <Progress
+                      percent={phase === 'ingest' ? 100 : 0}
+                      showInfo={false}
+                      strokeColor="#52c41a"
+                      strokeLinecap="butt"
+                      status={phase === 'ingest' ? 'active' : undefined}
+                      style={{ flex: 1, marginBottom: 0 }}
+                    />
+                  </div>
+                  <Space size={12} style={{ marginTop: 4 }}>
+                    <Typography.Text style={{ fontSize: 12 }}>
+                      <span style={{ color: '#1677ff' }}>① 下载</span> {phase === 'download' ? `${percent}%` : '完成'}
+                    </Typography.Text>
+                    <Typography.Text style={{ fontSize: 12 }}>
+                      <span style={{ color: '#52c41a' }}>② 入库</span> {phase === 'ingest' ? '中…(正在写进音频库,稍等)' : '待开始'}
+                    </Typography.Text>
+                  </Space>
+                  <div style={{ marginTop: 8 }}>
+                    <Button size="small" onClick={() => cancelJob(jobId)}>取消</Button>
+                  </div>
+                </div>
+              )}
+              {done !== null && <Alert type="success" showIcon message={done} style={{ marginTop: 16, flexShrink: 0 }} />}
+            </Card>
+          )}
+        </div>
       </div>
 
-      {/* 脚:分页固定在底部(列表滚它不滚) */}
-      <div style={{ flexShrink: 0, display: 'flex', justifyContent: 'center' }}>
-        <Pagination
-          current={safePage}
-          pageSize={pageSize}
-          total={total}
-          showSizeChanger
-          pageSizeOptions={PAGE_SIZE_OPTIONS}
-          showTotal={(t) => (cardLevel ? `共 ${t} 部作品` : `共 ${t} 条`)}
-          onChange={(p, ps) => { setPage(p); setPageSize(ps); }}
-        />
-      </div>
+      {/* 新导入弹窗:URL 输入 + 解析;成功自动关弹窗,新来源进左列表并选中 */}
+      <Modal title="新导入" open={modalOpen} footer={null} onCancel={() => { setModalOpen(false); setError(null); }}>
+        <Space.Compact style={{ width: '100%' }}>
+          <Input autoFocus value={url} placeholder="粘贴 B 站/YouTube/播客 URL" onChange={(e) => setUrl(e.target.value)} onPressEnter={() => void onParseInModal()} />
+          <Button type="primary" onClick={() => void onParseInModal()} loading={parsing}>解析</Button>
+        </Space.Compact>
+        {parsing && <Spin style={{ marginTop: 12 }} />}
+        {error !== null && <Alert type="error" showIcon message={error} style={{ marginTop: 12 }} />}
+      </Modal>
     </div>
   );
 }

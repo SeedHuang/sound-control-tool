@@ -11,8 +11,9 @@ export default defineConfig({
   mfsu: false,
   routes: [
     { path: '/', component: 'index' },
+    { path: '/library', component: 'library' },       // 资料库(原 acquire)
+    { path: '/studio', component: 'studio' },         // 剪辑室(原 library)
+    { path: '/studio/:importId', component: 'studio-detail' },
     { path: '/settings', component: 'settings' },
-    { path: '/acquire', component: 'acquire' },
-    { path: '/library', component: 'library' },
   ],
 });
