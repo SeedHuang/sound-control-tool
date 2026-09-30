@@ -1,11 +1,10 @@
 // web/src/pages/library.tsx(资料库 2026-09-30:P1 仅改名搬文件,职责仍是"只负责下载")
 // 左列表持久化(imported_sources 表,parse 成功自动落库);点来源直接看缓存集数,不重新解析
-import { Alert, Badge, Button, Card, Checkbox, Empty, Input, Modal, Progress, Radio, Segmented, Space, Spin, Typography } from 'antd';
+import { Alert, Badge, Button, Card, Checkbox, Empty, Input, Modal, Progress, Radio, Space, Spin, Tag, Typography } from 'antd';
 import { useEffect, useState } from 'react';
-import { ApiError, apiGet, cancelJob, deleteImport, getImport, listImports, logFe, notifyAudioChanged, parseUrl, startDownload, subscribeJob, type ImportDetail, type ImportSource } from '@/api';
+import { ApiError, apiGet, cancelJob, deleteImport, getImport, listImports, listMedia, logFe, notifyAudioChanged, parseUrl, startDownload, subscribeJob, type ImportDetail, type ImportSource, type MediaItem } from '@/api';
 import PageHeader from '@/components/PageHeader';
 import SiteLogo from '@/components/SiteLogo';
-import VideoClipPanel from '@/components/VideoClipPanel';
 
 export default function LibraryPage() {
   const [imports, setImports] = useState<ImportSource[]>([]);
@@ -22,7 +21,12 @@ export default function LibraryPage() {
   const [phase, setPhase] = useState<'download' | 'ingest'>('download'); // 进度条第二段:下载结束→入库中(2026-09-29 用户拍板)
   const [done, setDone] = useState<string | null>(null);
   const [busy, setBusy] = useState(false); // 提交 in-flight 守卫 + 逐条串行中
-  const [mode, setMode] = useState<'audio' | 'video'>('audio'); // 顶部模式切换(Task 13):audio=下载音频(原流程),video=视频预览剪音频
+  const [produce, setProduce] = useState<'audio' | 'video'>('audio'); // 产物类型(Task 3,替代原 mode,语义对齐后端 payload):audio=音频下载流程,video=视频素材下载(单选一集,2026-09-30 Task 4+5)
+  // 视频下载流状态(2026-09-30 Task 4+5,方案 A:一次只选一集):
+  // videoHeight=清晰度档位(默认 480);videoSelectedIndex=网格单选的集;mediaList=已登记素材列表(D20 当前素材标记 + D19 默认选中/换集判定都靠它)
+  const [videoHeight, setVideoHeight] = useState<360 | 480 | 720 | 1080>(480);
+  const [videoSelectedIndex, setVideoSelectedIndex] = useState<number | null>(null);
+  const [mediaList, setMediaList] = useState<MediaItem[]>([]);
 
   const refreshImports = (): Promise<ImportSource[]> =>
     listImports().then((list) => { setImports(list); return list; });
@@ -33,6 +37,7 @@ export default function LibraryPage() {
       .then((d) => {
         setDetail(d);
         setChecked(d.kind === 'playlist' && d.entries !== null && d.entries.length > 0 ? [d.entries[0]!.index] : []);
+        setVideoSelectedIndex(null); // 换来源 → 视频单选复位(与 setDetail 同批;「默认选中素材所在集」的 effect 会按新来源重新挑)
       })
       .catch((e: Error) => setError(e.message));
   };
@@ -50,12 +55,34 @@ export default function LibraryPage() {
       onProgress: (p) => setPercent(Math.round(p.percent)),
       onPhase: () => setPhase('ingest'), // 下载进程结束 → 第二段(入库)开始动
       onDone: (d) => {
-        if (d.kind === 'video') { setDone(`《${d.title}》视频素材已下好`); return; }
+        if (d.kind === 'video') {
+          setDone(`《${d.title}》视频素材已下好`);
+          // 素材登记完成 → 刷新素材列表(D20 当前素材标记、默认选中都依赖它;2026-09-30 Task 4+5)
+          listMedia().then((list) => setMediaList(list)).catch((e: unknown) => { logFe('error', `刷新素材列表失败: ${e instanceof Error ? e.message : String(e)}`); /* 拉失败不挡完成提示,下次进 video 模式会重拉 */ });
+          return;
+        }
         setDone(d.replaced ? `《${d.title}》已入库(库里原来那一份已替换)` : `《${d.title}》已入库`);
       },
       onStatus: (s) => { if (s.state === 'error' || s.state === 'cancelled') setError(s.message ?? s.state); },
     });
   }, [jobId]);
+
+  // video 模式拉素材列表(挂载/切换 produce 时拉一次;D20 标记与默认选中靠它;Task 4+5)
+  useEffect(() => {
+    if (produce !== 'video') return;
+    let alive = true;
+    listMedia()
+      .then((list) => { if (alive) setMediaList(list); })
+      .catch((e: Error) => { if (alive) setError(e.message); });
+    return () => { alive = false; };
+  }, [produce]);
+
+  // 默认选中(Task 4+5):还没手动选过集且当前来源已有素材 → 自动选中素材所在集
+  useEffect(() => {
+    if (produce !== 'video' || videoSelectedIndex !== null || detail === null) return;
+    const mat = mediaList.find((m) => m.import_id === detail.id);
+    if (mat !== undefined && mat.entry_index !== null) setVideoSelectedIndex(mat.entry_index);
+  }, [produce, videoSelectedIndex, detail, mediaList]);
 
   // 等待单个 job 终结的 Promise(供逐条串行用);resolve 前必清定时器。
   // 2026-09-29 修复(用户拍板):兜底定时器此前只计一次、不随进度重置——超过 60s 的正常下载
@@ -185,6 +212,60 @@ export default function LibraryPage() {
     finally { setBusy(false); setJobId(null); }
   };
 
+  // ---- 视频下载流(2026-09-30 Task 4+5,方案 A:一次只选一集;点集=选中,点下载=下载/替换该集素材) ----
+  // 当前素材行 + 它在哪一集(D20 标记 + D19 换集判定用);单视频素材/无素材 → undefined / entry_index=null → null。
+  // 2026-09-30 终审修:素材行与集号拆开——存量素材(m1c 时代在合集来源上下载)entry_index 可为 NULL,
+  // 此时是「素材行存在但集号未知」,不等于「无素材」,D19 判定要区分这两种情况
+  const currentMaterial = detail === null ? undefined : mediaList.find((m) => m.import_id === detail.id);
+  const currentMaterialEp = currentMaterial?.entry_index ?? null;
+
+  // 真正提交视频下载;进度/完成/取消全走 jobId 订阅机器(与 audio 同款,waitJobEnd 托住 busy 生命周期)
+  const doDownloadVideo = async (entryIndex: number | null): Promise<void> => {
+    if (detail === null) return;
+    setBusy(true); setError(null); setDone(null); setPercent(0); setPhase('download');
+    // 集标题:playlist 时按所选集从 entries 找;单视频/未找到 → 来源标题兜底
+    const entry = detail.kind === 'playlist' && entryIndex !== null ? detail.entries?.find((e) => e.index === entryIndex) ?? null : null;
+    logFe('info', `onDownloadVideo entry=${entryIndex ?? '(single)'} height=${videoHeight}`);
+    try {
+      const { jobId: jid } = await startDownload({
+        url: detail.url,
+        title: entry !== null ? entry.title : detail.title,
+        entryIndex: entryIndex ?? undefined,
+        collectionTitle: detail.kind === 'playlist' ? detail.title : undefined,
+        produce: 'video',
+        options: { videoHeight, format: 'mp3', entryIndices: entryIndex !== null ? [entryIndex] : undefined },
+      });
+      setJobId(jid);
+      await waitJobEnd(jid);
+    } catch (e) { setError((e as Error).message); }
+    finally { setBusy(false); setJobId(null); }
+  };
+
+  // D19:素材行存在且(集号未知 或 目标集 ≠ 当前素材集)才弹替换确认;同集换清晰度/首次下载/无素材直接下(服务端覆盖,不确认)。
+  // 2026-09-30 终审修:原判定 `currentMaterialEp !== null && ...` 对「素材行存在但集号为 NULL」的存量素材跳过确认,
+  // 而服务端此时仍会清空该来源剪辑工程 → 集号未知也必须弹;集号已知且相同(同集换清晰度)维持不弹。
+  const onDownloadVideo = (): void => {
+    if (detail === null || busy) return;
+    if (detail.kind === 'playlist') {
+      if (videoSelectedIndex === null) { setError('请先在网格中选择一集'); return; }
+      if (currentMaterial !== undefined && (currentMaterialEp === null || videoSelectedIndex !== currentMaterialEp)) {
+        const segCount = imports.find((i) => i.id === detail.id)?.segment_count ?? 0;
+        Modal.confirm({
+          title: '替换视频素材？',
+          content: currentMaterialEp !== null
+            ? `当前素材是第 ${currentMaterialEp} 集，将下载第 ${videoSelectedIndex} 集并替换（原素材文件会被删除）${segCount > 0 ? `，并清空该来源已保存的 ${segCount} 个剪辑点（它们对应的是第 ${currentMaterialEp} 集的画面）` : ''}。`
+            : `当前素材未记录集数，将下载第 ${videoSelectedIndex} 集并替换（原素材文件会被删除）${segCount > 0 ? `，已保存的 ${segCount} 个剪辑点将被清空` : ''}。`,
+          okText: '下载并替换',
+          okType: 'danger',
+          cancelText: '取消',
+          onOk: () => void doDownloadVideo(videoSelectedIndex),
+        });
+        return;
+      }
+    }
+    void doDownloadVideo(detail.kind === 'playlist' ? videoSelectedIndex : null);
+  };
+
   const onDeleteSource = (id: number): void => {
     Modal.confirm({
       title: '删除这个导入来源?',
@@ -200,10 +281,12 @@ export default function LibraryPage() {
 
   return (
     /* 高度锁死为布局内容区高度、overflow hidden:body 不滚,滚动全部收敛到内部容器;
-       外层改纵向:顶部是页面头(PageHeader,模式切换在它的工具栏行里),下面才是「左列表 + 主区」的横向排布 */
+       外层改纵向:顶部是页面头(PageHeader,产物类型选择在它的工具栏行里),下面才是「左列表 + 主区」的横向排布 */
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0, overflow: 'hidden' }}>
       {/* 页面头(spec D2):① 来源 logo + 标题 ② 工具栏。
-          模式切换暂时放在工具栏里,行为与改造前完全一致;P2 再把它换成"产物类型 Radio"。 */}
+          工具栏(Task 3 重构)= 产物类型 Radio(D4:资料库只负责下载,音频/视频不是顶层 tab)
+          + audio 模式的格式/下载(从 Card extra 上移)+ 删除来源(两模式都在);
+          传 Fragment,让 PageHeader 工具栏行的 flex(gap:8 + wrap)直接排布各控件。 */}
       <PageHeader
         icon={detail === null ? undefined : <SiteLogo site={detail.site} size={20} />}
         title={detail === null ? '资料库' : detail.title}
@@ -213,11 +296,49 @@ export default function LibraryPage() {
             : undefined
         }
         toolbar={
-          <Segmented
-            value={mode}
-            onChange={(v) => { setMode(v as 'audio' | 'video'); setError(null); setDone(null); }}
-            options={[{ value: 'audio', label: '下载音频' }, { value: 'video', label: '视频预览剪音频' }]}
-          />
+          <>
+            {/* 产物类型(D4):资料库只负责下载——音频/视频是工具栏里的一个 Radio,不是顶层 tab */}
+            <Radio.Group
+              value={produce}
+              optionType="button"
+              options={[{ label: '音频', value: 'audio' }, { label: '视频', value: 'video' }]}
+              onChange={(e) => { setProduce(e.target.value as 'audio' | 'video'); setError(null); setDone(null); }}
+            />
+            {/* video 模式(2026-09-30 Task 4+5):清晰度档位(素材按档位下载)+ 下载按钮;
+                playlist 未选集时禁用(无可下对象)。格式 Radio 仍属 audio 专用(视频素材固定带 mp3 音轨) */}
+            {produce === 'video' && detail !== null && (
+              <Radio.Group
+                value={videoHeight}
+                optionType="button"
+                options={[{ label: '360p', value: 360 }, { label: '480p', value: 480 }, { label: '720p', value: 720 }, { label: '1080p', value: 1080 }]}
+                onChange={(e) => setVideoHeight(e.target.value as 360 | 480 | 720 | 1080)}
+              />
+            )}
+            {produce === 'video' && detail !== null && (
+              <Button
+                type="primary"
+                onClick={onDownloadVideo}
+                loading={busy}
+                disabled={busy || (detail.kind === 'playlist' && videoSelectedIndex === null)}
+              >
+                下载
+              </Button>
+            )}
+            {produce === 'audio' && detail !== null && (
+              <Radio.Group value={format} onChange={(e) => setFormat(e.target.value)}>
+                <Radio value="mp3">mp3</Radio><Radio value="m4a">m4a</Radio><Radio value="wav">wav</Radio>
+              </Radio.Group>
+            )}
+            {produce === 'audio' && detail !== null && (
+              <Button type="primary" onClick={() => onDownload()} loading={busy} disabled={busy}>
+                {detail.kind === 'playlist' ? `下载(${checked.length})` : '下载'}
+              </Button>
+            )}
+            {/* 删除来源:danger,两模式都渲染(动作从 Card extra 上移,Task 3) */}
+            {detail !== null && (
+              <Button type="primary" danger onClick={() => onDeleteSource(detail.id)}>删除来源</Button>
+            )}
+          </>
         }
       />
       <div style={{ display: 'flex', flex: 1, minHeight: 0 }}>
@@ -240,38 +361,20 @@ export default function LibraryPage() {
           </div>
         </div>
 
-        {/* 右:音频模式=选中来源详情(占满内容区宽高;卡内只有集数网格一个滚动区,body 不滚);
-            视频模式=VideoClipPanel(2026-09-30 Task 13),detail 直接当 source(组件只用到 id/url/title) */}
+        {/* 右:选中来源详情(占满内容区宽高;卡内只有集数网格一个滚动区,body 不滚)。
+            网格双形态(2026-09-30 Task 4+5):audio=Checkbox 多选(批量下载);video=单选卡片(点集=选中,下载=下载/替换该集素材)。
+            旧「视频预览剪音频」面板已从资料库移除,剪辑功能 P4 于剪辑室详情页回归 */}
         <div style={{ flex: 1, minWidth: 0, padding: 16, display: 'flex', flexDirection: 'column', minHeight: 0, overflow: 'hidden' }}>
           {error !== null && <Alert type="error" showIcon message={error} style={{ marginBottom: 12, flexShrink: 0 }} />}
-          {/* 视频模式:内容高度不定(视频 + 素材列表),给独立滚动区,沿用「body 不滚」的口径 */}
-          {mode === 'video' && (
-            <div style={{ flex: 1, minHeight: 0, overflowY: 'auto' }}>
-              <VideoClipPanel source={detail} />
-            </div>
-          )}
-          {mode === 'audio' && detail === null && error === null && <Empty description="从左侧选择一个来源,或点「+ 新导入」" style={{ marginTop: 80 }} />}
-          {mode === 'audio' && detail !== null && (
+          {detail === null && error === null && <Empty description="从左侧选择一个来源,或点「+ 新导入」" style={{ marginTop: 80 }} />}
+          {detail !== null && (
             <Card
-              title={null}   /* 标题已抬到页面头(D2),卡里不再重复 */
-              extra={(
-                <Space wrap size={8}>
-                  {/* 音频格式 + 下载 + 删除来源(2026-09-29 用户拍板:两个按钮统一为同一种类型——都走实心 primary,
-                      删除保留 danger 红;此前「删除来源」是小号 text 按钮,与下载按钮视觉上不是一路) */}
-                  <Radio.Group value={format} onChange={(e) => setFormat(e.target.value)}>
-                    <Radio value="mp3">mp3</Radio><Radio value="m4a">m4a</Radio><Radio value="wav">wav</Radio>
-                  </Radio.Group>
-                  <Button type="primary" onClick={() => onDownload()} loading={busy} disabled={busy}>
-                    {detail.kind === 'playlist' ? `下载(${checked.length})` : '下载'}
-                  </Button>
-                  <Button type="primary" danger onClick={() => onDeleteSource(detail.id)}>删除来源</Button>
-                </Space>
-              )}
+              title={null}   /* 标题已抬到页面头(D2),卡里不再重复;格式/下载/删除来源已上移到页面头工具栏(Task 3) */
               style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}
               styles={{ body: { flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' } }}
             >
               {/* 集数区 = 卡内唯一滚动区:标题固定在上,格子网格在本区内滚 */}
-              {detail.kind === 'playlist' && detail.entries !== null && (
+              {produce === 'audio' && detail.kind === 'playlist' && detail.entries !== null && (
                 <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0, marginTop: 12 }}>
                   <Typography.Title level={5} style={{ marginTop: 0, flexShrink: 0 }}>集数({detail.entries.length})</Typography.Title>
                   {/* display:block 覆盖 antd 默认的 inline-block —— 否则内层 grid 按内容宽度收缩,
@@ -298,9 +401,45 @@ export default function LibraryPage() {
                   </Checkbox.Group>
                 </div>
               )}
+              {/* video 单选网格(2026-09-30 Task 4+5 方案 A):一次只选一集,点卡片=选中,下载按钮提交选中集。
+                  容器视觉与 audio 多选网格同款(auto-fit 网格);选中=蓝框(#1677ff)+蓝底(#e6f4ff);
+                  当前素材所在集显示 D20「当前素材」标记;kind='single' 不渲染网格(与 audio 一致) */}
+              {produce === 'video' && detail.kind === 'playlist' && detail.entries !== null && (
+                <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0, marginTop: 12 }}>
+                  <Typography.Title level={5} style={{ marginTop: 0, flexShrink: 0 }}>集数({detail.entries.length})</Typography.Title>
+                  <div style={{ display: 'block', width: '100%', flex: 1, minHeight: 0, overflowY: 'auto', paddingRight: 4 }}>
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 8, width: '100%' }}>
+                      {detail.entries.map((e) => {
+                        const selected = videoSelectedIndex === e.index;
+                        const isMaterial = currentMaterialEp === e.index;
+                        return (
+                          <div
+                            key={e.index}
+                            role="button"
+                            tabIndex={0}
+                            onClick={() => setVideoSelectedIndex(e.index)}
+                            onKeyDown={(ev) => { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); setVideoSelectedIndex(e.index); } }}
+                            style={{
+                              minWidth: 0,
+                              border: selected ? '1px solid #1677ff' : '1px solid #f0f0f0',
+                              borderRadius: 8,
+                              padding: '6px 10px',
+                              background: selected ? '#e6f4ff' : 'transparent',
+                              cursor: 'pointer',
+                            }}
+                          >
+                            <Typography.Text ellipsis style={{ maxWidth: '100%' }} title={e.title}>{e.title}</Typography.Text>
+                            {isMaterial && <Tag color="blue" style={{ marginInlineEnd: 0, marginTop: 2 }}>当前素材</Tag>}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </div>
+              )}
               {jobId !== null && done === null && (
                 <div style={{ marginTop: 16, flexShrink: 0 }}>
-                  {/* 两段式进度条(2026-09-29 用户拍板):① 下载(蓝) ② 入库(绿)。
+                  {/* 两段式进度条(2026-09-29 用户拍板):① 下载(蓝) ② 入库(绿;第二段文案按产物类型,audio「入库」/video「登记素材」,Task 4+5)。
                       为什么必须分段:下载字节跑完 ≠ 已经进剪辑室——后端还要 ffprobe 测时长、改名、写库(实测约 4 秒),
                       这段没有可上报的百分比,所以第二段用 antd 的 active 动画表示「正在进行中」(不是假进度)。
                       之前只有一根条:它停在 100% 而库里还是空的,用户以为下好了就切走(真实踩的坑)。
@@ -328,7 +467,7 @@ export default function LibraryPage() {
                       <span style={{ color: '#1677ff' }}>① 下载</span> {phase === 'download' ? `${percent}%` : '完成'}
                     </Typography.Text>
                     <Typography.Text style={{ fontSize: 12 }}>
-                      <span style={{ color: '#52c41a' }}>② 入库</span> {phase === 'ingest' ? '中…(正在写进剪辑室,稍等)' : '待开始'}
+                      <span style={{ color: '#52c41a' }}>{produce === 'video' ? '② 登记素材' : '② 入库'}</span> {phase === 'ingest' ? '中…(正在写进剪辑室,稍等)' : '待开始'}
                     </Typography.Text>
                   </Space>
                   <div style={{ marginTop: 8 }}>

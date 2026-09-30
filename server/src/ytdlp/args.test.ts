@@ -77,4 +77,16 @@ describe('buildVideoDownloadArgs(下视频做定位素材)', () => {
   it('进度模板与音频那条一致(前端进度条复用)', () => {
     expect(buildVideoDownloadArgs(base).join(' ')).toContain('--progress-template');
   });
+  // P2 方案A(Task 1,2026-09-30):视频单集下载——镜像音频侧 entryIndices → --playlist-items(D8 单产物模型)
+  it('带 entryIndices: [3] → 追加 --playlist-items 3(镜像音频侧)', () => {
+    const args = buildVideoDownloadArgs({ ...base, entryIndices: [3] });
+    expect(args).toContain('--playlist-items');
+    expect(args[args.indexOf('--playlist-items') + 1]).toBe('3');
+    expect(args).not.toContain('--no-playlist');
+  });
+  it('不带 entryIndices → 保持 --no-playlist(单视频素材不受影响)', () => {
+    const args = buildVideoDownloadArgs(base);
+    expect(args).toContain('--no-playlist');
+    expect(args).not.toContain('--playlist-items');
+  });
 });

@@ -23,6 +23,7 @@ import { probeDuration } from './ffprobe.js';
 import { ingestDownloadedFile } from './ingest.js';
 import { parseMetadata, YtdlpRunError } from './parse.js';
 import { createSourceVideosRepo } from '../db/repo/source-videos.js';
+import { createClipProjectsRepo } from '../db/repo/clip-projects.js';
 import { deleteVideoFiles, placeVideo } from '../media/media-files.js';
 // SSE 事件桥(2026-09-29 抽到 job-events.ts):下载路由与媒体剪辑路由共用,连接表/节流状态都在那边
 import { addSseConnection, emit, logSseClose, progressBucketChanged, removeSseConnection, type SseConn } from './job-events.js';
@@ -161,12 +162,27 @@ function createDownloadHandlers(deps: YtdlpDeps) {
       const ext = producedPath.slice(producedPath.lastIndexOf('.') + 1).toLowerCase();
       const videosRepo = createSourceVideosRepo(db);
       // 批4 裁定 R6:placeVideo 收「该来源当前登记的 file_path」(null=从未登记过),用于覆盖/避让判定
-      const registeredPath = videosRepo.get(row.id)?.file_path ?? null;
+      // P2 方案A(D19):同一发 get 顺带取旧 entry_index(upsert 前取)——Task 2 清空剪辑工程要靠这组新旧值判定
+      const prev = videosRepo.get(row.id);
+      const registeredPath = prev?.file_path ?? null;
+      const oldEntryIndex = prev?.entry_index ?? null;
       const placed = placeVideo({ tmpPath: producedPath, mediaDir, importId: row.id, ext, registeredPath });
       if (!placed.ok) throw new Error(placed.message);
       const size = statSync(placed.path).size;
+      // P2 方案A:视频素材也记「这是哪一集」——payload 顶层 entryIndex(与音频合集条目同口径;单视频 null)
+      const newEntryIndex = payload.entryIndex ?? null;
       // 批4 裁定 R6:落库路径必须用 placed.path 原样(Windows 反斜杠风格,不 normalize,与磁盘真实路径逐字节一致)
-      videosRepo.upsert({ importId: row.id, filePath: placed.path, height: videoHeight, fileSize: size });
+      videosRepo.upsert({ importId: row.id, filePath: placed.path, height: videoHeight, fileSize: size, entryIndex: newEntryIndex });
+      // D19 判定留痕(Task 2 消费):集号变没变一眼可查(pushLog source 联合类型无 'ytdlp',与 finalize 其余日志同源用 'job')
+      pushLog('info', 'job', `video 素材 entry_index: ${oldEntryIndex} → ${newEntryIndex} import=${row.id}`);
+      // D19 服务端(2026-09-30):换集 → 清空该来源的剪辑工程(段 + 工程行);同集换清晰度重下 → 保留,用户的剪辑点不丢。
+      // NULL 语义:两侧都 ?? null 归一后再比——同为 NULL(单视频重下)视为相同,不清
+      if ((oldEntryIndex ?? null) !== (newEntryIndex ?? null)) {
+        const cleared = createClipProjectsRepo(db).clearByImportId(row.id);
+        pushLog('info', 'job', `换集 ${oldEntryIndex} → ${newEntryIndex}: 清空剪辑工程 ${cleared} 段 import=${row.id}`);
+      } else {
+        pushLog('debug', 'job', `video entry_index 未变(${String(newEntryIndex)}),保留剪辑工程 import=${row.id}`);
+      }
       jobsRepo.finish(jobId);
       pushLog('info', 'job', `job ${jobId} done → video import=${row.id} @ ${placed.path} height=${videoHeight} bytes=${size}`);
       emit(jobId, { type: 'done', kind: 'video', importId: row.id, title: row.title, filePath: placed.path, height: videoHeight, fileSize: size });
@@ -196,7 +212,8 @@ function createDownloadHandlers(deps: YtdlpDeps) {
     const jobOutDir = join(tempDir, 'job' + jobId);
     mkdirSync(jobOutDir, { recursive: true });
     const args = produce === 'video'
-      ? buildVideoDownloadArgs({ url: payload.url, outDir: jobOutDir, videoHeight, cookiePath: resolveCookiePath(db, audioDir) })
+      // P2 方案A:options.entryIndices(路由已校验"长度 1 的正整数")透传给视频参数——单集下载与音频同口径
+      ? buildVideoDownloadArgs({ url: payload.url, outDir: jobOutDir, videoHeight, entryIndices: opt.entryIndices, cookiePath: resolveCookiePath(db, audioDir) })
       : buildDownloadArgs({
           url: payload.url,
           options: {
@@ -576,6 +593,10 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
       createSourceVideosRepo(db).delete(id);
       pushLog('info', 'media', `来源 ${id} 删除 → 连带删素材 deleted=${r.deleted.length} failed=${r.failed.length}`);
     }
+    // 修复轮 1(2026-09-30,spec §0.4):删来源还要显式级联清剪辑工程与段 —— 同因库没开外键,不清会留孤儿工程。
+    // 排在删素材之后同一条链路里;clearByImportId 幂等(无工程删 0 行返 0 不抛),无条件调用即安全
+    const clearedSegs = createClipProjectsRepo(db).clearByImportId(id);
+    pushLog('info', 'job', `来源 ${id} 删除 → 连带清剪辑工程 ${clearedSegs} 段`);
     // 顺手清掉这个来源的封面失败冷却(2026-09-29 评审补):id 是自增的,不清就会随进程一直攒着(慢泄漏)。
     // 正在抓的那发不动 —— 它的 finally 自己会从 coverInFlight 里摘掉。
     coverFailedAt.delete(id);

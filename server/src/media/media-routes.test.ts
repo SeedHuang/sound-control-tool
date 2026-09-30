@@ -56,15 +56,16 @@ afterEach(async () => {
 });
 
 describe('媒体素材路由', () => {
-  it('GET /api/media 只列有素材的来源(带 url/title/site/height)', async () => {
+  it('GET /api/media 只列有素材的来源(带 url/title/site/height;P2 带出 entry_index)', async () => {
     const importId = createImportsRepo(db).upsertByUrl({ url: 'https://a/pl', title: '凡人', site: 'bilibili', kind: 'playlist', duration_sec: null, entries: null });
     createImportsRepo(db).upsertByUrl({ url: 'https://a/other', title: '无素材', site: 'other', kind: 'single', duration_sec: null, entries: null });
     writeFileSync(join(mediaDir, `media-${importId}.mp4`), 'V');
-    createSourceVideosRepo(db).upsert({ importId, filePath: join(mediaDir, `media-${importId}.mp4`), height: 480, fileSize: 1 });
+    // P2 方案A:upsert 带 entryIndex → 路由原样透传 list(),行里必须带出集号(前端显示"第几集")
+    createSourceVideosRepo(db).upsert({ importId, filePath: join(mediaDir, `media-${importId}.mp4`), height: 480, fileSize: 1, entryIndex: 2 });
     const res = await app.inject({ method: 'GET', url: '/api/media?token=tok' });
-    const body = res.json() as { media: Array<{ import_id: number; url: string; height: number }> };
+    const body = res.json() as { media: Array<{ import_id: number; url: string; height: number; entry_index: number | null }> };
     expect(body.media).toHaveLength(1);
-    expect(body.media[0]).toMatchObject({ import_id: importId, url: 'https://a/pl', height: 480 });
+    expect(body.media[0]).toMatchObject({ import_id: importId, url: 'https://a/pl', height: 480, entry_index: 2 });
   });
   it('GET /api/media/:id/file:Range 206 与全量 200;非法 Range 416(R2-f);非正整数 404;文件丢了给 FILE_MISSING', async () => {
     const importId = createImportsRepo(db).upsertByUrl({ url: 'https://a/pl', title: 't', site: 'bilibili', kind: 'single', duration_sec: null, entries: null });

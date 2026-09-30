@@ -12,7 +12,8 @@ import { createDownloadManager } from './download.js';
 import { createJobsRepo } from '../db/repo/jobs.js';
 import { createAudioItemsRepo } from '../db/repo/audio-items.js';
 import { createSourceVideosRepo } from '../db/repo/source-videos.js';
-import { registerRequestLogging } from '../logs.js';
+import { createClipProjectsRepo } from '../db/repo/clip-projects.js';
+import { getLogs, registerRequestLogging } from '../logs.js';
 import { createSettingsRepo } from '../db/repo/settings.js';
 import { createImportsRepo } from '../db/repo/imports.js';
 import { BILI_COOKIE_KEY, SETTINGS_KEYS } from '../settings-keys.js';
@@ -872,12 +873,107 @@ describe('下载视频素材(produce=video)', () => {
     expect(rows).toHaveLength(1);
     expect(rows[0]!.import_id).toBe(1);
     expect(rows[0]!.height).toBe(480);
+    expect(rows[0]!.entry_index).toBeNull(); // P2 方案A:不带 entryIndex 的视频素材,集号落 NULL
     expect(rows[0]!.file_path.startsWith(mediaDir)).toBe(true); // R6:placeVideo 返回的 placed.path 原样落库
     expect(existsSync(rows[0]!.file_path)).toBe(true);
     expect(existsSync(producedPath)).toBe(false); // rename 消耗掉临时产物
     expect(createAudioItemsRepo(db).list()).toHaveLength(0); // 不进剪辑室
     expect(createImportsRepo(db).getByUrl('https://a/v')).not.toBeNull(); // import 兜底 upsert
     expect(createJobsRepo(db).get(jobId)!.status).toBe('done');
+  });
+  // P2 方案A(Task 1,2026-09-30):视频单集下载——payload 顶层 entryIndex(与音频合集条目同口径)+
+  // options.entryIndices(yt-dlp 选择参数,镜像音频侧);下载完成落库 source_videos.entry_index(D19 判定数据)
+  it('video 下载带 entryIndex:3 + entryIndices:[3] → args 含 --playlist-items 3,落库 entry_index === 3', async () => {
+    const producedPath = join(tempDir, 'vid3.mp4');
+    writeFileSync(producedPath, 'VIDEOBYTES');
+    let fire: (() => void) | undefined;
+    const dm = {
+      start: vi.fn((opts: { jobId: number; onEvent: (jid: number, ev: unknown) => void }) => {
+        fire = () => opts.onEvent(opts.jobId, { type: 'status', state: 'done', producedPath });
+      }),
+      cancel: vi.fn(async () => {}),
+      dispose: vi.fn(async () => {}),
+    };
+    makeApp('yt-dlp', 'tok2', dm as unknown as ReturnType<typeof createDownloadManager>);
+    const res = await app.inject({ method: 'POST', url: '/api/ytdlp/download', payload: { url: 'https://a/v', options: { format: 'mp3', entryIndices: [3] }, produce: 'video', title: '凡人', entryIndex: 3 } });
+    expect(res.statusCode).toBe(201);
+    // args 镜像音频侧:--playlist-items 3,且不再带 --no-playlist(dm.start 带强类型实现,须经 unknown 转)
+    const startOpts = dm.start.mock.calls[0]?.[0] as unknown as { args: string[] };
+    expect(startOpts.args).toContain('--playlist-items');
+    expect(startOpts.args[startOpts.args.indexOf('--playlist-items') + 1]).toBe('3');
+    expect(startOpts.args).not.toContain('--no-playlist');
+    const jobId = res.json().jobId as number;
+    fire!(); // 下载进程退出 → finalizeVideoDownload(记 entry_index + D19 留痕日志)
+    const deadline = Date.now() + 2000;
+    while (Date.now() < deadline && createJobsRepo(db).get(jobId)!.status !== 'done') await new Promise((r) => setTimeout(r, 20));
+    const row = createSourceVideosRepo(db).get(1);
+    expect(row).not.toBeNull();
+    expect(row!.entry_index).toBe(3);
+  });
+  // P2 D19 服务端(2026-09-30):换集下载完成 → 清空该来源的剪辑工程(段 + 工程行);同集换清晰度 → 保留。
+  // 前置状态用原生 SQL 造(clip_projects/clip_segments 的"建"在 P4):旧素材 entry_index=2 + 工程 2 段
+  it('视频换集(旧 2 → 新 5)下载完成 → 剪辑工程被清空,日志留痕「清空剪辑工程」', async () => {
+    const importId = createImportsRepo(db).upsertByUrl({ url: 'https://a/v', title: '凡人', site: 'bilibili', kind: 'playlist', duration_sec: null, entries: null });
+    const producedPath = join(tempDir, 'vid5.mp4');
+    writeFileSync(producedPath, 'VIDEOBYTES');
+    let fire: (() => void) | undefined;
+    const dm = {
+      start: vi.fn((opts: { jobId: number; onEvent: (jid: number, ev: unknown) => void }) => {
+        fire = () => opts.onEvent(opts.jobId, { type: 'status', state: 'done', producedPath });
+      }),
+      cancel: vi.fn(async () => {}),
+      dispose: vi.fn(async () => {}),
+    };
+    makeApp('yt-dlp', 'tok2', dm as unknown as ReturnType<typeof createDownloadManager>); // mediaDir 在 makeApp 里才 mkdir,写旧素材文件必须在其后
+    const oldVideo = join(mediaDir, `media-${importId}.webm`);
+    writeFileSync(oldVideo, 'OLD');
+    createSourceVideosRepo(db).upsert({ importId, filePath: oldVideo, height: 480, fileSize: 3, entryIndex: 2 });
+    const clipRepo = createClipProjectsRepo(db);
+    const pid = Number(db.prepare('INSERT INTO clip_projects (import_id) VALUES (?)').run(importId).lastInsertRowid);
+    db.prepare('INSERT INTO clip_segments (project_id, start_sec, end_sec) VALUES (?, ?, ?)').run(pid, 0, 10);
+    db.prepare('INSERT INTO clip_segments (project_id, start_sec, end_sec) VALUES (?, ?, ?)').run(pid, 10, 20);
+    const res = await app.inject({ method: 'POST', url: '/api/ytdlp/download', payload: { url: 'https://a/v', options: { format: 'mp3', entryIndices: [5] }, produce: 'video', title: '凡人', entryIndex: 5 } });
+    expect(res.statusCode).toBe(201);
+    const jobId = res.json().jobId as number;
+    fire!(); // 下载进程退出 → finalizeVideoDownload(记 entry_index=5 + D19 清工程)
+    const deadline = Date.now() + 2000;
+    while (Date.now() < deadline && createJobsRepo(db).get(jobId)!.status !== 'done') await new Promise((r) => setTimeout(r, 20));
+    expect(createSourceVideosRepo(db).get(importId)!.entry_index).toBe(5); // 新集号已落库
+    expect(clipRepo.countSegmentsByImportId(importId)).toBe(0); // 段被清
+    expect((db.prepare('SELECT COUNT(*) AS n FROM clip_projects WHERE import_id = ?').get(importId) as { n: number }).n).toBe(0); // 工程行被清
+    expect(getLogs().some((l) => l.source === 'job' && l.message.includes('清空剪辑工程'))).toBe(true); // 仓库铁律:关键步骤必须有日志
+  });
+  it('视频同集换清晰度(旧 2 → 新 2)下载完成 → 剪辑工程保留(用户剪辑点不丢)', async () => {
+    const importId = createImportsRepo(db).upsertByUrl({ url: 'https://a/v', title: '凡人', site: 'bilibili', kind: 'playlist', duration_sec: null, entries: null });
+    const producedPath = join(tempDir, 'vid720.mp4');
+    writeFileSync(producedPath, 'VIDEOBYTES720');
+    let fire: (() => void) | undefined;
+    const dm = {
+      start: vi.fn((opts: { jobId: number; onEvent: (jid: number, ev: unknown) => void }) => {
+        fire = () => opts.onEvent(opts.jobId, { type: 'status', state: 'done', producedPath });
+      }),
+      cancel: vi.fn(async () => {}),
+      dispose: vi.fn(async () => {}),
+    };
+    makeApp('yt-dlp', 'tok2', dm as unknown as ReturnType<typeof createDownloadManager>); // mediaDir 在 makeApp 里才 mkdir,写旧素材文件必须在其后
+    const oldVideo = join(mediaDir, `media-${importId}.mp4`);
+    writeFileSync(oldVideo, 'OLD480');
+    createSourceVideosRepo(db).upsert({ importId, filePath: oldVideo, height: 480, fileSize: 5, entryIndex: 2 });
+    const clipRepo = createClipProjectsRepo(db);
+    const pid = Number(db.prepare('INSERT INTO clip_projects (import_id) VALUES (?)').run(importId).lastInsertRowid);
+    db.prepare('INSERT INTO clip_segments (project_id, start_sec, end_sec) VALUES (?, ?, ?)').run(pid, 0, 10);
+    db.prepare('INSERT INTO clip_segments (project_id, start_sec, end_sec) VALUES (?, ?, ?)').run(pid, 10, 20);
+    const res = await app.inject({ method: 'POST', url: '/api/ytdlp/download', payload: { url: 'https://a/v', options: { format: 'mp3', entryIndices: [2], videoHeight: 720 }, produce: 'video', title: '凡人', entryIndex: 2 } });
+    expect(res.statusCode).toBe(201);
+    const jobId = res.json().jobId as number;
+    fire!(); // 下载进程退出 → finalizeVideoDownload(entry_index 未变 → 保留工程)
+    const deadline = Date.now() + 2000;
+    while (Date.now() < deadline && createJobsRepo(db).get(jobId)!.status !== 'done') await new Promise((r) => setTimeout(r, 20));
+    expect(createSourceVideosRepo(db).get(importId)!.entry_index).toBe(2);
+    expect(createSourceVideosRepo(db).get(importId)!.height).toBe(720); // 素材确实换了清晰度
+    expect(clipRepo.countSegmentsByImportId(importId)).toBe(2); // 段还在
+    expect((db.prepare('SELECT COUNT(*) AS n FROM clip_projects WHERE import_id = ?').get(importId) as { n: number }).n).toBe(1); // 工程行还在
+    expect(getLogs().some((l) => l.source === 'job' && l.message.includes('保留剪辑工程'))).toBe(true);
   });
 });
 
@@ -935,5 +1031,58 @@ describe('DELETE /api/imports/:id 连带清素材(批4)', () => {
     expect(createImportsRepo(db).get(importId)).toBeNull();
     expect(createSourceVideosRepo(db).get(importId)).toBeNull();
     expect(existsSync(p)).toBe(false);
+  });
+  // 修复轮 1(2026-09-30,spec §0.4):删来源必须级联清剪辑工程与段(库没开外键,不显式删会留孤儿工程)。
+  // 造数先例同"换集"用例:clip_projects/clip_segments 的建行路由在 P4 才有,这里原生 SQL 造
+  it('删来源 → 该来源的剪辑工程行与段一并清空;再删一次(工程已不存在)不报错', async () => {
+    makeApp('yt-dlp', 'tok2');
+    const importId = createImportsRepo(db).upsertByUrl({ url: 'https://a/clip', title: '凡人', site: 'bilibili', kind: 'single', duration_sec: null, entries: null });
+    const pid = Number(db.prepare('INSERT INTO clip_projects (import_id) VALUES (?)').run(importId).lastInsertRowid);
+    db.prepare('INSERT INTO clip_segments (project_id, start_sec, end_sec) VALUES (?, ?, ?)').run(pid, 0, 10);
+    db.prepare('INSERT INTO clip_segments (project_id, start_sec, end_sec) VALUES (?, ?, ?)').run(pid, 10, 20);
+    expect((await app.inject({ method: 'DELETE', url: `/api/imports/${importId}` })).statusCode).toBe(200);
+    expect((db.prepare('SELECT COUNT(*) AS n FROM clip_projects WHERE import_id = ?').get(importId) as { n: number }).n).toBe(0); // 工程行被清
+    expect((db.prepare('SELECT COUNT(*) AS n FROM clip_segments WHERE project_id = ?').get(pid) as { n: number }).n).toBe(0); // 该工程的段被清
+    expect(getLogs().some((l) => l.source === 'job' && l.message.includes('连带清剪辑工程 2 段'))).toBe(true); // 仓库铁律:关键步骤留痕,N 段计数要看得见
+    expect((await app.inject({ method: 'DELETE', url: `/api/imports/${importId}` })).statusCode).toBe(200); // 幂等:工程已不存在,再删同一来源不报错
+  });
+});
+
+// ---- P2(2026-09-30):/api/imports 派生列 has_video/has_project/segment_count(spec D7 两表提前建后补出参) ----
+describe('/api/imports 派生列(has_video/has_project/segment_count)', () => {
+  const seedProjectWithSegments = (impId: number, segCount: number): void => {
+    const pid = Number(db.prepare('INSERT INTO clip_projects (import_id) VALUES (?)').run(impId).lastInsertRowid);
+    for (let i = 0; i < segCount; i++) {
+      db.prepare('INSERT INTO clip_segments (project_id, start_sec, end_sec) VALUES (?, ?, ?)').run(pid, i * 10, i * 10 + 5);
+    }
+  };
+  it('三态:无素材无工程 false/false/0;有素材无工程 true/false/0;有素材有工程 true/true/段数', async () => {
+    makeApp('yt-dlp', 'tok2');
+    const bare = createImportsRepo(db).upsertByUrl({ url: 'https://a/bare', title: '裸来源', site: 'other', kind: 'single', duration_sec: null, entries: null });
+    const withVideo = createImportsRepo(db).upsertByUrl({ url: 'https://a/vid', title: '有素材', site: 'bilibili', kind: 'single', duration_sec: null, entries: null });
+    const full = createImportsRepo(db).upsertByUrl({ url: 'https://a/full', title: '全都有', site: 'bilibili', kind: 'single', duration_sec: null, entries: null });
+    writeFileSync(join(mediaDir, `media-${withVideo}.mp4`), 'V');
+    createSourceVideosRepo(db).upsert({ importId: withVideo, filePath: join(mediaDir, `media-${withVideo}.mp4`), height: 480, fileSize: 1, entryIndex: 1 });
+    writeFileSync(join(mediaDir, `media-${full}.mp4`), 'V');
+    createSourceVideosRepo(db).upsert({ importId: full, filePath: join(mediaDir, `media-${full}.mp4`), height: 720, fileSize: 1, entryIndex: 2 });
+    seedProjectWithSegments(full, 2);
+    const res = await app.inject({ method: 'GET', url: '/api/imports' });
+    expect(res.statusCode).toBe(200);
+    const rows = (res.json() as { imports: Array<{ id: number; has_video: boolean; has_project: boolean; segment_count: number; has_cover: boolean }> }).imports;
+    const byId = new Map(rows.map((r) => [r.id, r]));
+    expect(byId.get(bare)).toMatchObject({ has_video: false, has_project: false, segment_count: 0 });
+    expect(byId.get(withVideo)).toMatchObject({ has_video: true, has_project: false, segment_count: 0 });
+    expect(byId.get(full)).toMatchObject({ has_video: true, has_project: true, segment_count: 2 });
+  });
+  it('GET /api/imports/:id 详情行同样带出派生列(ImportDetailRow 与列表同型)', async () => {
+    makeApp('yt-dlp', 'tok2');
+    const id = createImportsRepo(db).upsertByUrl({ url: 'https://a/full', title: '全都有', site: 'bilibili', kind: 'single', duration_sec: null, entries: null });
+    writeFileSync(join(mediaDir, `media-${id}.mp4`), 'V');
+    createSourceVideosRepo(db).upsert({ importId: id, filePath: join(mediaDir, `media-${id}.mp4`), height: 720, fileSize: 1 });
+    seedProjectWithSegments(id, 1);
+    const res = await app.inject({ method: 'GET', url: `/api/imports/${id}` });
+    expect(res.statusCode).toBe(200);
+    expect((res.json() as { import: { has_video: boolean; has_project: boolean; segment_count: number } }).import)
+      .toMatchObject({ has_video: true, has_project: true, segment_count: 1 });
   });
 });

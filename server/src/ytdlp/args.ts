@@ -51,7 +51,7 @@ export function buildDownloadArgs(opts: { url: string; options: DownloadOptions;
  *   (偏好名以 spec §0.1 实测 D 的结论为准;2026-09-30 实测:B 站加 -S vcodec:h264,acodec:aac 后落 h264+aac)
  */
 export function buildVideoDownloadArgs(opts: {
-  url: string; outDir: string; videoHeight: 360 | 480 | 720 | 1080; cookiePath?: string;
+  url: string; outDir: string; videoHeight: 360 | 480 | 720 | 1080; entryIndices?: number[]; cookiePath?: string;
 }): string[] {
   const args: string[] = ['--newline', '--windows-filenames'];
   if (opts.cookiePath) args.push('--cookies', opts.cookiePath);
@@ -59,8 +59,14 @@ export function buildVideoDownloadArgs(opts: {
     '-f', `bv*[height<=${opts.videoHeight}]+ba/b[height<=${opts.videoHeight}]/b`,
     '-S', 'vcodec:h264,acodec:aac',
     '--merge-output-format', 'mp4',
-    '--no-playlist',
   );
+  // P2 方案A(2026-09-30):视频也支持只下合集里的一集——镜像音频侧 entryIndices → --playlist-items 的写法;
+  // 不传保持 --no-playlist(单视频素材原形态不变)
+  if (opts.entryIndices && opts.entryIndices.length > 0) {
+    args.push('--playlist-items', opts.entryIndices.join(','));
+  } else {
+    args.push('--no-playlist');
+  }
   args.push('--progress-template', '%(progress._percent_str)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s');
   args.push('-o', join(opts.outDir, '%(id)s.%(ext)s'), opts.url);
   return args;

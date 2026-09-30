@@ -145,6 +145,7 @@ export async function startDownload(payload: DownloadPayload): Promise<{ ok: boo
 // ---- 视频素材(2026-09-29 spec m1c-video-clip:视频当"带画面的时间标尺",只用于定位,不进剪辑室) ----
 export interface MediaItem {
   import_id: number; url: string; title: string; site: string;
+  entry_index: number | null;     // 合集第几集(1 起);单视频素材 → null(2026-09-30 P2:资料库单选一集下载/D19 默认选中用)
   height: number | null;          // 下载时选的档位(不是实测分辨率)
   file_size: number | null;
   created_at: string;
@@ -325,6 +326,9 @@ export async function deleteAudio(audioId: number): Promise<{ ok: boolean; delet
 export interface ImportSource {
   id: number; url: string; title: string; site: string; kind: 'single' | 'playlist';
   entry_count: number; created_at: string;
+  has_video: boolean;             // 该来源已登记视频素材(2026-09-30 P2 对齐服务端 /api/imports)
+  has_project: boolean;           // 已有剪辑工程(2026-09-30 P2 对齐服务端)
+  segment_count: number;          // 已保存剪辑点数(D19 替换确认文案的条件句用)
 }
 export interface ImportDetail extends Omit<ImportSource, 'entry_count'> { duration_sec: number | null; entries: { index: number; title: string }[] | null }
 

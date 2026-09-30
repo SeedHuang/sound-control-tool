@@ -59,6 +59,25 @@ CREATE TABLE IF NOT EXISTS source_videos (
   file_size INTEGER,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+-- 剪辑工程(2026-09-30,spec D7 提前落地):一个来源一份工程(import_id UNIQUE),P4 再扩 CRUD。
+-- 不写 REFERENCES:库没开外键,级联不生效(与 source_videos 同款处理,删除靠代码显式删,spec §0.1 事实 6)
+CREATE TABLE IF NOT EXISTS clip_projects (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  import_id INTEGER NOT NULL UNIQUE,
+  name TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS clip_segments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id INTEGER NOT NULL,
+  start_sec REAL NOT NULL,
+  end_sec REAL NOT NULL,
+  label TEXT,
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_clip_segments_project ON clip_segments(project_id, sort_order);
 `;
 
 /** 补列(幂等):CREATE TABLE IF NOT EXISTS 只对"表不存在"生效,已存在的老库不会拿到新列 → 必须 ALTER TABLE */
@@ -84,5 +103,9 @@ export function initSchema(db: DB): void {
   // 2026-09-29 用户拍板:分组视图要作品封面 → imported_sources 存封面原始地址(图片本体落盘在 covers/)
   ensureColumns(db, 'imported_sources', [
     { name: 'thumbnail', ddl: 'thumbnail TEXT' },
+  ]);
+  // 2026-09-30 方案A(P2):视频素材一次只留一集,记"这份素材是哪一集"(单视频为 NULL)
+  ensureColumns(db, 'source_videos', [
+    { name: 'entry_index', ddl: 'entry_index INTEGER' },
   ]);
 }
