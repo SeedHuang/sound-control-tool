@@ -128,7 +128,7 @@ describe('媒体素材路由', () => {
     const items = createAudioItemsRepo(db).list();
     expect(items).toHaveLength(1);
     expect(items[0]!.title).toBe(formatClipTitle('我的前缀', 90, 210)); // = '我的前缀 [01:30-03:30]'(后端拼的时间段)
-    expect(items[0]!.source_url).toBe('https://a/pl'); // 记原视频地址 → 音频库分组/封面/外链自动复用(spec D7)
+    expect(items[0]!.source_url).toBe('https://a/pl'); // 记原视频地址 → 剪辑室分组/封面/外链自动复用(spec D7)
     expect(items[0]!.file_path.startsWith(audioDir)).toBe(true);
     expect(existsSync(items[0]!.file_path)).toBe(true);
     expect(items[0]!.duration_sec).toBe(10); // ffprobe 实测(桩)

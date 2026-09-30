@@ -28,7 +28,7 @@ function BinCard({ title, bin, loading }: { title: string; bin: BinProbe | null;
           type="error"
           showIcon
           message="未检测到"
-          description="影响:相关获取功能不可用。请确认已安装并加入 PATH,或在设置中指定完整路径。"
+          description="影响:下载、剪辑等相关功能不可用。请确认已安装并加入 PATH,或在设置中指定完整路径。"
         />
       </Card>
     );
@@ -152,7 +152,7 @@ function LogsCard() {
   return (
     <Card title="日志" style={{ marginBottom: 16 }}>
       <Typography.Paragraph type="secondary">
-        清空后端内存日志,并删除已按天/小时落盘的日志文件。看日志请点右下角「日志」按钮。
+        清空后端内存日志,并删除已按天/小时落盘的日志文件。看日志请点右上角「日志」按钮。
       </Typography.Paragraph>
       <Button danger loading={clearing} onClick={confirmClear}>
         清空所有日志

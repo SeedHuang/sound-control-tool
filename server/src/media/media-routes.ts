@@ -40,7 +40,7 @@ export function registerMediaRoutes(
     if (!row) return reply.code(404).send({ ok: false, error: { code: 'NOT_FOUND', message: '素材不存在', next: '' } });
     if (!existsSync(row.file_path)) {
       // 两种成因文案不同(spec §0.3):来源已删 → 素材行也会被清,能走到这里说明是文件被外部删了
-      return reply.code(404).send({ ok: false, error: { code: 'FILE_MISSING', message: '素材文件已丢失，请重新下载视频', next: '回到获取页重新下视频' } });
+      return reply.code(404).send({ ok: false, error: { code: 'FILE_MISSING', message: '素材文件已丢失，请重新下载视频', next: '回到资料库重新下视频' } });
     }
     const stat = statSync(row.file_path);
     const ext = row.file_path.slice(row.file_path.lastIndexOf('.') + 1).toLowerCase();

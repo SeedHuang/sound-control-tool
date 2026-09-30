@@ -40,7 +40,7 @@ describe('audio-items repo', () => {
     expect(repo.get(id)).toBeNull();
     expect(repo.list()).toHaveLength(0);
   });
-  // 2026-09-29 用户拍板:音频库要显示「第几集 / 所属合集」→ audio_items 增两列
+  // 2026-09-29 用户拍板:剪辑室要显示「第几集 / 所属合集」→ audio_items 增两列
   it('entry_index/collection_title 落库并回读;不传 → null', () => {
     const repo = createAudioItemsRepo(db);
     const ep = repo.create({ title: '第 3 集', source_type: 'download', source_url: 'https://a/pl', file_path: 'C:/tmp/3.mp3', format: 'mp3', duration_sec: null, file_size: 1, entry_index: 3, collection_title: '某合集' });

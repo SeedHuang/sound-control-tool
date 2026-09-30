@@ -42,7 +42,7 @@ describe('ingestDownloadedFile', () => {
     expect(p2.endsWith('-2.mp3')).toBe(true);
     expect(p2).not.toBe(p1);
   });
-  // 2026-09-29 用户拍板:合集条目入库要记住「第几集 / 所属合集」,音频库据此显示
+  // 2026-09-29 用户拍板:合集条目入库要记住「第几集 / 所属合集」,剪辑室据此显示
   it('剧集字段 entryIndex/collectionTitle 随入库写进 audio_items(单视频不传 → null)', () => {
     const audioRepo = createAudioItemsRepo(db);
     const t1 = join(dir, 'ep3.mp3'); writeFileSync(t1, 'x');

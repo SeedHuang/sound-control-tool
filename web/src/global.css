@@ -1,5 +1,5 @@
 /* web/src/global.css
-   2026-09-29:音频库「剧集分组」卡片墙的动效。
+   2026-09-29:剪辑室「剧集分组」卡片墙的动效。
    为什么单独开一个 CSS 文件:内联样式表达不了 :hover / :active / @media(不含伪类与媒体查询),
    而这个项目没有引入 styled-components(规则:用了就得单独开 sc.tsx),所以用最朴素的 CSS 类。
    动效口径(emil-design-eng):

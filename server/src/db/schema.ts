@@ -76,7 +76,7 @@ export function initSchema(db: DB): void {
   // 幂等索引:jobs.status 被启动恢复/孤儿清理扫描,audio_item_tags.tag_id 会被连接过滤
   db.exec('CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_audio_item_tags_tag ON audio_item_tags(tag_id)');
-  // 2026-09-29 用户拍板:音频库要显示「第几集 / 所属合集」——老库(表已存在)靠这里补列,不会因缺列报错
+  // 2026-09-29 用户拍板:剪辑室要显示「第几集 / 所属合集」——老库(表已存在)靠这里补列,不会因缺列报错
   ensureColumns(db, 'audio_items', [
     { name: 'entry_index', ddl: 'entry_index INTEGER' },
     { name: 'collection_title', ddl: 'collection_title TEXT' },

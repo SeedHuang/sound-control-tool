@@ -115,7 +115,7 @@ export default function LibraryPage() {
         if (detail === null) return batchOk;
         setDone(null); // 每条开始前重置,避免上一条 onDone 的成功提示误报
         setPhase('download'); setPercent(0); // 进度条两段也复位:下一条从「① 下载 0%」重新开始
-        // 合集条目的「第几集 + 所属合集」随下载一起落库(2026-09-29 用户拍板:音频库要显示第几集/集名)
+        // 合集条目的「第几集 + 所属合集」随下载一起落库(2026-09-29 用户拍板:剪辑室要显示第几集/集名)
         const entry = entryIndex === 0 ? null : detail.entries?.find((e) => e.index === entryIndex) ?? null;
         try {
           const { jobId: jid } = await startDownload({
@@ -137,8 +137,8 @@ export default function LibraryPage() {
             failed.push(`条目 ${entryIndex}`);
             continue; // 单条 error 跳过继续,不再 break
           }
-          // 入库已成 → 喊一声让音频库刷新。用的是「切页后这段异步循环仍活着」这一事实:
-          // 用户往往在进度条刚满就切到音频库,那一瞬库里还没这行,靠这条通知补上(2026-09-29 用户反馈修复)
+          // 入库已成 → 喊一声让剪辑室刷新。用的是「切页后这段异步循环仍活着」这一事实:
+          // 用户往往在进度条刚满就切到剪辑室,那一瞬库里还没这行,靠这条通知补上(2026-09-29 用户反馈修复)
           notifyAudioChanged(`job ${jid} 入库完成`);
           okCount += 1;
           batchOk += 1;
@@ -159,7 +159,7 @@ export default function LibraryPage() {
         const names = duplicates.map((i) => (i === 0 ? '该音频' : `第 ${i} 集`)).join('、');
         const ok = await new Promise<boolean>((resolve) => {
           Modal.confirm({
-            title: '这些已经在音频库里了',
+            title: '这些已经在剪辑室里了',
             content: `${names} 已存在。重新下载会删掉库里原来那一份(文件也删掉),只保留新下的。要继续吗?`,
             okText: '重新下载并替换',
             okType: 'danger',
@@ -200,7 +200,7 @@ export default function LibraryPage() {
 
   return (
     /* 高度锁死为布局内容区高度、overflow hidden:body 不滚,滚动全部收敛到内部容器;
-       外层改纵向(Task 13 模式切换):顶部 Segmented 横条,下面才是「左列表 + 主区」的横向排布 */
+       外层改纵向:顶部是页面头(PageHeader,模式切换在它的工具栏行里),下面才是「左列表 + 主区」的横向排布 */
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0, overflow: 'hidden' }}>
       {/* 页面头(spec D2):① 来源 logo + 标题 ② 工具栏。
           模式切换暂时放在工具栏里,行为与改造前完全一致;P2 再把它换成"产物类型 Radio"。 */}
@@ -301,7 +301,7 @@ export default function LibraryPage() {
               {jobId !== null && done === null && (
                 <div style={{ marginTop: 16, flexShrink: 0 }}>
                   {/* 两段式进度条(2026-09-29 用户拍板):① 下载(蓝) ② 入库(绿)。
-                      为什么必须分段:下载字节跑完 ≠ 已经进音频库——后端还要 ffprobe 测时长、改名、写库(实测约 4 秒),
+                      为什么必须分段:下载字节跑完 ≠ 已经进剪辑室——后端还要 ffprobe 测时长、改名、写库(实测约 4 秒),
                       这段没有可上报的百分比,所以第二段用 antd 的 active 动画表示「正在进行中」(不是假进度)。
                       之前只有一根条:它停在 100% 而库里还是空的,用户以为下好了就切走(真实踩的坑)。
                       strokeLinecap=butt 让两段并排时看起来是一根连续的条。 */}
@@ -328,7 +328,7 @@ export default function LibraryPage() {
                       <span style={{ color: '#1677ff' }}>① 下载</span> {phase === 'download' ? `${percent}%` : '完成'}
                     </Typography.Text>
                     <Typography.Text style={{ fontSize: 12 }}>
-                      <span style={{ color: '#52c41a' }}>② 入库</span> {phase === 'ingest' ? '中…(正在写进音频库,稍等)' : '待开始'}
+                      <span style={{ color: '#52c41a' }}>② 入库</span> {phase === 'ingest' ? '中…(正在写进剪辑室,稍等)' : '待开始'}
                     </Typography.Text>
                   </Space>
                   <div style={{ marginTop: 8 }}>

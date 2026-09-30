@@ -71,7 +71,7 @@ export function createImportsRepo(db: DB) {
     return r ? mapDetail(r) : null;
   };
 
-  /** 按 URL 取(2026-09-29 用户拍板:音频库补齐老记录——旧音频没记合集名,拿它的 source_url 反查这张表) */
+  /** 按 URL 取(2026-09-29 用户拍板:剪辑室补齐老记录——旧音频没记合集名,拿它的 source_url 反查这张表) */
   const getByUrl = (url: string): ImportDetailRow | null => {
     const r = db.prepare('SELECT * FROM imported_sources WHERE url = ?').get(url) as Record<string, unknown> | undefined;
     return r ? mapDetail(r) : null;

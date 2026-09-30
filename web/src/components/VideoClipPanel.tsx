@@ -1,5 +1,5 @@
 // web/src/components/VideoClipPanel.tsx
-// 获取页「视频预览剪音频」模式(2026-09-29 spec m1c-video-clip)。
+// 资料库「视频预览剪音频」模式(2026-09-29 spec m1c-video-clip)。
 // 为什么单独一个文件:acquire.tsx 已经很长,这个模式的交互(下视频/打点/剪)是自成一体的。
 // 2026-09-30 实测:剪辑/下载完成 onDone 设 msg 后 refresh() 的 setMedia 会触发 effect,把成功提示和打点一并清零——
 // 故拆成「来源 id 变化才清打点/提示」(lastSourceId ref)与「media 对齐选中素材」两个 effect,后者不清任何状态。

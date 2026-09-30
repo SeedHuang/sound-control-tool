@@ -74,7 +74,7 @@ export async function startClipJob(
     const audioRepo = createAudioItemsRepo(deps.db);
     const finalTitle = formatClipTitle(payload.title ?? '剪辑音频', payload.start, payload.end);
     // 批4 裁定 R3:ingest 的 sourceUrl 是 string 非可空 → 空值归一为空串(不落 null 撞签名);
-    // 记原视频地址 → 音频库的分组/封面/外链自动复用(spec D7);sourceUrl 未带/空串 → 空串
+    // 记原视频地址 → 剪辑室的分组/封面/外链自动复用(spec D7);sourceUrl 未带/空串 → 空串
     const result = ingestDownloadedFile({
       tmpPath: tmpOut,
       title: finalTitle,

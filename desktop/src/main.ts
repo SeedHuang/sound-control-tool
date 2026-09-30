@@ -97,7 +97,7 @@ async function openWindow(mode: 'dev' | 'file', apiPort: number, apiToken: strin
     },
   });
   const search = `apiPort=${apiPort}&apiToken=${apiToken}`;
-  // 外链走系统浏览器(2026-09-29:音频库「原视频」链接用 target=_blank):
+  // 外链走系统浏览器(2026-09-29:剪辑室「原视频」链接用 target=_blank):
   // 不拦的话 Electron 默认新开一个无 preload 的裸窗口,点一次冒一个;这里统一 deny + openExternal
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     if (/^https?:\/\//i.test(url)) void shell.openExternal(url);

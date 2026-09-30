@@ -54,7 +54,7 @@ export type CoverWriter = (opts: { url: string; coversDir: string; importId: num
 export interface DownloadJobPayload {
   url: string;
   options: Record<string, unknown>;
-  /** 产物类型(2026-09-29 spec m1c-video-clip):audio → 音频库;video → 视频素材(media/ + source_videos);缺省按 audio */
+  /** 产物类型(2026-09-29 spec m1c-video-clip):audio → 剪辑室;video → 视频素材(media/ + source_videos);缺省按 audio */
   produce?: 'audio' | 'video';
   title?: string;
   durationSec?: number;
@@ -672,7 +672,7 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
     if (kind === 'ffmpeg_clip') {
       const clipPayload = JSON.parse(old.payload) as { videoPath?: string };
       if (typeof clipPayload.videoPath !== 'string' || !existsSync(clipPayload.videoPath)) {
-        return reply.code(409).send({ ok: false, error: { code: 'MEDIA_GONE', message: '素材已不存在，请重新下载视频', next: '回到获取页重新下视频' } });
+        return reply.code(409).send({ ok: false, error: { code: 'MEDIA_GONE', message: '素材已不存在，请重新下载视频', next: '回到资料库重新下视频' } });
       }
       if (deps.clipStarter === undefined) return reply.code(500).send({ ok: false, error: { code: 'NOT_WIRED', message: '剪辑重试未接线', next: '' } });
       const newId = jobsRepo.create('ffmpeg_clip', clipPayload);
@@ -708,7 +708,7 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
   });
 
   // Task 7:音频列表——spec 0.3:返回数组(非 {ok,items});list() 已按 created_at DESC(§0.4)
-  // 2026-09-29 用户拍板:每行带 site(由 source_url 反查平台)→ 前端音频库显示平台 logo
+  // 2026-09-29 用户拍板:每行带 site(由 source_url 反查平台)→ 前端剪辑室显示平台 logo
   // 2026-09-29 用户拍板(补齐老记录):改动前入库的音频没记「所属合集 / 第几集」,但来源网址还在——
   // 拿它反查 imported_sources(解析时落库的那张表)就能把番剧名补回来;集数只在分集清单里
   // **唯一命中同名条目**时才判定(同名多条一律不猜:宁可不显示,也不显示错的集数)。已记录的值优先,不覆盖。

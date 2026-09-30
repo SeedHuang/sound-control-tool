@@ -50,15 +50,15 @@ export async function fetchLogs(): Promise<LogRow[]> {
   return j.logs;
 }
 
-// ---- 音频库数据变更通知(2026-09-29 用户反馈:下载结束后切到音频库看不到刚下的文件) ----
+// ---- 剪辑室数据变更通知(2026-09-29 用户反馈:下载结束后切到剪辑室看不到刚下的文件) ----
 // 真相:切页那一刻列表确实拉了,但后端「rename + ffprobe 测时长 + INSERT」还没跑完(实测差了 4 秒),
 // 之后页面就不再刷新了 → 用户看到的是旧列表。这里放一个极小的进程内事件总线:
-// 谁写完音频库数据就喊一声,音频库页订阅后自己重拉列表(页面开着也能立刻看到新条目)。
-// 喊的时候若音频库页没打开,通知丢失也无妨——它每次挂载都会自己拉一次。
+// 谁写完剪辑室数据就喊一声,剪辑室页订阅后自己重拉列表(页面开着也能立刻看到新条目)。
+// 喊的时候若剪辑室页没打开,通知丢失也无妨——它每次挂载都会自己拉一次。
 export type AudioChangedHandler = () => void;
 const audioChangedHandlers = new Set<AudioChangedHandler>();
 export function notifyAudioChanged(reason: string): void {
-  logFe('info', `通知音频库刷新(${reason})`); // 诊断日志:日志页能看清"是谁触发的那次刷新"
+  logFe('info', `通知剪辑室刷新(${reason})`); // 诊断日志:日志页能看清"是谁触发的那次刷新"
   for (const fn of [...audioChangedHandlers]) fn();
 }
 export function onAudioChanged(fn: AudioChangedHandler): () => void {
@@ -124,7 +124,7 @@ export interface DownloadPayload {
   url: string;
   title?: string;
   durationSec?: number;
-  entryIndex?: number;      // 合集第几集(1 起);单视频不传(2026-09-29 用户拍板:音频库要显示第几集)
+  entryIndex?: number;      // 合集第几集(1 起);单视频不传(2026-09-29 用户拍板:剪辑室要显示第几集)
   collectionTitle?: string; // 所属合集标题;单视频不传
   options: { entryIndices?: number[]; section?: { start: number; end: number }; videoHeight?: 360 | 480 | 720 | 1080; format: 'mp3' | 'm4a' | 'wav'; quality?: string; force?: boolean };
   produce?: 'audio' | 'video'; // 产物类型(2026-09-29 spec m1c-video-clip):video=下完整视频素材(带音轨),缺省 audio=抽音轨
@@ -142,7 +142,7 @@ export async function startDownload(payload: DownloadPayload): Promise<{ ok: boo
   return r;
 }
 
-// ---- 视频素材(2026-09-29 spec m1c-video-clip:视频当"带画面的时间标尺",只用于定位,不进音频库) ----
+// ---- 视频素材(2026-09-29 spec m1c-video-clip:视频当"带画面的时间标尺",只用于定位,不进剪辑室) ----
 export interface MediaItem {
   import_id: number; url: string; title: string; site: string;
   height: number | null;          // 下载时选的档位(不是实测分辨率)
@@ -194,8 +194,8 @@ export async function listAudio(): Promise<AudioRow[]> {
 }
 export interface AudioRow {
   id: number; title: string; source_type: string; format: string; duration_sec: number | null; created_at: string;
-  source_url: string | null;      // 原视频地址(后端返回;音频库展示 + 可点开)
-  site: string;                   // 平台标识(bilibili/youtube/other,后端由 source_url 反查)→ 音频库显示 logo
+  source_url: string | null;      // 原视频地址(后端返回;剪辑室展示 + 可点开)
+  site: string;                   // 平台标识(bilibili/youtube/other,后端由 source_url 反查)→ 剪辑室显示 logo
   entry_index: number | null;     // 合集第几集;单视频/录制 → null
   collection_title: string | null; // 所属合集标题;非合集 → null
 }
@@ -218,7 +218,7 @@ export function coverUrl(importId: number): string {
   return `${API_BASE}/api/imports/${importId}/cover?token=${encodeURIComponent(token ?? '')}`;
 }
 
-/** done 事件联合类型(spec m1c-video-clip):audio=进音频库(下载与剪辑共用;旧下载事件无 kind 字段 → 按缺省 audio 读);
+/** done 事件联合类型(spec m1c-video-clip):audio=进剪辑室(下载与剪辑共用;旧下载事件无 kind 字段 → 按缺省 audio 读);
  *  video=视频素材就位(importId 即来源 id,拿它拼 /api/media/:id/file 流地址;fileSize 为素材字节数) */
 export type DoneEvent =
   | { kind?: 'audio'; audioId: number; title: string; format: string; replaced?: boolean }
@@ -318,7 +318,7 @@ export async function deleteAudio(audioId: number): Promise<{ ok: boolean; delet
   return r;
 }
 
-// ---- 导入来源(2026-09-29 用户拍板:parse 成功自动落库,获取页左列表持久化) ----
+// ---- 导入来源(2026-09-29 用户拍板:parse 成功自动落库,资料库左列表持久化) ----
 // 注意(2026-09-29 评审修):服务端 /api/imports 还会回 thumbnail / has_cover,前端**刻意不声明、不使用** ——
 // 卡片渲不渲染 <img> 不看 has_cover(那样"还没抓过图"的来源就永远没机会触发服务端抓取),
 // 而是有来源记录就渲染、取不到由 onError 回退纯色卡片(见 library.tsx 的 WorkCard)。将来要用再加回契约。

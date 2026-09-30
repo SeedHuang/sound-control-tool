@@ -291,7 +291,7 @@ describe('GET /api/jobs/:id/events', () => {
     expect(buf).toContain('"percent":42');
   });
   // 2026-09-29 用户拍板(进度条分两段:① 下载 ② 入库):下载进程结束、开始入库前必须推一个阶段信号,
-  // 前端才能把进度条从下载段切到入库段。否则进度条停在 100% 而音频库还是空,用户以为下好了就切走(真实踩坑)。
+  // 前端才能把进度条从下载段切到入库段。否则进度条停在 100% 而剪辑室还是空,用户以为下好了就切走(真实踩坑)。
   it('SSE 连接收到 phase=ingest 事件,且早于 done(下载完成 → 入库 → 入库完成)', async () => {
     let fireDone: (() => void) | undefined;
     const producedPath = join(tempDir, 'produced.mp3');
@@ -428,7 +428,7 @@ describe('GET /api/audio 与 GET /api/audio/:id/file', () => {
     expect(res.json()).toHaveLength(1);
     expect(res.json()[0].title).toBe('a');
   });
-  // 2026-09-29 用户拍板:音频库要显示平台 logo / 第几集 / 所属合集 → 列表附带 site + 剧集两列
+  // 2026-09-29 用户拍板:剪辑室要显示平台 logo / 第几集 / 所属合集 → 列表附带 site + 剧集两列
   it('audio 列表带 site(由 source_url 反查平台)与剧集字段', async () => {
     const audioRepo = createAudioItemsRepo(db);
     audioRepo.create({ title: '第 3 集', source_type: 'download', source_url: 'https://www.bilibili.com/list/1', file_path: 'C:/x/3.mp3', format: 'mp3', duration_sec: null, file_size: 1, entry_index: 3, collection_title: '某合集' });
@@ -669,7 +669,7 @@ describe('Cookie 注入(parse/download)', () => {
   });
 });
 
-// 作品封面(2026-09-29 用户拍板:音频库分组视图显示作品封面)
+// 作品封面(2026-09-29 用户拍板:剪辑室分组视图显示作品封面)
 // 抓取时机两处:解析成功后**后台**预热一次(不 await,不拖慢解析);看分组视图时本地还没有就兜底现抓(自愈)
 describe('作品封面:解析预热 / has_cover / cover 路由', () => {
   const parseUrl = 'https://www.bilibili.com/bangumi/play/ss1';
@@ -875,7 +875,7 @@ describe('下载视频素材(produce=video)', () => {
     expect(rows[0]!.file_path.startsWith(mediaDir)).toBe(true); // R6:placeVideo 返回的 placed.path 原样落库
     expect(existsSync(rows[0]!.file_path)).toBe(true);
     expect(existsSync(producedPath)).toBe(false); // rename 消耗掉临时产物
-    expect(createAudioItemsRepo(db).list()).toHaveLength(0); // 不进音频库
+    expect(createAudioItemsRepo(db).list()).toHaveLength(0); // 不进剪辑室
     expect(createImportsRepo(db).getByUrl('https://a/v')).not.toBeNull(); // import 兜底 upsert
     expect(createJobsRepo(db).get(jobId)!.status).toBe('done');
   });
