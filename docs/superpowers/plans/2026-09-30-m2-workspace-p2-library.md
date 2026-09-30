@@ -1,5 +1,7 @@
 # P2 · 资料库（下载统一）Implementation Plan
 
+> **2026-09-30 追补**：本计划 Task 3 交付的"产物类型 Radio"已被后续裁决取代——资料库收敛为**仅视频下载**（音频从剪辑获得，见 spec D4 修订），工具栏不再有音频/视频之分。以 spec 为准。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development（推荐）or superpowers:executing-plans。Steps 用 checkbox（`- [ ]`）跟踪。
 
 **Goal:** 资料库页成为"只负责下载"的页面：产物类型（音频/视频）收进工具栏 Radio；集数网格音视频共用；视频按已裁决的方案 A **一次只选一集**下载；已下素材的那一集在网格里高亮（D20）；换集下载前二次确认（D19）。

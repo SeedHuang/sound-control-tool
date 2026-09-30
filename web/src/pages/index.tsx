@@ -24,7 +24,7 @@ export default function IndexPage() {
   return (
     /* 首页自管滚动(spec D3):根容器锁死高度,超出的部分由内部这层滚 */
     <div style={{ height: '100%', minHeight: 0, overflowY: 'auto', padding: 16 }}>
-      <Card title="首页">
+      <Card>
         {error && <Alert type="error" showIcon message="无法连接本地服务" description={error} />}
         {!error && !health && <Spin />}
         {!error && health && ok && (

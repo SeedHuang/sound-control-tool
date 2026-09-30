@@ -202,7 +202,7 @@ export default function SettingsPage() {
           style={{ marginBottom: 16 }}
         />
       )}
-      <Card title="设置" style={{ marginBottom: 16 }}>
+      <Card style={{ marginBottom: 16 }}>
         <Typography.Text>API 端口:{apiPort()}</Typography.Text>
         <Button style={{ float: 'right' }} loading={probing} onClick={() => void probe()}>
           重新探测
