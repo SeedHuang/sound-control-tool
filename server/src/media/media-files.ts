@@ -9,7 +9,7 @@ import { pushLog } from '../logs.js';
 function prefixOf(importId: number): string { return `media-${importId}.`; }
 
 /** 该来源名下现有的素材文件(可能多个扩展名) */
-export function findVideoFiles(mediaDir: string, importId: number): string[] {
+function findVideoFiles(mediaDir: string, importId: number): string[] {
   try {
     return readdirSync(mediaDir).filter((f) => f.startsWith(prefixOf(importId))).sort().map((f) => join(mediaDir, f));
   } catch {

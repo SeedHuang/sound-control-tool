@@ -2,7 +2,7 @@
 // 左列表持久化(imported_sources 表,parse 成功自动落库);点来源直接看缓存集数,不重新解析
 import { Alert, Badge, Button, Card, Empty, Input, Modal, Progress, Radio, Space, Spin, Tag, Typography } from 'antd';
 import { useEffect, useState } from 'react';
-import { apiGet, cancelJob, coverUrl, deleteImport, getImport, listImports, listMedia, logFe, mediaFileUrl, parseUrl, startDownload, subscribeJob, type ImportDetail, type ImportSource, type MediaItem } from '@/api';
+import { cancelJob, coverUrl, deleteImport, getImport, listImports, listMedia, logFe, mediaFileUrl, parseUrl, startDownload, subscribeJob, type ImportDetail, type ImportSource, type MediaItem } from '@/api';
 import PageHeader from '@/components/PageHeader';
 import SiteLogo from '@/components/SiteLogo';
 

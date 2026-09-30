@@ -14,7 +14,5 @@
     "probe:sqlite": "pnpm --filter @sct/desktop probe:sqlite",
     "probe:sqlite:node": "pnpm --filter @sct/server probe:sqlite:node"
   },
-  "devDependencies": {
-    "concurrently": "^9.1.0"
-  }
+  "devDependencies": {}
 }

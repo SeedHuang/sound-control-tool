@@ -182,17 +182,6 @@ export async function cancelJob(jobId: number): Promise<{ ok: boolean }> {
   return apiPost<{ ok: boolean }>(`/api/jobs/${jobId}/cancel`, {});
 }
 
-export async function retryJob(jobId: number): Promise<{ ok: boolean; jobId: number }> {
-  // 诊断日志:重试是「明知会失败仍提交」的高风险操作,前端必须留痕便于与后端对账
-  logFe('info', `retryJob jobId=${jobId}`);
-  const r = await apiPost<{ ok: boolean; jobId: number }>(`/api/jobs/${jobId}/retry`, {});
-  logFe('info', `retryJob jobId=${jobId} → newJobId=${r.jobId}`);
-  return r;
-}
-
-export async function listAudio(): Promise<AudioRow[]> {
-  return apiGet<AudioRow[]>('/api/audio');
-}
 export interface AudioRow {
   id: number; title: string; source_type: string; format: string; duration_sec: number | null; created_at: string;
   source_url: string | null;      // 原视频地址(后端返回;剪辑室展示 + 可点开)
