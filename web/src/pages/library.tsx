@@ -3,6 +3,7 @@
 import { Alert, Badge, Button, Card, Checkbox, Empty, Input, Modal, Progress, Radio, Segmented, Space, Spin, Typography } from 'antd';
 import { useEffect, useState } from 'react';
 import { ApiError, apiGet, cancelJob, deleteImport, getImport, listImports, logFe, notifyAudioChanged, parseUrl, startDownload, subscribeJob, type ImportDetail, type ImportSource } from '@/api';
+import PageHeader from '@/components/PageHeader';
 import SiteLogo from '@/components/SiteLogo';
 import VideoClipPanel from '@/components/VideoClipPanel';
 
@@ -201,12 +202,23 @@ export default function LibraryPage() {
     /* 高度锁死为布局内容区高度、overflow hidden:body 不滚,滚动全部收敛到内部容器;
        外层改纵向(Task 13 模式切换):顶部 Segmented 横条,下面才是「左列表 + 主区」的横向排布 */
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0, overflow: 'hidden' }}>
-      {/* 模式切换(2026-09-30 Task 13):video 模式主区渲染 VideoClipPanel;左列表两个模式共用(选来源) */}
-      <Segmented
-        value={mode}
-        onChange={(v) => { setMode(v as 'audio' | 'video'); setError(null); setDone(null); }}
-        options={[{ value: 'audio', label: '下载音频' }, { value: 'video', label: '视频预览剪音频' }]}
-        style={{ alignSelf: 'flex-start', margin: '12px 16px 8px' }}
+      {/* 页面头(spec D2):① 来源 logo + 标题 ② 工具栏。
+          模式切换暂时放在工具栏里,行为与改造前完全一致;P2 再把它换成"产物类型 Radio"。 */}
+      <PageHeader
+        icon={detail === null ? undefined : <SiteLogo site={detail.site} size={20} />}
+        title={detail === null ? '资料库' : detail.title}
+        meta={
+          detail !== null && detail.duration_sec !== null
+            ? `时长 ${Math.floor(detail.duration_sec / 60)} 分 ${Math.round(detail.duration_sec % 60)} 秒`
+            : undefined
+        }
+        toolbar={
+          <Segmented
+            value={mode}
+            onChange={(v) => { setMode(v as 'audio' | 'video'); setError(null); setDone(null); }}
+            options={[{ value: 'audio', label: '下载音频' }, { value: 'video', label: '视频预览剪音频' }]}
+          />
+        }
       />
       <div style={{ display: 'flex', flex: 1, minHeight: 0 }}>
         {/* 左:导入来源列表(持久化;项 = 站点 logo + 标题 + 条目数徽标) */}
@@ -241,7 +253,7 @@ export default function LibraryPage() {
           {mode === 'audio' && detail === null && error === null && <Empty description="从左侧选择一个来源,或点「+ 新导入」" style={{ marginTop: 80 }} />}
           {mode === 'audio' && detail !== null && (
             <Card
-              title={<Space><SiteLogo site={detail.site} size={18} /><span>{detail.title}</span></Space>}
+              title={null}   /* 标题已抬到页面头(D2),卡里不再重复 */
               extra={(
                 <Space wrap size={8}>
                   {/* 音频格式 + 下载 + 删除来源(2026-09-29 用户拍板:两个按钮统一为同一种类型——都走实心 primary,
@@ -258,11 +270,6 @@ export default function LibraryPage() {
               style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}
               styles={{ body: { flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' } }}
             >
-              {detail.duration_sec !== null && (
-                <Typography.Text type="secondary" style={{ flexShrink: 0 }}>
-                  时长 {Math.floor(detail.duration_sec / 60)} 分 {Math.round(detail.duration_sec % 60)} 秒
-                </Typography.Text>
-              )}
               {/* 集数区 = 卡内唯一滚动区:标题固定在上,格子网格在本区内滚 */}
               {detail.kind === 'playlist' && detail.entries !== null && (
                 <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0, marginTop: 12 }}>
