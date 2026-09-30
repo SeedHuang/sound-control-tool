@@ -50,6 +50,15 @@ CREATE TABLE IF NOT EXISTS imported_sources (
   thumbnail TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+-- 视频素材(2026-09-29,spec m1c-video-clip):与 imported_sources 一对一,import_id 即来源 id。
+-- 不写 REFERENCES:库没开外键,级联不生效,删除来源时靠代码显式删(spec §0.1 事实 6)
+CREATE TABLE IF NOT EXISTS source_videos (
+  import_id INTEGER PRIMARY KEY,
+  file_path TEXT NOT NULL,
+  height INTEGER,
+  file_size INTEGER,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 `;
 
 /** 补列(幂等):CREATE TABLE IF NOT EXISTS 只对"表不存在"生效,已存在的老库不会拿到新列 → 必须 ALTER TABLE */

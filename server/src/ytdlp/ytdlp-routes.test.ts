@@ -11,6 +11,7 @@ import { registerYtdlpRoutes, type YtdlpDeps } from './ytdlp-routes.js';
 import { createDownloadManager } from './download.js';
 import { createJobsRepo } from '../db/repo/jobs.js';
 import { createAudioItemsRepo } from '../db/repo/audio-items.js';
+import { createSourceVideosRepo } from '../db/repo/source-videos.js';
 import { registerRequestLogging } from '../logs.js';
 import { createSettingsRepo } from '../db/repo/settings.js';
 import { createImportsRepo } from '../db/repo/imports.js';
@@ -35,10 +36,12 @@ vi.mock('./bili-login.js', () => ({
 let db: DB;
 let app: FastifyInstance;
 let tempDir: string; // 每用例独立真实 tempDir(startDownload 会 mkdirSync 子目录;用 'C:/tmp' 会在机器上留残余)
+let mediaDir: string; // 视频素材目录(批4 Task 9):produce=video 的 finalize 落这里
 beforeEach(async () => {
   db = openDatabase(':memory:'); initSchema(db);
   app = Fastify({ logger: false });
   tempDir = mkdtempSync(join(tmpdir(), 'sct-ytdlp-tmp-'));
+  mediaDir = join(tempDir, 'media');
 });
 afterEach(async () => {
   app.server.closeAllConnections?.(); // 强制关闭残留 SSE/keep-alive 连接,防 app.close() 悬挂
@@ -51,19 +54,23 @@ function makeApp(
   dm?: ReturnType<typeof createDownloadManager>,
   coverFetcher?: YtdlpDeps['coverFetcher'],
   coverWriter?: YtdlpDeps['coverWriter'],
+  clipStarter?: YtdlpDeps['clipStarter'],
 ) {
   // audioDir 用临时子目录:Cookie 注入会把 cookies.txt 物化到 dirname(audioDir),不能写真机 C:/ 根
   const audioDir = join(tempDir, 'audio');
   mkdirSync(audioDir, { recursive: true });
+  // 视频素材目录(批4 裁定 5:YtdlpDeps 加 mediaDir 后 makeApp 的必要连带)
+  mkdirSync(mediaDir, { recursive: true });
   registerSettingsRoutes(app, db); // /api/settings 白名单用例需要真实 settings 路由
   return registerYtdlpRoutes(app, {
     db,
     binProvider: async () => ({ path: binPath }),
     downloadManager: dm ?? createDownloadManager(),
-    audioDir, tempDir, token,
+    audioDir, mediaDir, tempDir, token,
     // 默认注入桩:两条抓封面路径都失败。否则解析用例(带 mock 出来的封面地址)会真的发网络请求 / 真拉 yt-dlp(测试必须封闭)
     coverFetcher: coverFetcher ?? (async () => false),
     coverWriter: coverWriter ?? (async () => false),
+    clipStarter,
   });
 }
 
@@ -798,5 +805,135 @@ describe('作品封面:解析预热 / has_cover / cover 路由', () => {
     // 本机页面的 Referer → 放行(来源不存在 → 404,证明没被 401 拦下)
     expect((await app.inject({ method: 'GET', url: '/api/imports/999/cover', headers: { referer: 'http://localhost:8000/' } })).statusCode).toBe(404);
     expect((await app.inject({ method: 'GET', url: '/api/imports/999/cover', headers: { referer: 'https://evil.example/x' } })).statusCode).toBe(401);
+  });
+});
+
+// ---- 批4 Task 9:视频素材(2026-09-29 spec m1c-video-clip):下载进 <数据>/media/,不进 audio_items ----
+describe('下载视频素材(produce=video)', () => {
+  it('校验:produce 非法 → 400;videoHeight 非法 → 400;缺省 videoHeight 走 480', async () => {
+    const dm = { start: vi.fn(), cancel: vi.fn(async () => {}), dispose: vi.fn(async () => {}) };
+    makeApp('yt-dlp', 'tok2', dm as unknown as ReturnType<typeof createDownloadManager>);
+    expect((await app.inject({ method: 'POST', url: '/api/ytdlp/download', payload: { url: 'https://a/v', options: { format: 'mp3' }, produce: 'movie' } })).statusCode).toBe(400);
+    // videoHeight 在 options 里(与 DownloadOptions 同位置);999 不在 360|480|720|1080 档位 → 400
+    expect((await app.inject({ method: 'POST', url: '/api/ytdlp/download', payload: { url: 'https://a/v', options: { format: 'mp3', videoHeight: 999 }, produce: 'video' } })).statusCode).toBe(400);
+    // 缺省 videoHeight → 480 档:视频分支用 buildVideoDownloadArgs(不是 -x 抽音轨),job kind 是 ytdlp_video
+    const res = await app.inject({ method: 'POST', url: '/api/ytdlp/download', payload: { url: 'https://a/v', options: { format: 'mp3' }, produce: 'video', title: 't' } });
+    expect(res.statusCode).toBe(201);
+    const startOpts = dm.start.mock.calls[0]?.[0] as { args: string[] };
+    expect(startOpts.args.join(' ')).toContain('height<=480');
+    expect(startOpts.args).not.toContain('-x');
+    expect(createJobsRepo(db).get(res.json().jobId as number)!.kind).toBe('ytdlp_video');
+  });
+  it('produce 空串按 audio 处理(前端"没选"不是非法)', async () => {
+    const dm = { start: vi.fn(), cancel: vi.fn(async () => {}), dispose: vi.fn(async () => {}) };
+    makeApp('yt-dlp', 'tok2', dm as unknown as ReturnType<typeof createDownloadManager>);
+    const res = await app.inject({ method: 'POST', url: '/api/ytdlp/download', payload: { url: 'https://a/v', options: { format: 'mp3' }, produce: '', title: 't' } });
+    expect(res.statusCode).toBe(201);
+    expect(createJobsRepo(db).get(res.json().jobId as number)!.kind).toBe('ytdlp_download');
+  });
+  it('视频下载不参与音频判重(换清晰度重下不该被 409 拦住)', async () => {
+    const audioRepo = createAudioItemsRepo(db);
+    audioRepo.create({ title: 't', source_type: 'download', source_url: 'https://a/v', file_path: 'C:/x.mp3', format: 'mp3', duration_sec: 1, file_size: 1 });
+    const dm = { start: vi.fn(), cancel: vi.fn(async () => {}), dispose: vi.fn(async () => {}) };
+    makeApp('yt-dlp', 'tok2', dm as unknown as ReturnType<typeof createDownloadManager>);
+    const res = await app.inject({ method: 'POST', url: '/api/ytdlp/download', payload: { url: 'https://a/v', options: { format: 'mp3' }, produce: 'video', title: 't' } });
+    expect(res.statusCode).toBe(201);
+    expect(createJobsRepo(db).get(res.json().jobId as number)!.kind).toBe('ytdlp_video');
+  });
+  it('视频任务同 URL 并发 → 409 BUSY(按 ytdlp_video 查,与音频任务互不挡)', async () => {
+    const jobsRepo = createJobsRepo(db);
+    const jid = jobsRepo.create('ytdlp_video', { url: 'https://a/v', options: { format: 'mp3' }, produce: 'video' });
+    jobsRepo.update(jid, { status: 'running' });
+    makeApp('yt-dlp', 'tok2');
+    const res = await app.inject({ method: 'POST', url: '/api/ytdlp/download', payload: { url: 'https://a/v', options: { format: 'mp3' }, produce: 'video', title: 't' } });
+    expect(res.statusCode).toBe(409);
+    expect(res.json().error.code).toBe('BUSY');
+  });
+  // 视频入库全链路(批4 裁定 R6 接线的直接验证):下载完成 → 落 media/ 记 source_videos,不进 audio_items
+  it('produce=video 下载完成 → 落 media/ 记 source_videos,不进 audio_items', async () => {
+    const producedPath = join(tempDir, 'vid.mp4');
+    writeFileSync(producedPath, 'VIDEOBYTES');
+    let fire: (() => void) | undefined;
+    const dm = {
+      start: vi.fn((opts: { jobId: number; onEvent: (jid: number, ev: unknown) => void }) => {
+        fire = () => opts.onEvent(opts.jobId, { type: 'status', state: 'done', producedPath });
+      }),
+      cancel: vi.fn(async () => {}),
+      dispose: vi.fn(async () => {}),
+    };
+    makeApp('yt-dlp', 'tok2', dm as unknown as ReturnType<typeof createDownloadManager>);
+    const res = await app.inject({ method: 'POST', url: '/api/ytdlp/download', payload: { url: 'https://a/v', options: { format: 'mp3' }, produce: 'video', title: '凡人' } });
+    expect(res.statusCode).toBe(201);
+    const jobId = res.json().jobId as number;
+    fire!(); // 下载进程退出 → finalizeVideoDownload(rename + upsert source_videos)
+    const deadline = Date.now() + 2000;
+    while (Date.now() < deadline && createJobsRepo(db).get(jobId)!.status !== 'done') await new Promise((r) => setTimeout(r, 20));
+    const rows = createSourceVideosRepo(db).list();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.import_id).toBe(1);
+    expect(rows[0]!.height).toBe(480);
+    expect(rows[0]!.file_path.startsWith(mediaDir)).toBe(true); // R6:placeVideo 返回的 placed.path 原样落库
+    expect(existsSync(rows[0]!.file_path)).toBe(true);
+    expect(existsSync(producedPath)).toBe(false); // rename 消耗掉临时产物
+    expect(createAudioItemsRepo(db).list()).toHaveLength(0); // 不进音频库
+    expect(createImportsRepo(db).getByUrl('https://a/v')).not.toBeNull(); // import 兜底 upsert
+    expect(createJobsRepo(db).get(jobId)!.status).toBe('done');
+  });
+});
+
+// ---- 批4 R2 补测:retry 按 kind 分支 ----
+describe('POST /api/jobs/:id/retry 按 kind 分支(批4)', () => {
+  it('视频任务重试 → 新 job kind 仍为 ytdlp_video,且不参与音频判重(R2-a)', async () => {
+    createAudioItemsRepo(db).create({ title: 't', source_type: 'download', source_url: 'https://a/v', file_path: 'C:/x.mp3', format: 'mp3', duration_sec: 1, file_size: 1 });
+    const jobsRepo = createJobsRepo(db);
+    const jid = jobsRepo.create('ytdlp_video', { url: 'https://a/v', options: { format: 'mp3' }, produce: 'video', title: 't' });
+    jobsRepo.fail(jid, '网络失败');
+    const dm = { start: vi.fn(), cancel: vi.fn(async () => {}), dispose: vi.fn(async () => {}) };
+    makeApp('yt-dlp', 'tok2', dm as unknown as ReturnType<typeof createDownloadManager>);
+    const res = await app.inject({ method: 'POST', url: `/api/jobs/${jid}/retry` });
+    expect(res.statusCode).toBe(201);
+    expect(createJobsRepo(db).get(res.json().jobId as number)!.kind).toBe('ytdlp_video');
+  });
+  it('剪辑任务重试但素材已删 → 409 MEDIA_GONE,文案含「素材已不存在」(R2-b)', async () => {
+    const jobsRepo = createJobsRepo(db);
+    const jid = jobsRepo.create('ffmpeg_clip', { importId: 1, videoPath: join(tempDir, 'gone.mp4'), start: 0, end: 5, format: 'mp3' });
+    jobsRepo.fail(jid, 'ffmpeg 失败');
+    makeApp('yt-dlp', 'tok2');
+    const res = await app.inject({ method: 'POST', url: `/api/jobs/${jid}/retry` });
+    expect(res.statusCode).toBe(409);
+    expect(res.json().error.code).toBe('MEDIA_GONE');
+    expect(res.json().error.message).toContain('素材已不存在');
+  });
+  // M3(修复轮 1,2026-09-30):剪辑任务重试的**成功**路径此前无覆盖——注入 clipStarter 桩捕获调用参数,
+  // videoPath 指向真实存在的临时文件(先过 MEDIA_GONE 拦截)→ 断言 201 + 桩被调且 payload 原样透传 + 新 job kind 仍为 ffmpeg_clip
+  it('剪辑任务重试成功 → 201 + clipStarter 被调且 payload 正确 + 新 job kind 为 ffmpeg_clip(M3)', async () => {
+    const videoPath = join(tempDir, 'media-clip-src.mp4');
+    writeFileSync(videoPath, 'VIDEOBYTES'); // retry 分支 existsSync(videoPath) 要真文件
+    const jobsRepo = createJobsRepo(db);
+    const clipPayload = { importId: 1, videoPath, start: 10, end: 30, format: 'mp3', quality: '192k', title: '前缀', sourceUrl: 'https://a/v' };
+    const oldId = jobsRepo.create('ffmpeg_clip', clipPayload);
+    jobsRepo.fail(oldId, 'ffmpeg 失败'); // 仅 error 可重试(P1-4)
+    const calls: Array<{ jobId: number; payload: unknown }> = [];
+    makeApp('yt-dlp', 'tok2', undefined, undefined, undefined, async (jobId, payload) => { calls.push({ jobId, payload }); });
+    const res = await app.inject({ method: 'POST', url: `/api/jobs/${oldId}/retry` });
+    expect(res.statusCode).toBe(201);
+    const newId = res.json().jobId as number;
+    expect(calls).toEqual([{ jobId: newId, payload: clipPayload }]); // payload 原样透传(JSON 存取往返后深相等)
+    expect(createJobsRepo(db).get(newId)!.kind).toBe('ffmpeg_clip');
+  });
+});
+
+// ---- 批4 R2-c:DELETE /api/imports/:id 连带清素材 ----
+describe('DELETE /api/imports/:id 连带清素材(批4)', () => {
+  it('删来源 → source_videos 行、media 文件、imported_sources 行一并消失', async () => {
+    makeApp('yt-dlp', 'tok2');
+    const importId = createImportsRepo(db).upsertByUrl({ url: 'https://a/v', title: '凡人', site: 'bilibili', kind: 'single', duration_sec: null, entries: null });
+    const p = join(mediaDir, `media-${importId}.mp4`);
+    writeFileSync(p, 'VIDEOBYTES');
+    createSourceVideosRepo(db).upsert({ importId, filePath: p, height: 480, fileSize: 10 });
+    expect((await app.inject({ method: 'DELETE', url: `/api/imports/${importId}` })).statusCode).toBe(200);
+    expect(createImportsRepo(db).get(importId)).toBeNull();
+    expect(createSourceVideosRepo(db).get(importId)).toBeNull();
+    expect(existsSync(p)).toBe(false);
   });
 });

@@ -4,6 +4,8 @@ export interface DownloadOptions {
   section?: { start: number; end: number };
   format: 'mp3' | 'm4a' | 'wav';
   quality?: string;
+  /** 视频素材的清晰度**上限档**(spec 待实测 A 定表达式;默认 480) */
+  videoHeight?: 360 | 480 | 720 | 1080;
 }
 export function buildParseArgs(url: string, cookiePath?: string): string[] {
   const args: string[] = [];
@@ -38,6 +40,29 @@ export function buildDownloadArgs(opts: { url: string; options: DownloadOptions;
   // D6:结构化进度行 percent|downloaded|total
   args.push('--progress-template', '%(progress._percent_str)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s');
   args.push('-o', join(outDir, '%(id)s.%(ext)s'), url);
+  return args;
+}
+/**
+ * 下视频素材(带画面的时间标尺):**不是** -x,而是完整下视频 + 音轨。
+ * 三个硬要求(spec D1/D2 + 待实测 D):
+ * - `bv*+ba`:必须含音轨 —— 剪辑是从这个文件抽音频,只下视频流等于素材没法剪
+ * - `--merge-output-format mp4`:Electron 是 Chromium,mkv 播不了
+ * - 编解码偏好:只锁容器不够,B 站之外可能给 VP9/AV1 + Opus 装进 mp4 后"有画面没声音"
+ *   (偏好名以 spec §0.1 实测 D 的结论为准;2026-09-30 实测:B 站加 -S vcodec:h264,acodec:aac 后落 h264+aac)
+ */
+export function buildVideoDownloadArgs(opts: {
+  url: string; outDir: string; videoHeight: 360 | 480 | 720 | 1080; cookiePath?: string;
+}): string[] {
+  const args: string[] = ['--newline', '--windows-filenames'];
+  if (opts.cookiePath) args.push('--cookies', opts.cookiePath);
+  args.push(
+    '-f', `bv*[height<=${opts.videoHeight}]+ba/b[height<=${opts.videoHeight}]/b`,
+    '-S', 'vcodec:h264,acodec:aac',
+    '--merge-output-format', 'mp4',
+    '--no-playlist',
+  );
+  args.push('--progress-template', '%(progress._percent_str)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s');
+  args.push('-o', join(opts.outDir, '%(id)s.%(ext)s'), opts.url);
   return args;
 }
 import { join } from 'node:path';

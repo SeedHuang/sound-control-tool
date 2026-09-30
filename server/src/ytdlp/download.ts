@@ -12,6 +12,8 @@ export type DownloadEvent =
 
 export interface StartOpts {
   jobId: number; binPath: string; args: string[]; outDir: string;
+  /** 本 job 的产物扩展名集合(音频/视频不同)——**必填**,逼调用方明确表态(spec D5) */
+  exts: string[];
   onEvent: (jobId: number, ev: DownloadEvent) => void;
 }
 export interface DownloadManager {
@@ -19,40 +21,47 @@ export interface DownloadManager {
   cancel(jobId: number): Promise<void>;
   dispose(): Promise<void>;
 }
-// 默认实现:outDir 下 mtime 最新的音频文件(无则 null)
-export function findLatestAudioFile(dir: string): string | null {
+// 产物扩展名集合按媒体类型分两组:完成定位/取消清理都按「本 job 声明的集合」找文件(spec D5)。
+// 视频组多列 .webm/.mkv:实际产物由 --merge-output-format mp4 决定,多列两个防意外。
+export const MEDIA_EXTS_AUDIO = ['.mp3', '.m4a', '.wav'];
+export const MEDIA_EXTS_VIDEO = ['.mp4', '.webm', '.mkv'];
+
+/** 目录里 mtime 最新的、扩展名在 exts 里的文件(无则 null) */
+export function findLatestByExt(dir: string, exts: string[]): string | null {
   try {
-    const audioExt = new Set(['.mp3', '.m4a', '.wav']);
     return (
       readdirSync(dir)
         .map((f) => ({ name: f, p: join(dir, f) }))
-        .filter((f) => audioExt.has(f.name.slice(f.name.lastIndexOf('.'))))
+        .filter((f) => exts.includes(f.name.slice(f.name.lastIndexOf('.')).toLowerCase()))
         .sort((a, b) => statSync(b.p).mtimeMs - statSync(a.p).mtimeMs)[0]?.p ?? null
     );
   } catch {
     return null;
   }
 }
-export function createDownloadManager(deps?: { spawn?: typeof spawn; execFile?: typeof execFile; findLatest?: (dir: string) => string | null }): DownloadManager {
+export function createDownloadManager(deps?: { spawn?: typeof spawn; execFile?: typeof execFile }): DownloadManager {
   const doSpawn = deps?.spawn ?? spawn;
   const doExec = deps?.execFile ?? execFile;
-  const findLatest = deps?.findLatest ?? findLatestAudioFile;
   const active = new Map<number, ChildProcess>();
   const activeOutDir = new Map<number, string>(); // P2-2:cancel 时清理该 job 的 outDir 半成品
+  const activeExts = new Map<number, string[]>(); // spec D5:exts 与 outDir 同生共死,定位/清理产物时按它过滤
   const cancelledJobs = new Set<number>(); // 取消标记:close 时据此发 cancelled 而非 error
   const cleanJobOutputs = (jobId: number, outDir: string): void => {
-    // 删除该 job 刚产出的音频半成品(close 前 findLatest 能定位;cancel 场景下 mtime 最新即本 job 写的)
-    const produced = findLatest(outDir);
+    // 删除该 job 刚产出的产物(按本 job 的 exts 集合定位;cancel 场景下 mtime 最新即本 job 写的)
+    const exts = activeExts.get(jobId) ?? [];
+    const produced = findLatestByExt(outDir, exts);
     if (produced) { try { rmSync(produced, { force: true }); } catch { /* 尽力清理 */ } }
     activeOutDir.delete(jobId);
+    activeExts.delete(jobId);
   };
   return {
     start: (opts) => {
-      const { jobId, binPath, args, outDir, onEvent } = opts;
+      const { jobId, binPath, args, outDir, exts, onEvent } = opts;
       // D7:detached + windowsHide;taskkill 杀整棵树
       const child = doSpawn(binPath, args, { windowsHide: true, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
       active.set(jobId, child);
       activeOutDir.set(jobId, outDir);
+      activeExts.set(jobId, exts);
       cancelledJobs.delete(jobId); // 清除可能残留的取消标记(jobId 复用防护)
       let stderrBuf = '';
       const onStdoutData = (chunk: Buffer) => {
@@ -68,9 +77,10 @@ export function createDownloadManager(deps?: { spawn?: typeof spawn; execFile?: 
       if (child.stderr) child.stderr.on('data', onStderrData);
       else child.on('stderr', onStderrData);
       child.on('error', (err) => {
-        // spawn 失败(如 binPath 缺失):清掉 activeOutDir 作为"终态已发"标记,避免 close 再补发一条 error
+        // spawn 失败(如 binPath 缺失):清掉 activeOutDir/activeExts 作为"终态已发"标记,避免 close 再补发一条 error
         active.delete(jobId);
         activeOutDir.delete(jobId);
+        activeExts.delete(jobId);
         const info = mapYtdlpError({ code: (err as NodeJS.ErrnoException).code, binPath });
         pushLog('error', 'job', `job ${jobId} spawn 失败 code=${(err as NodeJS.ErrnoException).code ?? '?'} message=${err.message.slice(0, 200)}`);
         onEvent(jobId, { type: 'status', state: 'error', message: info.message });
@@ -81,15 +91,19 @@ export function createDownloadManager(deps?: { spawn?: typeof spawn; execFile?: 
         if (cancelledJobs.has(jobId)) {
           // 取消:taskkill /F 后 close 必非零,发 cancelled 而非 error
           cancelledJobs.delete(jobId);
-          activeOutDir.delete(jobId);
+          // 修复(批3审查 round1):被杀子进程的 close 几乎必然先于 taskkill 回调触发,
+          // 半成品必须在这里删(cleanJobOutputs 先读 exts 再删 Map+文件),
+          // 否则 cancel 随后的 cleanJobOutputs 拿到 exts=[] 永远找不到文件,P2-2 被主流时序架空。
+          if (outDir !== undefined) cleanJobOutputs(jobId, outDir);
           onEvent(jobId, { type: 'status', state: 'cancelled', message: '用户取消' });
           return;
         }
         // error 处理器已清掉 activeOutDir → 终态 error 已发,跳过避免重复
         if (outDir === undefined) return;
         if (code === 0) {
-          const produced = findLatest(outDir);
+          const produced = findLatestByExt(outDir, activeExts.get(jobId) ?? []);
           activeOutDir.delete(jobId);
+          activeExts.delete(jobId);
           onEvent(jobId, produced
             ? { type: 'status', state: 'done', producedPath: produced }
             : { type: 'status', state: 'error', message: '下载完成但未找到产物文件' });
@@ -97,7 +111,7 @@ export function createDownloadManager(deps?: { spawn?: typeof spawn; execFile?: 
           // 双保险:taskkill 回调未决时 close 也可能先进 error 分支(通常已被上方 cancelled 分支拦截)
           if (cancelledJobs.has(jobId)) {
             cancelledJobs.delete(jobId);
-            activeOutDir.delete(jobId);
+            cleanJobOutputs(jobId, outDir); // 同上:半成品在这里先删(此时 outDir 必非空,已在上方检查过)
             onEvent(jobId, { type: 'status', state: 'cancelled', message: '用户取消' });
             return;
           }
@@ -128,7 +142,7 @@ export function createDownloadManager(deps?: { spawn?: typeof spawn; execFile?: 
       }
       active.delete(jobId);
       if (outDir !== undefined) {
-        cleanJobOutputs(jobId, outDir); // P2-2:cancel 后清理该 job 的半成品文件
+        cleanJobOutputs(jobId, outDir); // P2-2:cancel 后清理该 job 的半成品文件(按本 job 的 exts 集合)
       }
     },
     dispose: async () => {
@@ -140,6 +154,7 @@ export function createDownloadManager(deps?: { spawn?: typeof spawn; execFile?: 
       }
       active.clear();
       activeOutDir.clear();
+      activeExts.clear();
     },
   };
 }

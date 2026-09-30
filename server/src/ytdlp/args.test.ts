@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { buildDownloadArgs, buildParseArgs, buildWriteThumbnailArgs } from './args.js';
+import { join } from 'node:path';
+import { buildDownloadArgs, buildParseArgs, buildVideoDownloadArgs, buildWriteThumbnailArgs } from './args.js';
 describe('buildParseArgs', () => {
   it('固定 -J --flat-playlist --no-warnings', () => {
     expect(buildParseArgs('https://b23.tv/abc')).toEqual(['-J', '--flat-playlist', '--no-warnings', 'https://b23.tv/abc']);
@@ -57,5 +58,23 @@ describe('cookiePath 注入(--cookies,B 站风控)', () => {
   it('buildDownloadArgs 无 cookiePath → 不含 --cookies', () => {
     const a = buildDownloadArgs({ url: 'u', options: { format: 'mp3' }, outDir: 'D:/tmp' });
     expect(a).not.toContain('--cookies');
+  });
+});
+describe('buildVideoDownloadArgs(下视频做定位素材)', () => {
+  const base = { url: 'https://a/v', outDir: 'C:/tmp/job1', videoHeight: 480 as const };
+  it('不含 -x(那是抽音频,会把视频流丢掉);强制 mp4 合流;要音轨(剪辑从它抽音)', () => {
+    const args = buildVideoDownloadArgs(base);
+    expect(args).not.toContain('-x');
+    expect(args).toContain('--merge-output-format');
+    expect(args[args.indexOf('--merge-output-format') + 1]).toBe('mp4');
+    expect(args.join(' ')).toContain('height<=480');
+  });
+  it('带 cookie 时 --cookies 在 url 之前;输出模板在 outDir 下', () => {
+    const args = buildVideoDownloadArgs({ ...base, cookiePath: 'C:/tmp/ck.txt' });
+    expect(args.indexOf('--cookies')).toBeLessThan(args.indexOf('https://a/v'));
+    expect(args[args.indexOf('-o') + 1]).toBe(join('C:/tmp/job1', '%(id)s.%(ext)s'));
+  });
+  it('进度模板与音频那条一致(前端进度条复用)', () => {
+    expect(buildVideoDownloadArgs(base).join(' ')).toContain('--progress-template');
   });
 });

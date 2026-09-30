@@ -59,6 +59,7 @@ M1 前半使命：**贴一个网页 URL（B 站课程/YouTube/播客等）→ �
 - 失败 4xx/5xx `{ ok:false, error:{...} }`（D9 映射）
 
 **POST `/api/ytdlp/download`**（body: `{ url, options: { entryIndices?: number[], section?: { start:number, end:number }, format:'mp3'|'m4a'|'wav', quality?: string, force?: boolean }, title?: string, durationSec?: number, entryIndex?: number, collectionTitle?: string }`）
+> **2026-09-30 增补（m1c-video-clip）**：body 另接受 `produce?: 'audio'|'video'`（缺省/空串按 `audio`）与 `options.videoHeight?: 360|480|720|1080`（仅 `produce='video'` 有意义，缺省 480）。`produce='video'` 时 job kind 为 `ytdlp_video`、跳过音频判重、产物落 `<数据目录>/media/`（不进 audio_items）；`done` 事件视频支形状见 m1c spec §0.3。
 - `title?`：前端从 parse 结果带入的显示名，作入库 title 与文件名 slug（D5c）。缺省时 finalize 用 `'下载音频'`
 - `entryIndex?` / `collectionTitle?`（**2026-09-29 增补**，用户拍板：音频库要显示「第几集 / 该集自己的名字」）：前端下载合集某集时带入 `entryIndex=条目 index`、`collectionTitle=合集 title`，随 job payload 一起存（retry 复用），入库时写进 `audio_items.entry_index / collection_title`。非法或缺省 → 落 NULL（视为单视频），**不因它拦下载**
 - `durationSec?`：前端从 parse 结果带入（D10），作入库 duration；**`section` 存在时忽略此值，强制 ffprobe 实测**（P1-3 修复：片段产物时长 ≠ 整条时长）；缺省则 ffprobe 兜底
@@ -168,7 +169,7 @@ M1 前半使命：**贴一个网页 URL（B 站课程/YouTube/播客等）→ �
 
 | 页面 | 路由 | 内容 |
 |---|---|---|
-| `acquire.tsx` | `/acquire` | Tab1 URL 下载：输入 URL → parse（重复检测提示）→ 合集勾选（默认勾当前页单条）/片段起止/格式+码率选择 → 提交下载 → SSE 进度条（可取消；合集逐条串行）→ 完成后"去音频库"入口。**2026-09-29 用户拍板**：进度条分两段——① 下载（蓝，真实百分比，来自 `event: progress`）② 入库（绿，`event: phase` 后进入，无百分比可用，用 antd active 动画表示"进行中"）；集数网格 `repeat(auto-fit, minmax(160px,1fr))` 自适应列数并铺满整行。**覆盖下载流程**：整批用 `force:false` 先跑一遍，服务端判重命中的条目返回 409（此时未开始下载，不耗流量）→ 被记下来，整批跑完弹**一次**确认窗（列出第几集、说明会删掉库里旧的那份）→ 用户确认后这批带 `force:true` 再跑一遍 |
+| `acquire.tsx` | `/acquire` | Tab1 URL 下载：输入 URL → parse（重复检测提示）→ 合集勾选（默认勾当前页单条）/格式+码率选择 → 提交下载 → SSE 进度条（可取消；合集逐条串行）→ 完成后"去音频库"入口。**2026-09-29 用户拍板**：进度条分两段——① 下载（蓝，真实百分比，来自 `event: progress`）② 入库（绿，`event: phase` 后进入，无百分比可用，用 antd active 动画表示"进行中"）；集数网格 `repeat(auto-fit, minmax(160px,1fr))` 自适应列数并铺满整行。**覆盖下载流程**：整批用 `force:false` 先跑一遍，服务端判重命中的条目返回 409（此时未开始下载，不耗流量）→ 被记下来，整批跑完弹**一次**确认窗（列出第几集、说明会删掉库里旧的那份）→ 用户确认后这批带 `force:true` 再跑一遍。**漂移修正（2026-09-30 核实）**：原文所写「片段起止」UI **并未实现**——`section` 参数与 `--download-sections` 后端链路在位，但获取页没有起止输入控件（原计划随 S5 剪辑工作台一起做，后被 S2.5 的"画面打点"方案部分取代）。**2026-09-30 增补（S2.5）**：本页顶部加模式切换（下载音频 / 视频预剪音频），新模式见 m1c spec §0.6 |
 | `library.tsx` | `/library` | `GET /api/audio` 列表（antd Empty 空态），行内 `<audio controls src="/api/audio/:id/file?token=..." />` 播放。**2026-09-29 用户拍板增补**：每行显示平台 logo（`site` → `SiteLogo` 官方品牌矢量标）+ 名称（合集条目取 `collection_title`）+ `第 N 集`标签（`entry_index`）+ 该集自己的名字（`title`）+ 原视频地址（`source_url`，`target=_blank`，Electron 侧由 `setWindowOpenHandler` 转系统浏览器）+ 删除；顶部搜索框按名字本地过滤，底部分页（默认 10/页，可 10/20/50）；整页三段式（头/列表自滚/页脚），窄窗自动折行。**视图切换（用户拍板，放在搜索栏右侧）**：`平铺`（逐条列表，即上述）/ `剧集分组`（按 `source_url` 聚合成作品卡片墙：封面 + 平台角标 + 作品名 + 「已下 N 集 / 共 M 集」+ 细进度条 + 最近入库；卡片也分页、`auto-fill` 自适应列数、整块限宽居中）。点卡片**同页换层**进该作品自己的音频列表（顶部「← 返回分组」+ 作品信息行，行 UI 与平铺层完全相同，底部同样分页），搜索框随当前层走（分组层搜作品名/任意集名，作品内只搜这一部）。动效（`src/global.css`）：卡片 `:active` 轻缩 + 真鼠标设备才有的悬停上浮（160ms 强 ease-out）、封面透明淡入、切层/进作品一次 150ms 淡入；全部只动 `transform/opacity` 并尊重 `prefers-reduced-motion` |
 
 `web/src/api.ts` 增补：`parseUrl(url)`、`startDownload(payload)`、`subscribeJob(jobId, { onProgress, onStatus, onDone, onError, signal })`（EventSource + query token）、`cancelJob(jobId)`、`retryJob(jobId)`、`listAudio()`、`audioFileUrl(id, token)`。

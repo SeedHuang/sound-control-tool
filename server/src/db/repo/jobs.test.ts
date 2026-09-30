@@ -50,18 +50,26 @@ describe('jobs repo', () => {
     const repo = createJobsRepo(db);
     const id = repo.create('ytdlp_download', { url: 'https://a/1' });
     repo.update(id, { status: 'running' });
-    expect(repo.findActiveByUrl('https://a/1')?.id).toBe(id);
+    expect(repo.findActiveByUrl('https://a/1', 'ytdlp_download')?.id).toBe(id);
     // 不同 URL 不命中
-    expect(repo.findActiveByUrl('https://b/2')).toBeNull();
+    expect(repo.findActiveByUrl('https://b/2', 'ytdlp_download')).toBeNull();
     // URL 前缀相同不误配("https://a/1x" 不应命中 "https://a/1")
     repo.create('ytdlp_download', { url: 'https://a/1x' });
-    expect(repo.findActiveByUrl('https://a/1')?.id).toBe(id);
+    expect(repo.findActiveByUrl('https://a/1', 'ytdlp_download')?.id).toBe(id);
     // 含 LIKE 通配符的 URL(%20/下划线)不被误配
     repo.create('ytdlp_download', { url: 'https://a/under_score%20x' });
-    expect(repo.findActiveByUrl('https://a/1')?.id).toBe(id);
-    expect(repo.findActiveByUrl('https://a/under_score%20x')?.id).not.toBeUndefined();
+    expect(repo.findActiveByUrl('https://a/1', 'ytdlp_download')?.id).toBe(id);
+    expect(repo.findActiveByUrl('https://a/under_score%20x', 'ytdlp_download')?.id).not.toBeUndefined();
     // finish 后不再命中
     repo.finish(id);
-    expect(repo.findActiveByUrl('https://a/1')).toBeNull();
+    expect(repo.findActiveByUrl('https://a/1', 'ytdlp_download')).toBeNull();
+  });
+
+  it('findActiveByUrl 按 kind 区分:音频任务不挡视频任务', () => {
+    const repo = createJobsRepo(db);
+    const audioId = repo.create('ytdlp_download', { url: 'https://a/x' });
+    expect(repo.findActiveByUrl('https://a/x', 'ytdlp_download')).toEqual({ id: audioId });
+    expect(repo.findActiveByUrl('https://a/x', 'ytdlp_video')).toBeNull();
+    void audioId;
   });
 });

@@ -19,7 +19,7 @@ export interface JobsRepo {
   update(id: number, patch: { status?: JobStatus; progress?: number; message?: string | null }): void;
   finish(id: number, progress?: number): void;
   fail(id: number, message: string): void;
-  findActiveByUrl(url: string): { id: number } | null; // P1-1:防同 URL 并发下载
+  findActiveByUrl(url: string, kind: string): { id: number } | null; // P1-1:防同 URL 并发下载;kind 参数化后音频/视频任务互不挡
 }
 
 export function createJobsRepo(db: DB): JobsRepo {
@@ -57,14 +57,15 @@ export function createJobsRepo(db: DB): JobsRepo {
       db.prepare("UPDATE jobs SET status='done', progress=?, finished_at=datetime('now') WHERE id=?").run(progress, id),
     fail: (id, message) =>
       db.prepare("UPDATE jobs SET status='error', message=?, finished_at=datetime('now') WHERE id=?").run(message, id),
-    findActiveByUrl: (url) => {
+    findActiveByUrl: (url, kind) => {
       // payload 是 JSON 文本;LIKE 匹配 "url":"<escaped>" 子串,避免误配 URL 前缀相同者。
       // LIKE 通配符 %/_ 需转义(URL 可能含 %20、下划线),配合 ESCAPE '\'
+      // kind 参数化(批3 Task 6):音频(ytdlp_download)/视频(ytdlp_video)任务互不挡 —— 同 URL 可同时挂音频下载与视频素材下载
       const needle = JSON.stringify({ url }).slice(1, -1); // "url":"<escaped>"
       const esc = needle.replace(/[\\%_]/g, (c) => `\\${c}`);
       const row = db
-        .prepare("SELECT id FROM jobs WHERE kind='ytdlp_download' AND status IN ('pending','running') AND payload LIKE ? ESCAPE '\\'")
-        .get(`%${esc}%`);
+        .prepare("SELECT id FROM jobs WHERE kind=? AND status IN ('pending','running') AND payload LIKE ? ESCAPE '\\'")
+        .get(kind, `%${esc}%`);
       return row && typeof (row as { id: unknown }).id === 'number' ? { id: (row as { id: number }).id } : null;
     },
   };

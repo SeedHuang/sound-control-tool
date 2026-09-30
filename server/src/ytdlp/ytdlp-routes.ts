@@ -5,6 +5,7 @@ import { createReadStream, existsSync, mkdirSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import type { DB } from '../db/index.js';
 import { isAllowedOrigin, isAllowedLocalOrigin, isLocalPageReferer } from '../http/cors.js';
+import { sendFileWithRange } from '../http/file-range.js';
 import { clearLogs, getLogs, pushLog } from '../logs.js';
 import { createAudioItemsRepo, type AudioItemRow, type AudioItemsRepo } from '../db/repo/audio-items.js';
 import { deleteAudioFile } from '../audio-files.js';
@@ -12,35 +13,19 @@ import { coverMime, fetchAndStoreCover, findCoverFile, listCoverImportIds, write
 import { createJobsRepo } from '../db/repo/jobs.js';
 import { createSettingsRepo } from '../db/repo/settings.js';
 import { BILI_COOKIE_KEY, SETTINGS_KEYS } from '../settings-keys.js';
-import { buildDownloadArgs } from './args.js';
+import { buildDownloadArgs, buildVideoDownloadArgs } from './args.js';
 import { countCookies, getSessdataExpiry, materializeCookieFile, normalizeCookieContent, toCookieHeader } from './cookies.js';
 import { validateBiliLogin } from './bili-login.js';
 import { createImportsRepo, detectSite } from '../db/repo/imports.js';
-import type { DownloadManager } from './download.js';
+import { MEDIA_EXTS_AUDIO, MEDIA_EXTS_VIDEO, type DownloadManager } from './download.js';
 import { mapYtdlpError } from './errors.js';
 import { probeDuration } from './ffprobe.js';
 import { ingestDownloadedFile } from './ingest.js';
 import { parseMetadata, YtdlpRunError } from './parse.js';
-
-// SSE 事件桥(Task 6):模块级连接表,事件写入后终态(done/error/cancelled)断开,progress/running 保持
-type SseConn = { write: (s: string) => void; end: () => void };
-const sseConnections = new Map<number, Set<SseConn>>();
-// 终态:done/error/cancelled 事件后断开连接(progress/running 不断开)
-const TERMINAL_STATES = new Set(['done', 'error', 'cancelled']);
-// 诊断日志:每个 job 只在 25/50/75/100 档位变化时记一行进度(逐条进度行会把日志面板刷成噪声)
-const lastProgressBucket = new Map<number, number>();
-function emit(jobId: number, ev: unknown): void {
-  const set = sseConnections.get(jobId);
-  if (!set) return;
-  const type = (ev as { type: string }).type;
-  const state = type === 'status' ? (ev as { state?: string }).state : type;
-  for (const conn of set) conn.write(`event: ${type}\ndata: ${JSON.stringify(ev)}\n\n`);
-  if (type === 'done' || (type === 'status' && state && TERMINAL_STATES.has(state))) {
-    for (const conn of set) conn.end();
-    sseConnections.delete(jobId);
-    lastProgressBucket.delete(jobId); // 终态清理,防 Map 无界增长
-  }
-}
+import { createSourceVideosRepo } from '../db/repo/source-videos.js';
+import { deleteVideoFiles, placeVideo } from '../media/media-files.js';
+// SSE 事件桥(2026-09-29 抽到 job-events.ts):下载路由与媒体剪辑路由共用,连接表/节流状态都在那边
+import { addSseConnection, emit, logSseClose, progressBucketChanged, removeSseConnection, type SseConn } from './job-events.js';
 
 // Task 7:文件流 Content-Type 按扩展名映射——给 <audio> 标签可识别的 MIME,未知格式回退 octet-stream
 const MIME: Record<string, string> = { mp3: 'audio/mpeg', m4a: 'audio/mp4', wav: 'audio/wav' };
@@ -50,6 +35,10 @@ export interface YtdlpDeps {
   binProvider: () => Promise<{ path: string | null }>;
   downloadManager: DownloadManager;
   audioDir: string; tempDir: string; token: string;
+  /** 视频素材目录(2026-09-29 spec m1c-video-clip):<数据>/media —— produce=video 的 finalize 把素材落这里 */
+  mediaDir: string;
+  /** 剪辑启动器(Task 10 注入):retry 遇到 ffmpeg_clip 任务时把新任务交给它;未接线时 retry 返回 501 NOT_WIRED */
+  clipStarter?: (jobId: number, payload: unknown) => Promise<void>;
   /** 封面抓取(2026-09-29):默认走 covers.ts 的真实实现(带 Referer 抓 B 站图床);单测注入桩,避免真发网络 */
   coverFetcher?: CoverFetcher;
   /** 封面兜底抓法:让 yt-dlp 自己写图(--write-thumbnail)。外网图床只能走它(Node fetch 不走系统代理) */
@@ -65,6 +54,8 @@ export type CoverWriter = (opts: { url: string; coversDir: string; importId: num
 export interface DownloadJobPayload {
   url: string;
   options: Record<string, unknown>;
+  /** 产物类型(2026-09-29 spec m1c-video-clip):audio → 音频库;video → 视频素材(media/ + source_videos);缺省按 audio */
+  produce?: 'audio' | 'video';
   title?: string;
   durationSec?: number;
   entryIndex?: number | null;      // 合集第几集(1 起);单视频不传
@@ -102,7 +93,7 @@ function replaceSameItems(audioRepo: AudioItemsRepo, opts: { url: string; entryI
 
 // 模块级辅助(在 registerYtdlpRoutes 外,通过参数注入 deps 更易测;此处为可注入闭包工厂)
 function createDownloadHandlers(deps: YtdlpDeps) {
-  const { db, binProvider, downloadManager, audioDir, tempDir, token } = deps;
+  const { db, binProvider, downloadManager, audioDir, mediaDir, tempDir, token } = deps;
   const jobsRepo = createJobsRepo(db);
   const audioRepo = createAudioItemsRepo(db);
   let ffprobePath: string | null = null; // 首次用时惰性探测
@@ -150,9 +141,48 @@ function createDownloadHandlers(deps: YtdlpDeps) {
       emit(jobId, { type: 'status', state: 'error', message: msg });
     }
   }
+  /**
+   * 视频素材 finalize(spec §0.3/§0.4,2026-09-29 m1c-video-clip):落 <数据>/media/,记 source_videos,**不进 audio_items**。
+   * 失败语义与音频一致:置 error/推 SSE;但"目标被占用"是**本体失败**,必须报错(spec §0.4 第 2 条,placeVideo 会报)。
+   */
+  async function finalizeVideoDownload(jobId: number, payload: DownloadJobPayload, producedPath: string, videoHeight: number): Promise<void> {
+    try {
+      const importsRepo = createImportsRepo(db);
+      // importId 反查(spec §0.3):UI 流程 parse 必先跑过;直接打 API 可能没有 → 兜底 upsert,不在下载中途报错
+      let row = importsRepo.getByUrl(payload.url);
+      if (row === null) {
+        const id = importsRepo.upsertByUrl({
+          url: payload.url, title: payload.title ?? '未命名', site: detectSite(payload.url),
+          kind: 'single', duration_sec: null, entries: null,
+        });
+        row = importsRepo.get(id);
+      }
+      if (row === null) throw new Error('导入来源反查失败');
+      const ext = producedPath.slice(producedPath.lastIndexOf('.') + 1).toLowerCase();
+      const videosRepo = createSourceVideosRepo(db);
+      // 批4 裁定 R6:placeVideo 收「该来源当前登记的 file_path」(null=从未登记过),用于覆盖/避让判定
+      const registeredPath = videosRepo.get(row.id)?.file_path ?? null;
+      const placed = placeVideo({ tmpPath: producedPath, mediaDir, importId: row.id, ext, registeredPath });
+      if (!placed.ok) throw new Error(placed.message);
+      const size = statSync(placed.path).size;
+      // 批4 裁定 R6:落库路径必须用 placed.path 原样(Windows 反斜杠风格,不 normalize,与磁盘真实路径逐字节一致)
+      videosRepo.upsert({ importId: row.id, filePath: placed.path, height: videoHeight, fileSize: size });
+      jobsRepo.finish(jobId);
+      pushLog('info', 'job', `job ${jobId} done → video import=${row.id} @ ${placed.path} height=${videoHeight} bytes=${size}`);
+      emit(jobId, { type: 'done', kind: 'video', importId: row.id, title: row.title, filePath: placed.path, height: videoHeight, fileSize: size });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      jobsRepo.fail(jobId, msg);
+      pushLog('error', 'job', `job ${jobId} 视频入库失败: ${msg}`);
+      emit(jobId, { type: 'status', state: 'error', message: msg });
+    }
+  }
   async function startDownload(jobId: number, payload: DownloadJobPayload): Promise<void> {
     jobsRepo.update(jobId, { status: 'running' });
-    const opt = (payload.options ?? {}) as { entryIndices?: number[]; section?: { start: number; end: number }; format?: string; quality?: string };
+    const opt = (payload.options ?? {}) as { entryIndices?: number[]; section?: { start: number; end: number }; format?: string; quality?: string; videoHeight?: unknown };
+    // produce 分支(2026-09-29 spec m1c-video-clip):视频素材下完整视频(带音轨,后面要从它抽音频);音频走原有 -x 抽音轨
+    const produce = payload.produce === 'video' ? 'video' : 'audio';
+    const videoHeight = (Number((opt as { videoHeight?: unknown }).videoHeight ?? 480) as 360 | 480 | 720 | 1080);
     const bin = await binProvider();
     if (!bin.path) {
       const msg = mapYtdlpError({ binPath: null }).message;
@@ -165,39 +195,42 @@ function createDownloadHandlers(deps: YtdlpDeps) {
     // 并发不同 URL 共享 tempDir 时,取消会误删别的 job 产物、close 会 findLatest 到对方文件(title/content 串库)
     const jobOutDir = join(tempDir, 'job' + jobId);
     mkdirSync(jobOutDir, { recursive: true });
-    const args = buildDownloadArgs({
-      url: payload.url,
-      options: {
-        entryIndices: opt.entryIndices,
-        section: opt.section,
-        format: (opt.format ?? 'mp3') as 'mp3' | 'm4a' | 'wav',
-        quality: opt.quality,
-      },
-      outDir: jobOutDir,
-      cookiePath: resolveCookiePath(db, audioDir), // B 站 Cookie:设置里有就注入 --cookies(未设置/物化失败 → undefined,照常下载)
-    });
+    const args = produce === 'video'
+      ? buildVideoDownloadArgs({ url: payload.url, outDir: jobOutDir, videoHeight, cookiePath: resolveCookiePath(db, audioDir) })
+      : buildDownloadArgs({
+          url: payload.url,
+          options: {
+            entryIndices: opt.entryIndices,
+            section: opt.section,
+            format: (opt.format ?? 'mp3') as 'mp3' | 'm4a' | 'wav',
+            quality: opt.quality,
+          },
+          outDir: jobOutDir,
+          cookiePath: resolveCookiePath(db, audioDir), // B 站 Cookie:设置里有就注入 --cookies(未设置/物化失败 → undefined,照常下载)
+        });
     pushLog('info', 'job', `job ${jobId} spawn yt-dlp bin=${bin.path}`); // 诊断日志:记录实际用的二进制路径
     downloadManager.start({
       jobId, binPath: bin.path, args, outDir: jobOutDir,
+      // spec D5:本 job 的产物扩展名集合必填——音频组/视频组按 produce 切换(定位产物与取消清理都按它过滤)
+      exts: produce === 'video' ? MEDIA_EXTS_VIDEO : MEDIA_EXTS_AUDIO,
       onEvent: (jid, ev) => {
         if (ev.type === 'progress') {
           jobsRepo.update(jid, { progress: ev.percent });
-          // 诊断日志只记 25/50/75/100 档位变化(逐条进度行会把日志面板刷成噪声)
-          const bucket = Math.floor(ev.percent / 25);
-          if (lastProgressBucket.get(jid) !== bucket) {
-            lastProgressBucket.set(jid, bucket);
+          if (progressBucketChanged(jid, ev.percent)) {
             pushLog('info', 'job', `job ${jid} 进度 ${Math.round(ev.percent)}%`);
           }
           emit(jid, ev); // Critical 修复:进度事件推给该 job 的所有 SSE 连接(前端进度条依赖;emit 把 type 写进 event 行)
         }
         if (ev.type === 'status' && ev.state === 'done' && ev.producedPath) {
           // 阶段信号(2026-09-29 用户拍板:进度条分两段——① 下载 ② 入库):
-          // 下载进程结束了,但东西还没进音频库——后面还有 ffprobe 测时长、改名、写库三步(实测约 4 秒)。
+          // 下载进程结束了,但东西还没进库——后面还有 ffprobe 测时长、改名、写库几步。
           // 先把「进入入库」推给前端,进度条才能从下载段切到入库段;
           // 否则进度条停在 100% 而库里还是空,用户会以为下好了跑去看列表(就是这次踩的坑)。
-          pushLog('info', 'job', `job ${jid} 下载完成 → 进入入库(ffprobe + rename + INSERT)`);
+          pushLog('info', 'job', `job ${jid} 下载完成 → 进入入库`);
           emit(jid, { type: 'phase', phase: 'ingest' });
-          void finalizeDownload(jid, payload, ev.producedPath);
+          // 视频支(2026-09-29 spec m1c-video-clip):落 media/ 记 source_videos,不进 audio_items
+          if (produce === 'video') void finalizeVideoDownload(jid, payload, ev.producedPath, videoHeight);
+          else void finalizeDownload(jid, payload, ev.producedPath);
         }
         if (ev.type === 'status' && ev.state === 'error' && ev.message) {
           jobsRepo.fail(jid, ev.message);
@@ -207,11 +240,11 @@ function createDownloadHandlers(deps: YtdlpDeps) {
       },
     });
   }
-  return { startDownload, finalizeDownload, getFfprobe };
+  return { startDownload, finalizeDownload, finalizeVideoDownload, getFfprobe };
 }
 
 export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void {
-  const { db, binProvider, token, downloadManager, audioDir } = deps;
+  const { db, binProvider, token, downloadManager, audioDir, mediaDir } = deps;
   const audioRepo = createAudioItemsRepo(db);
   const importsRepo = createImportsRepo(db);
   // 封面目录:与音频同级(audioDir = <数据目录>/audio → <数据目录>/covers),沿用 D4「与 db 同数据目录」的约定
@@ -303,26 +336,43 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
         return reply.code(400).send({ ok: false, error: { code: 'BAD_REQUEST', message: 'entryIndices 必须为单个正整数条目,多选请逐条提交', next: '重新勾选合集条目(逐条下载)' } });
       }
     }
+    // produce(2026-09-29 spec m1c-video-clip):空串/null/undefined 都按 audio(前端"没选"不是非法)
+    const rawProduce = (body as { produce?: unknown }).produce;
+    const blankProduce = rawProduce === undefined || rawProduce === null || rawProduce === '';
+    if (!blankProduce && rawProduce !== 'audio' && rawProduce !== 'video') {
+      return reply.code(400).send({ ok: false, error: { code: 'BAD_REQUEST', message: 'produce 只能是 audio 或 video', next: '选择产物类型' } });
+    }
+    const produce: 'audio' | 'video' = rawProduce === 'video' ? 'video' : 'audio';
+
+    const videoHeightRaw = (opt as { videoHeight?: unknown }).videoHeight;
+    const videoHeight = Number(videoHeightRaw ?? 480);
+    if (produce === 'video' && ![360, 480, 720, 1080].includes(videoHeight)) {
+      return reply.code(400).send({ ok: false, error: { code: 'BAD_REQUEST', message: 'videoHeight 只能是 360|480|720|1080', next: '选择清晰度' } });
+    }
     // 判重(2026-09-29 用户拍板:条目也要判重,确认后可覆盖):
     // 历史上只对「单视频整条」按网址判重——因为合集里每集共用同一个番剧网址,按网址一刀切会把第 2 集起全拦死,
     // 于是当时干脆关掉了条目判重;后果是同一集重下会静默留下两份(用户实测踩到,手动删过一次)。
     // 现在库里已记「第几集」,可按 网址 + 第几集 精确判重(老库没记集数的行按标题兜底,见 repo.findSameItem)。
     // 命中且未确认覆盖 → 409(此时还没 spawn 下载,不浪费流量):前端弹窗问过用户后带 force 重发。
-    // 本请求的「第几集」:以真正驱动下载的 options.entryIndices 为准(前面已校验为单个正整数),兼容只带 body.entryIndex 的写法
+    // 本请求的「第几集」:以真正驱动下载的 options.entryIndices 为准(前面已校验为单个正整数),兼容只带 body.entryIndex 的写法。
+    // 批4(spec §0.3):判重**只在音频支做**——视频重复下就是"覆盖素材",被 409 拦住就没法换清晰度了。
     const entryIndex = Array.isArray(opt.entryIndices) && typeof opt.entryIndices[0] === 'number'
       ? opt.entryIndices[0]
       : (typeof body.entryIndex === 'number' && Number.isInteger(body.entryIndex) && body.entryIndex > 0 ? body.entryIndex : null);
-    const existing = audioRepo.findSameItem(url, entryIndex, typeof body.title === 'string' ? body.title : '');
-    if (existing.length > 0 && opt.force !== true) {
-      const first = existing[0]!;
-      const what = entryIndex !== null ? `第 ${entryIndex} 集` : `《${first.title}》`;
-      return reply.code(409).send({
-        ok: false,
-        error: { code: 'DUPLICATE', message: `库中已存在${what}`, next: '确认重新下载会删掉库里原来那一份(文件也删),只保留新下的' },
-      });
+    if (produce === 'audio') {
+      const existing = audioRepo.findSameItem(url, entryIndex, typeof body.title === 'string' ? body.title : '');
+      if (existing.length > 0 && opt.force !== true) {
+        const first = existing[0]!;
+        const what = entryIndex !== null ? `第 ${entryIndex} 集` : `《${first.title}》`;
+        return reply.code(409).send({
+          ok: false,
+          error: { code: 'DUPLICATE', message: `库中已存在${what}`, next: '确认重新下载会删掉库里原来那一份(文件也删),只保留新下的' },
+        });
+      }
     }
-    // P1-1:同 URL 并发——已有 running/pending 的 ytdlp_download job 时拒绝(无论 force,防两进程写同一输出文件)
-    const activeJob = createJobsRepo(db).findActiveByUrl(url);
+    // P1-1:同 URL 并发——两支都挡,但各查各的 kind(批4 spec §0.3):两个视频任务并发会写同一个 media-<id>.<ext>,
+    // 后一个覆盖前一个,必须挡;音频/视频互不挡(kind 参数化,同 URL 可同时挂音频下载与视频素材下载)
+    const activeJob = createJobsRepo(db).findActiveByUrl(url, produce === 'video' ? 'ytdlp_video' : 'ytdlp_download');
     if (activeJob) {
       return reply.code(409).send({ ok: false, error: { code: 'BUSY', message: '该 URL 正在下载中', next: '等待当前下载结束或先取消再重试' } });
     }
@@ -335,13 +385,14 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
     const collectionTitle =
       typeof body.collectionTitle === 'string' && body.collectionTitle.trim().length > 0 ? body.collectionTitle.trim() : null;
     const payload: DownloadJobPayload = {
-      url, options: body.options ?? {},
+      url, options: body.options ?? {}, produce,
       title: typeof body.title === 'string' ? body.title : undefined,
       durationSec: typeof body.durationSec === 'number' ? body.durationSec : undefined,
       entryIndex, collectionTitle,
     };
-    const jobId = jobsRepo.create('ytdlp_download', payload);
-    pushLog('info', 'job', `job ${jobId} created url=${url} format=${String(opt.format)}`); // 诊断日志:任务创建留痕
+    // kind 按支选(2026-09-29 spec m1c-video-clip):视频任务记 ytdlp_video,retry/并发检查都按 kind 区分
+    const jobId = jobsRepo.create(produce === 'video' ? 'ytdlp_video' : 'ytdlp_download', payload);
+    pushLog('info', 'job', `job ${jobId} created url=${url} format=${String(opt.format)}${produce === 'video' ? ' produce=video' : ''}`); // 诊断日志:任务创建留痕
     await startDownload(jobId, payload);
     return reply.code(201).send({ ok: true, jobId });
   });
@@ -517,6 +568,14 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
     const id = Number((req.params as { id: string }).id);
     if (!Number.isInteger(id) || id <= 0) return reply.code(404).send({ ok: false, error: { code: 'NOT_FOUND', message: '来源不存在', next: '' } });
     const ok = importsRepo.delete(id);
+    // 素材一并清(批4 spec §0.4,R2-c):库没开外键,级联不会发生,必须显式删 ——
+    // 先删磁盘文件(按前缀扫,DB 行还在时读得到路径;删文件失败不让接口失败),再删 source_videos 行
+    const v = createSourceVideosRepo(db).get(id);
+    if (v !== null) {
+      const r = deleteVideoFiles(mediaDir, id);
+      createSourceVideosRepo(db).delete(id);
+      pushLog('info', 'media', `来源 ${id} 删除 → 连带删素材 deleted=${r.deleted.length} failed=${r.failed.length}`);
+    }
     // 顺手清掉这个来源的封面失败冷却(2026-09-29 评审补):id 是自增的,不清就会随进程一直攒着(慢泄漏)。
     // 正在抓的那发不动 —— 它的 finally 自己会从 coverInFlight 里摘掉。
     coverFailedAt.delete(id);
@@ -559,16 +618,12 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
     raw.flushHeaders();
     // M2:写前判 writableEnded——终态后连接已 end,心跳/补发再写会触发 ERR_STREAM_WRITE_AFTER_END
     const conn: SseConn = { write: (s) => { if (!raw.writableEnded) raw.write(s); }, end: () => raw.end() };
-    if (!sseConnections.has(id)) sseConnections.set(id, new Set());
-    sseConnections.get(id)!.add(conn);
+    addSseConnection(id, conn);
     // 心跳:15s 一次,保连接不被中间代理掐断(writableEnded 守卫同上)
     const heartbeat = setInterval(() => { if (!raw.writableEnded) raw.write(': ping\n\n'); }, 15_000);
     req.raw.on('close', () => {
       clearInterval(heartbeat);
-      sseConnections.get(id)?.delete(conn);
-      if (sseConnections.get(id)?.size === 0) sseConnections.delete(id);
-      // 诊断日志:客户端断开要留痕——浏览器关 tab / 心跳超时 / 浏览器 cancel,排查 SSE 异常中断必备
-      pushLog('info', 'job', `SSE close job=${id} remaining=${sseConnections.get(id)?.size ?? 0}`);
+      logSseClose(id, removeSseConnection(id, conn));
     });
     // 已结束的 job 立即补发终态
     if (['done', 'error', 'cancelled'].includes(job.status)) {
@@ -610,20 +665,40 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
     try { payload = JSON.parse(old.payload) as Partial<DownloadJobPayload>; } catch {
       return reply.code(400).send({ ok: false, error: { code: 'BAD_REQUEST', message: '原任务参数损坏，无法重试', next: '重新提交下载' } });
     }
+    // 批4(2026-09-29 spec m1c-video-clip):重试按旧 job 的 kind 分支——
+    // 视频任务沿用 ytdlp_video;剪辑任务交给剪辑启动器(Task 10 注入,素材没了要先拦);
+    // 其余(含老数据)一律按音频下载重试。剪辑分支必须在 url 校验**之前**:剪辑载荷没有 url 字段
+    const kind = old.kind === 'ytdlp_video' ? 'ytdlp_video' : old.kind === 'ffmpeg_clip' ? 'ffmpeg_clip' : 'ytdlp_download';
+    if (kind === 'ffmpeg_clip') {
+      const clipPayload = JSON.parse(old.payload) as { videoPath?: string };
+      if (typeof clipPayload.videoPath !== 'string' || !existsSync(clipPayload.videoPath)) {
+        return reply.code(409).send({ ok: false, error: { code: 'MEDIA_GONE', message: '素材已不存在，请重新下载视频', next: '回到获取页重新下视频' } });
+      }
+      if (deps.clipStarter === undefined) return reply.code(500).send({ ok: false, error: { code: 'NOT_WIRED', message: '剪辑重试未接线', next: '' } });
+      const newId = jobsRepo.create('ffmpeg_clip', clipPayload);
+      pushLog('info', 'clip', `job ${newId} created by retry of ${id}`); // 诊断日志:重试也留痕
+      // 不 await(R7,2026-09-30):与 POST /api/media/:id/clip 同款 job 语义——201 立即返回,
+      // 前端拿到 jobId 先建 SSE 订阅,异步剪辑完成后事件才有人收;await 会让 done 事件在无订阅者时发出即丢
+      void deps.clipStarter(newId, clipPayload);
+      return reply.code(201).send({ ok: true, jobId: newId });
+    }
     if (typeof payload.url !== 'string') {
       return reply.code(400).send({ ok: false, error: { code: 'BAD_REQUEST', message: '原任务缺少 url，无法重试', next: '重新提交下载' } });
     }
-    // P1-4:建新 job 前同样过并发检查——防"旧 job 已 error 但同 URL 另有 running job"的窗口
-    const activeJob = jobsRepo.findActiveByUrl(payload.url);
+    // P1-4:建新 job 前同样过并发检查——防"旧 job 已 error 但同 URL 另有 running job"的窗口;
+    // 批4:按重试目标自己的 kind 查(视频重试挡视频并发,不挡音频)
+    const activeJob = jobsRepo.findActiveByUrl(payload.url, kind);
     if (activeJob) {
       return reply.code(409).send({ ok: false, error: { code: 'BUSY', message: '该 URL 正在下载中', next: '等待当前下载结束或先取消再重试' } });
     }
-    const newId = jobsRepo.create('ytdlp_download', payload);
+    const newId = jobsRepo.create(kind, payload);
     jobsRepo.update(newId, { status: 'running' });
-    // 复用 Task 5 的 startDownload;原 title/durationSec/剧集字段一并透传(否则重试后标题回落"下载音频"、第几集丢失)
+    // 复用 Task 5 的 startDownload;原 title/durationSec/剧集字段一并透传(否则重试后标题回落"下载音频"、第几集丢失);
+    // 批4:produce 一并透传(视频任务重试必须仍走视频支,否则会退回音频支下成 mp3)
     await startDownload(newId, {
       url: payload.url,
       options: (payload.options ?? {}) as Record<string, unknown>,
+      produce: payload.produce === 'video' ? 'video' : 'audio',
       title: typeof payload.title === 'string' ? payload.title : undefined,
       durationSec: typeof payload.durationSec === 'number' ? payload.durationSec : undefined,
       entryIndex: typeof payload.entryIndex === 'number' ? payload.entryIndex : null,
@@ -697,29 +772,13 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
     if (!item) return reply.code(404).send({ ok: false, error: { code: 'NOT_FOUND', message: '音频不存在', next: '' } });
     if (!existsSync(item.file_path)) return reply.code(404).send({ ok: false, error: { code: 'FILE_MISSING', message: '文件已丢失', next: '' } });
     const stat = statSync(item.file_path);
-    // Range 支持(2026-09-29 用户反馈:音频进度条拉不动)——浏览器拖动进度条发 Range 头期待 206 部分内容;
-    // 之前声明 accept-ranges 却永远回 200 全量,浏览器锁死进度条。现在真正处理 Range:
-    const range = req.headers.range;
-    reply
-      .header('content-type', MIME[item.format] ?? 'application/octet-stream')
-      .header('content-disposition', 'inline')
-      .header('accept-ranges', 'bytes');
-    const m = typeof range === 'string' ? /^bytes=(\d*)-(\d*)$/.exec(range.trim()) : null;
-    if (m !== null && ((m[1] ?? '') !== '' || (m[2] ?? '') !== '')) {
-      const size = stat.size;
-      const startRaw = m[1] ?? '';
-      const endRaw = m[2] ?? '';
-      const start = startRaw !== '' ? parseInt(startRaw, 10) : 0;
-      const end = endRaw !== '' ? Math.min(parseInt(endRaw, 10), size - 1) : size - 1;
-      if (Number.isNaN(start) || Number.isNaN(end) || start > end || start >= size) {
-        reply.header('content-range', `bytes */${size}`);
-        return reply.code(416).send();
-      }
-      reply.code(206).header('content-range', `bytes ${start}-${end}/${size}`).header('content-length', end - start + 1);
-      return reply.send(createReadStream(item.file_path, { start, end }));
-    }
-    reply.header('content-length', stat.size);
-    return reply.send(createReadStream(item.file_path));
+    // Range 支持(2026-09-29 用户反馈:音频进度条拉不动)——2026-09-30 抽到 http/file-range.ts,
+    // 视频播放路由将共用同一套 Range 语义(spec D11/D12),不再各写一份
+    return sendFileWithRange(req, reply, {
+      filePath: item.file_path,
+      size: stat.size,
+      contentType: MIME[item.format] ?? 'application/octet-stream',
+    });
   });
 
   // 2026-09-29 新增:DELETE /api/audio/:id —— 同时删 DB 行 + 磁盘文件

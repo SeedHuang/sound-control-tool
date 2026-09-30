@@ -13,6 +13,8 @@ import { probeBin } from './bins.js';
 import { SETTINGS_KEYS } from './settings-keys.js';
 import { createDownloadManager } from './ytdlp/download.js';
 import { registerYtdlpRoutes } from './ytdlp/ytdlp-routes.js';
+import { startClipJob, type ClipJobPayload } from './media/clip-job.js';
+import { registerMediaRoutes } from './media/media-routes.js';
 
 export { bootstrap } from './bootstrap.js';
 
@@ -60,6 +62,9 @@ export async function createServer(opts: CreateServerOpts): Promise<{
     // D4:audioDir 与 db 同目录
     const audioDir = path.join(path.dirname(opts.dbPath), 'audio');
     mkdirSync(audioDir, { recursive: true });
+    // 视频素材目录(2026-09-29 spec m1c-video-clip):与 db 同级 media/,produce=video 下载落这里
+    const mediaDir = path.join(path.dirname(opts.dbPath), 'media');
+    mkdirSync(mediaDir, { recursive: true });
     // 日志文件落盘根目录(2026-09-29 用户拍板:日志按 天/小时 落文件,与 db 同级 logs/)。
     // :memory: 是测试库 → 不落盘,避免测试运行往仓库 cwd 写 logs/
     if (!opts.dbPath.includes(':memory:')) initFileLogging(path.join(path.dirname(opts.dbPath), 'logs'));
@@ -72,8 +77,15 @@ export async function createServer(opts: CreateServerOpts): Promise<{
         const p = await probeBin('yt-dlp', explicit ?? undefined);
         return { path: p.path };
       },
-      downloadManager, audioDir, tempDir: opts.tempDir, token,
+      downloadManager, audioDir, mediaDir, tempDir: opts.tempDir, token,
+      // 剪辑启动器注入(批4 Task 10):ytdlp-routes 的 retry 分支遇到 ffmpeg_clip 任务时把新任务交给它 ——
+      // 两条触发路径(POST /api/media/:id/clip 与重试)共用同一个 startClipJob,不会各写一份
+      clipStarter: async (jobId, payload) => {
+        await startClipJob(jobId, payload as ClipJobPayload, { db, audioDir, tempDir: opts.tempDir });
+      },
     });
+    // 媒体素材路由(批4 Task 10):列表 / 视频流(Range) / 删素材 / 剪音频(放在 ytdlp 之后)
+    registerMediaRoutes(app, { db, audioDir, tempDir: opts.tempDir, mediaDir, token });
 
     // onRequest 守卫(路由注册之后、listen 之前);OPTIONS 必须跳过——预检交 cors 通配路由,否则被 401
     app.addHook('onRequest', async (req, reply) => {
@@ -85,6 +97,8 @@ export async function createServer(opts: CreateServerOpts): Promise<{
       // D3:SSE 与音频文件端点无法设 header(EventSource/<audio>),token 走 query——豁免 header 校验,由路由内 query 校验接管
       if (/^\/api\/jobs\/\d+\/events$/.test(pathname)) return;
       if (/^\/api\/audio\/\d+\/file$/.test(pathname)) return;
+      // 视频素材文件(批4 Task 10):<video> 与 <audio> 同款——带不了 header,守卫豁免后由路由内 query token / Referer 判定接管
+      if (/^\/api\/media\/\d+\/file$/.test(pathname)) return;
       // 作品封面同属这一类(<img> 也加不了 header):2026-09-29 浏览器实测漏网——守卫没豁免它,
       // 于是封面一律 401、卡片全退成纯色(路由内的 query token / Referer 判定根本没机会跑)
       if (/^\/api\/imports\/\d+\/cover$/.test(pathname)) return;

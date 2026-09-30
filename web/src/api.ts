@@ -126,7 +126,8 @@ export interface DownloadPayload {
   durationSec?: number;
   entryIndex?: number;      // 合集第几集(1 起);单视频不传(2026-09-29 用户拍板:音频库要显示第几集)
   collectionTitle?: string; // 所属合集标题;单视频不传
-  options: { entryIndices?: number[]; section?: { start: number; end: number }; format: 'mp3' | 'm4a' | 'wav'; quality?: string; force?: boolean };
+  options: { entryIndices?: number[]; section?: { start: number; end: number }; videoHeight?: 360 | 480 | 720 | 1080; format: 'mp3' | 'm4a' | 'wav'; quality?: string; force?: boolean };
+  produce?: 'audio' | 'video'; // 产物类型(2026-09-29 spec m1c-video-clip):video=下完整视频素材(带音轨),缺省 audio=抽音轨
 }
 
 export async function parseUrl(url: string): Promise<ParseResponse> {
@@ -139,6 +140,39 @@ export async function startDownload(payload: DownloadPayload): Promise<{ ok: boo
   const r = await apiPost<{ ok: boolean; jobId: number }>('/api/ytdlp/download', payload);
   logFe('info', `下载已提交 jobId=${r.jobId}`); // 诊断日志:提交留痕,与后端 job created 行可对账
   return r;
+}
+
+// ---- 视频素材(2026-09-29 spec m1c-video-clip:视频当"带画面的时间标尺",只用于定位,不进音频库) ----
+export interface MediaItem {
+  import_id: number; url: string; title: string; site: string;
+  height: number | null;          // 下载时选的档位(不是实测分辨率)
+  file_size: number | null;
+  created_at: string;
+}
+
+export async function listMedia(): Promise<MediaItem[]> {
+  const r = await apiGet<{ ok: boolean; media: MediaItem[] }>('/api/media');
+  return r.media;
+}
+
+/** 素材视频流地址:<video> 走 Range 请求,和 audioFileUrl 同款(query token) */
+export function mediaFileUrl(importId: number): string {
+  const token = apiToken();
+  logFe('debug', `mediaFileUrl import=${importId} token=${token ? 'query' : 'none'}`);
+  return `${API_BASE}/api/media/${importId}/file?token=${encodeURIComponent(token ?? '')}`;
+}
+
+export async function deleteMedia(importId: number): Promise<{ ok: boolean; deleted: number }> {
+  logFe('info', `deleteMedia import=${importId}`);
+  return apiDelete<{ ok: boolean; deleted: number }>(`/api/media/${importId}`);
+}
+
+export async function clipMedia(
+  importId: number,
+  payload: { start: number; end: number; format: 'mp3' | 'm4a' | 'wav'; quality?: string; title?: string },
+): Promise<{ ok: boolean; jobId: number }> {
+  logFe('info', `clipMedia import=${importId} ${payload.start}-${payload.end}s format=${payload.format}`);
+  return apiPost<{ ok: boolean; jobId: number }>(`/api/media/${importId}/clip`, payload);
 }
 
 export async function cancelJob(jobId: number): Promise<{ ok: boolean }> {
@@ -184,10 +218,16 @@ export function coverUrl(importId: number): string {
   return `${API_BASE}/api/imports/${importId}/cover?token=${encodeURIComponent(token ?? '')}`;
 }
 
+/** done 事件联合类型(spec m1c-video-clip):audio=进音频库(下载与剪辑共用;旧下载事件无 kind 字段 → 按缺省 audio 读);
+ *  video=视频素材就位(importId 即来源 id,拿它拼 /api/media/:id/file 流地址;fileSize 为素材字节数) */
+export type DoneEvent =
+  | { kind?: 'audio'; audioId: number; title: string; format: string; replaced?: boolean }
+  | { kind: 'video'; importId: number; title: string; filePath: string; height: number | null; fileSize: number };
+
 export function subscribeJob(jobId: number, handlers: {
   onProgress?: (p: { percent: number }) => void;
   onPhase?: (p: { phase: 'ingest' }) => void; // 阶段信号(2026-09-29):下载进程结束、开始入库 → 进度条切第二段
-  onDone?: (d: { audioId: number; title: string; format: string; replaced?: boolean }) => void; // replaced:本次是覆盖下载(旧的那份已删)
+  onDone?: (d: DoneEvent) => void; // replaced:本次是覆盖下载(旧的那份已删);kind==='video' 为视频素材分支
   onStatus?: (s: { state: string; message?: string }) => void;
   onError?: (msg: string) => void;
 }): () => void {

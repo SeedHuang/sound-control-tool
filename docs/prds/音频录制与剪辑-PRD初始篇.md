@@ -283,7 +283,9 @@ UI 组件库：**antd 5**（沿用 bfm 体系）+ **wavesurfer.js v7**（波形/
 | **M3 音频库完善** | 标签、筛选、重命名、删除、打开文件夹；**批量下载**（FR-1.6） | 库页面可完成日常归档管理 |
 | **M4（展望）AI** | 转写、自动打标签、按内容搜索 | 另立 PRD |
 
-依赖顺序：M0 → M1 → M2 → M3。M2 的 EditSpec 编译器（server/ffmpeg）可与 M1 并行开发。
+依赖顺序：M0 → M1 → M2 → M3。M2 的 EditSpec 编译器（server/ffmpeg）可与 M1 并行开发。**2026-09-30 增补**：M1 与 M2 之间落地了切片 **S2.5 · m1c-video-clip（视频预览剪音频）**——它是 S5 剪辑工作台的最小前置，用"画面打点定位"先行解决音频定位痛点（详见 §6.1）。
+
+**前置条件（2026-09-30 增补，spec D16）**：剪辑类功能（S2.5 的画面剪音频、S5 的剪辑工作台）要求 **ffmpeg 可用**——设置页配置过或能在 PATH 探测到；两处都拿不到时剪辑功能整体不可用（报错引导去设置页）。下载/录制链路不受影响。
 
 ### 6.1 Spec 路线图（后续拆分计划）
 
@@ -291,7 +293,7 @@ UI 组件库：**antd 5**（沿用 bfm 体系）+ **wavesurfer.js v7**（波形/
 
 **shared 候选（只标注不建文件，开工第一个引用它的 spec 时创建，内容引用本 PRD 不抄写）**：数据模型与入库契约（→ PRD §4.1+§3.5，将来 `shared-data-model`）｜长任务与错误处理（→ §3.4，`shared-jobs-and-errors`）｜测试策略（→ §6 验收 + T.3 探针约定，`shared-testing`）｜前端约定（→ §5，`shared-frontend`）。
 
-依赖图：`S1 → {S2, S3, S4} → S5 → S6`；S2、S3、S4 三者可并行。
+依赖图：`S1 → {S2, S3, S4} → S5 → S6`；S2、S3、S4 三者可并行。**S2.5（2026-09-30 插入，不在原 S1–S6 内）**：`S2 → S2.5 → {S5}`——S2.5 是 S5 的最小前置（先让用户用"画面定位"解决最痛的音频定位问题，波形工作台后置）。
 
 **S1 · m0-desktop-shell — 桌面壳与内嵌 server**（依赖：无）
 - 三包 pnpm workspace 脚手架（web/server/desktop）与根 dev 脚本
@@ -307,6 +309,15 @@ UI 组件库：**antd 5**（沿用 bfm 体系）+ **wavesurfer.js v7**（波形/
 - 重复 URL 检测；产物入库（命名与唯一性策略 §3.5）
 - 最小音频库列表页（支撑验收播放）
 - 验收锚点：M1 前半（B 站课程 URL → mp3 并能播放）
+
+**S2.5 · m1c-video-clip — 视频预览剪音频**（依赖：S2；**2026-09-30 新增切片，不在原 S1–S6 内**，是 S5 的最小前置）
+- 动机（用户原话）："只听音频很难定位开始/结束，用视频画面一眼就能认"——视频是**带画面的时间标尺**，最终产物仍是音频
+- 复用同一套下载 job 管线（`produce: 'audio'|'video'` 分支）；视频素材落 `<数据目录>/media/`，记 `source_videos` 表，**不进 audio_items**
+- 剪辑 job（`ffmpeg_clip`）：ffmpeg 抽音轨 → 走既有 ingest 入库为普通音频行，标题由后端拼时间段 `[mm:ss-mm:ss]`
+- web 获取页加「视频预览剪音频」模式（下视频 → 画面上打点 → 剪出音频 → 素材列表）
+- **硬前置：ffmpeg 必须可用**（见 §6 前置条件）
+- 详细 spec：`docs/superpowers/specs/m1c-video-clip.md`
+- 验收锚点：粘 URL → 下 480p 视频 → 画面定位 → 剪出音频 → 音频库出现该条并可播放
 
 **S3 · m1b-system-recording — 系统声音录制**（依赖：S1）
 - Electron 主进程 setDisplayMediaRequestHandler + 权限拒绝处理
