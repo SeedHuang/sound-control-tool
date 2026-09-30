@@ -10,15 +10,18 @@ import '@/global.css'; // 卡片墙动效等全局样式(显式引入,不依赖�
 
 const NAV_ITEMS = [
   { key: '/', label: '首页' },
-  { key: '/acquire', label: '获取' },
-  { key: '/library', label: '音频库' },
+  { key: '/library', label: '资料库' },
+  { key: '/studio', label: '剪辑室' },
   { key: '/settings', label: '设置' },
 ];
 
 export default function GlobalLayout() {
   const location = useLocation(); // 路由变化 → 布局重渲染 → 高亮跟随
   const navigate = useNavigate(); // 路由原生跳转:走 Umi history,页面必切
-  const selected = NAV_ITEMS.find((i) => i.key === location.pathname)?.key ?? '/';
+  // 子路由也要高亮父项:`/studio/12` 必须让"剪辑室"亮起来(否则详情页看不出自己在哪个板块)。
+  // 首页用精确匹配,避免它把任何路径都吃掉。
+  const selected =
+    NAV_ITEMS.find((i) => (i.key === '/' ? location.pathname === '/' : location.pathname.startsWith(i.key)))?.key ?? '/';
   return (
     /* App 壳(2026-09-29 用户拍板:整页不准滚 body)——根节点锁死 100vh、overflow hidden;
        顶栏固定一行,内容区占满剩余高度、超出自己滚。各页在内容区内自管滚动。 */
