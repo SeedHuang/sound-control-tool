@@ -3,7 +3,7 @@
   "private": true,
   "version": "0.0.0",
   "scripts": {
-    "dev": "concurrently -k -n server,web,electron \"pnpm dev:server\" \"pnpm dev:web\" \"pnpm dev:electron\"",
+    "dev": "node scripts/dev.js",
     "dev:server": "pnpm --filter @sct/server dev",
     "dev:web": "node scripts/check-port.js 8000 && pnpm --filter @sct/web dev --port 8000",
     "dev:electron": "pnpm --filter @sct/desktop dev",

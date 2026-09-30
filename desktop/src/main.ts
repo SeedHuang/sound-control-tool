@@ -107,33 +107,47 @@ async function openWindow(mode: 'dev' | 'file', apiPort: number, apiToken: strin
     const indexPath = path.join(app.getAppPath(), '..', 'web', 'dist', 'index.html');
     await mainWindow.loadFile(indexPath, { search });
   } else {
-    // 竞态修复:dev server(webpack)启动慢于 electron,直接 loadURL 会 ERR_CONNECTION_REFUSED 弹"启动失败"。
-    // 先等 8000 有 HTTP 响应(任意状态码,dev 页面编译中也会返回 HTML)再加载。
-    const webReady = await waitForWebReady(8000, 60_000);
-    if (!webReady) {
-      dialog.showErrorBox('Web 页面未就绪', '60 秒内未检测到 web dev server(8000 端口)。\n\n请确认已运行:\n\n  pnpm dev:web\n\n(或直接 pnpm dev 三进程一起起)');
+    // 2026-09-30 端口错位根治:web 的真实端口由 scripts/dev.js 写进 .sct/dev-web-port(只由我们自己的编排器写),
+    // 本进程只信这个文件。旧实现"等 8000 有任意 <500 响应就 loadURL"在端口被参照项目(bilibili_favorite_manager)
+    // 的 dev server 占用时,会把别人家的页面装进我们的窗口(check-port.js 头注释记录的同族坑),已删。
+    const webPort = await resolveDevWebPort();
+    if (webPort === null) {
+      dialog.showErrorBox(
+        'Web 页面未就绪',
+        '60 秒内未读到 .sct/dev-web-port(web dev 实际端口文件)。\n\nweb 端口现由 scripts/dev.js 自动挑选空闲端口并写入该文件。\n请用以下方式启动:\n\n  pnpm dev\n\n(单独 pnpm dev:electron 不再受支持)',
+      );
       app.exit(1);
       return;
     }
-    await mainWindow.loadURL(`http://localhost:8000/?${search}`);
+    // 日志(仓库规则:关键步骤留痕;token 只记来源不记值,dev.js 会以 [electron] 前缀转发到终端)
+    console.log(`[electron] dev:加载 web dev server http://localhost:${webPort}(apiPort=${apiPort},token=${apiToken ? 'query' : 'none'})`);
+    await mainWindow.loadURL(`http://localhost:${webPort}/?${search}`);
   }
 }
 
-/** 轮询等待端口上有 HTTP 响应;dev server 一旦 listen 即响应,编译中页面也返回 HTML */
-async function waitForWebReady(port: number, timeoutMs: number): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
+/** 读 .sct/dev-web-port(scripts/dev.js 在 web HTTP 就绪后写入 {"port":N});60s 内读到合法端口,否则 null。
+ *  信任锚:该文件只由我们自己的编排器写入,且编排器每次启动先清旧文件 —— 残留值不可能被误读。 */
+async function resolveDevWebPort(): Promise<number | null> {
+  const portFile = path.join(app.getAppPath(), '..', '.sct', 'dev-web-port');
+  const deadline = Date.now() + 60_000;
   while (Date.now() < deadline) {
-    const ctl = new AbortController();
-    const timer = setTimeout(() => ctl.abort(), 800);
-    try {
-      const res = await fetch(`http://127.0.0.1:${port}/`, { signal: ctl.signal });
-      if (res.status < 500) return true;
-    } catch {
-      /* 未就绪,继续轮询 */
-    } finally {
-      clearTimeout(timer);
+    if (existsSync(portFile)) {
+      let raw = '';
+      try {
+        raw = readFileSync(portFile, 'utf8');
+        const parsed = JSON.parse(raw) as { port?: unknown };
+        const port = Number(parsed.port);
+        if (Number.isInteger(port) && port > 0 && port < 65536) {
+          console.log(`[electron] dev:读到 web 端口 ${port}(来源 ${portFile})`);
+          return port;
+        }
+        console.error(`[electron] dev:端口文件内容非法(重试):${raw.slice(0, 100)}`);
+      } catch (e) {
+        console.error(`[electron] dev:端口文件读取/解析失败(重试):${e instanceof Error ? e.message : String(e)}`);
+      }
     }
     await new Promise((r) => setTimeout(r, 500));
   }
-  return false;
+  console.error('[electron] dev:60s 内未读到有效的 .sct/dev-web-port');
+  return null;
 }
