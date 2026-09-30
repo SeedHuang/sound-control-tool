@@ -1,5 +1,5 @@
 // web/src/components/LogsButton.tsx(2026-09-29 用户反馈:"一个按钮看前后端日志")
-// 固定悬浮按钮 + 抽屉面板:后端日志(拉 /api/logs)+ 前端日志(api.ts 环形缓冲),
+// 顶栏右侧固定按钮,点开抽屉看日志:后端日志(拉 /api/logs)+ 前端日志(api.ts 环形缓冲),
 // 跨进程问题(浏览器↔server↔yt-dlp)可观测——CORS 修复前的 SSE 断连排查就缺这样一个入口。
 import { Button, Drawer, Empty, Space, Switch, Typography } from 'antd';
 import { useCallback, useEffect, useState, type CSSProperties } from 'react';

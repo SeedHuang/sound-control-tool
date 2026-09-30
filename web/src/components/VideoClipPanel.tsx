@@ -1,6 +1,6 @@
 // web/src/components/VideoClipPanel.tsx
 // 资料库「视频预览剪音频」模式(2026-09-29 spec m1c-video-clip)。
-// 为什么单独一个文件:acquire.tsx 已经很长,这个模式的交互(下视频/打点/剪)是自成一体的。
+// 为什么单独一个文件:library.tsx 已经很长,这个模式的交互(下视频/打点/剪)是自成一体的。
 // 2026-09-30 实测:剪辑/下载完成 onDone 设 msg 后 refresh() 的 setMedia 会触发 effect,把成功提示和打点一并清零——
 // 故拆成「来源 id 变化才清打点/提示」(lastSourceId ref)与「media 对齐选中素材」两个 effect,后者不清任何状态。
 import { Alert, Button, Empty, InputNumber, Modal, Progress, Radio, Space, Typography } from 'antd';
@@ -28,7 +28,7 @@ function humanSize(bytes: number | null): string {
   return bytes > 1024 * 1024 ? `${(bytes / 1024 / 1024).toFixed(1)} MB` : `${Math.round(bytes / 1024)} KB`;
 }
 
-// prop 只声明用到的字段(id/url/title):acquire.tsx 传入的 detail 是 ImportDetail(不含 entry_count),
+// prop 只声明用到的字段(id/url/title):library.tsx 传入的 detail 是 ImportDetail(不含 entry_count),
 // 用 Pick 才能让 ImportDetail 直接当 source 传进来(与计划参考实现的差异点,其余照抄)。
 export default function VideoClipPanel({ source }: { source: Pick<ImportSource, 'id' | 'url' | 'title'> | null }) {
   const [media, setMedia] = useState<MediaItem[]>([]);
@@ -142,7 +142,7 @@ export default function VideoClipPanel({ source }: { source: Pick<ImportSource, 
 
       {/* I1(2026-09-30):job 活跃即显示(onProgress/onPhase 置位),不再依赖 busy——否则 POST 201 返回后
           长任务期间零反馈。下载段真实百分比;入库/剪辑段 percent 无意义 → 100% active 无数字
-          (对齐 acquire.tsx 两段式口径)。视频下载与剪辑共用同一根:两种 job 都走 SSE。 */}
+          (对齐 library.tsx 两段式口径)。视频下载与剪辑共用同一根:两种 job 都走 SSE。 */}
       {jobId !== null && jobStage !== null && (
         jobStage === 'ingest'
           ? <Progress percent={100} status="active" showInfo={false} />

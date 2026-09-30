@@ -40,11 +40,11 @@ export default function PageHeader({ icon, title, meta, toolbar }: PageHeaderPro
         >
           {title}
         </div>
-        {meta !== undefined && (
+        {meta != null && (
           <div style={{ flexShrink: 0, fontSize: 12, color: 'rgba(0, 0, 0, 0.45)' }}>{meta}</div>
         )}
       </div>
-      {toolbar !== undefined && (
+      {toolbar != null && (
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginTop: 8 }}>
           {toolbar}
         </div>

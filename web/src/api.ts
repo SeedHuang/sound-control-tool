@@ -321,7 +321,7 @@ export async function deleteAudio(audioId: number): Promise<{ ok: boolean; delet
 // ---- 导入来源(2026-09-29 用户拍板:parse 成功自动落库,资料库左列表持久化) ----
 // 注意(2026-09-29 评审修):服务端 /api/imports 还会回 thumbnail / has_cover,前端**刻意不声明、不使用** ——
 // 卡片渲不渲染 <img> 不看 has_cover(那样"还没抓过图"的来源就永远没机会触发服务端抓取),
-// 而是有来源记录就渲染、取不到由 onError 回退纯色卡片(见 library.tsx 的 WorkCard)。将来要用再加回契约。
+// 而是有来源记录就渲染、取不到由 onError 回退纯色卡片(见 studio.tsx 的 WorkCard)。将来要用再加回契约。
 export interface ImportSource {
   id: number; url: string; title: string; site: string; kind: 'single' | 'playlist';
   entry_count: number; created_at: string;
