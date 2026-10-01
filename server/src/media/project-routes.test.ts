@@ -69,16 +69,22 @@ const count = (sql: string, param: number): number => Number((db.prepare(sql).ge
 // 其余调用完全委托真实 db（GET 仍走真实读路径）。
 // 为什么要包：路由层的 parseSegments 会先把 `label: {}` 这类不可绑定值挡成 400，
 // 到不了 repo 的绑定异常——所以只能在这一层人为制造一次「事务中途失败」。
-function wrapDbForFailInjection(real: DB): { db: DB; failSegmentInsert: { on: boolean } } {
+function wrapDbForFailInjection(real: DB): { db: DB; failSegmentInsert: { on: boolean }; failProductDelete: { on: boolean } } {
   const failSegmentInsert = { on: false };
+  const failProductDelete = { on: false }; // F-b:让「删成品行」这一步失败,验证三次 DELETE 合并后的整体回滚
   const wrapper = {
     exec: (sql: string) => real.exec(sql),
-    prepare: (sql: string) =>
-      failSegmentInsert.on && sql.startsWith('INSERT INTO clip_segments')
-        ? { run: () => { throw new TypeError('测试注入：写段失败'); } }
-        : real.prepare(sql),
+    prepare: (sql: string) => {
+      if (failSegmentInsert.on && sql.startsWith('INSERT INTO clip_segments')) {
+        return { run: () => { throw new TypeError('测试注入：写段失败'); } };
+      }
+      if (failProductDelete.on && sql.startsWith('DELETE FROM audio_items')) {
+        return { run: () => { throw new TypeError('测试注入：删成品行失败'); } };
+      }
+      return real.prepare(sql);
+    },
   } as unknown as DB;
-  return { db: wrapper, failSegmentInsert };
+  return { db: wrapper, failSegmentInsert, failProductDelete };
 }
 
 describe('作品路由', () => {
@@ -247,6 +253,30 @@ describe('作品路由', () => {
     }
     const after = (await app.inject({ method: 'GET', url: `/api/projects/${wid}` })).json() as { project: { segments: Array<{ start_sec: number }> } };
     expect(after.project.segments.map((s) => s.start_sec)).toEqual([0, 20]); // 旧段一条不少
+  });
+
+  // F-b（2026-10-01 OCR 审查）：三条 DELETE 合并进同一事务后，任一步失败整体回滚——
+  // 不允许出现「作品行没了、成品行还在」的半删态（悬空 source_work_id + 孤儿文件，正是 D6/D22 要避免的）。
+  it('D6 接口级：删成品行失败 → 500 且作品行/段/成品行全部原样保留（整体回滚）', async () => {
+    const repo = createClipProjectsRepo(db);
+    const w = repo.create(1, '作品');
+    repo.update(w.id, '作品', [{ start_sec: 0, end_sec: 1 }]);
+    mkProduct(w.id, 'p1');
+    const { db: failingDb, failProductDelete } = wrapDbForFailInjection(db);
+    const failingApp = Fastify({ logger: false });
+    registerProjectRoutes(failingApp, { db: failingDb, audioDir: '/no/such/audio', tempDir: '/no/such/tmp', token: 'tok' });
+    try {
+      failProductDelete.on = true;
+      const res = await failingApp.inject({ method: 'DELETE', url: `/api/projects/${w.id}` });
+      expect(res.statusCode).toBe(500);
+    } finally {
+      failProductDelete.on = false;
+      await failingApp.close();
+    }
+    // 要么全删、要么都不动：作品行 / 段 / 成品行一条不少
+    expect(repo.get(w.id)).not.toBeNull();
+    expect(count('SELECT COUNT(*) AS n FROM clip_segments WHERE project_id = ?', w.id)).toBe(1);
+    expect(count('SELECT COUNT(*) AS n FROM audio_items WHERE source_work_id = ?', w.id)).toBe(1);
   });
 
   // D19/D22：导出 payload 带 projectId/workName；作品不存在 → 404

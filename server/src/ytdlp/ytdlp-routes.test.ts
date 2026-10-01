@@ -1203,6 +1203,19 @@ describe('POST /api/jobs/:id/retry 按 kind 分支(批4)', () => {
     expect(res.json().error.code).toBe('MEDIA_GONE');
     expect(res.json().error.message).toContain('素材已不存在');
   });
+  // F-a(2026-10-01 OCR 审查):旧 job 的 payload 列是字面量 'null'(合法 JSON,JSON.parse 不抛)→ 归一成空载荷,
+  // 走剪辑分支的「素材已不存在」自然路径(MEDIA_GONE 409),而不是 p.videoPath 解引用 → 500。修复前此处会 500(RED)。
+  it('剪辑任务重试但 payload 为字面量 null → 409 MEDIA_GONE(不 500,F-a)', async () => {
+    const jobsRepo = createJobsRepo(db);
+    const jid = jobsRepo.create('ffmpeg_clip', { importId: 1, videoPath: join(tempDir, 'x.mp4'), start: 0, end: 5, format: 'mp3' });
+    db.prepare('UPDATE jobs SET payload = ? WHERE id = ?').run('null', jid); // 破坏成合法 JSON 但非对象
+    jobsRepo.fail(jid, 'ffmpeg 失败');
+    makeApp('yt-dlp', 'tok2');
+    const res = await app.inject({ method: 'POST', url: `/api/jobs/${jid}/retry` });
+    expect(res.statusCode).not.toBe(500); // 关键:修复前这里 TypeError → 500
+    expect(res.statusCode).toBe(409);
+    expect(res.json().error.code).toBe('MEDIA_GONE');
+  });
   // M3(修复轮 1,2026-09-30):剪辑任务重试的**成功**路径此前无覆盖——注入 clipStarter 桩捕获调用参数,
   // videoPath 指向真实存在的临时文件(先过 MEDIA_GONE 拦截)→ 断言 201 + 桩被调且 payload 原样透传 + 新 job kind 仍为 ffmpeg_clip
   it('剪辑任务重试成功 → 201 + clipStarter 被调且 payload 正确 + 新 job kind 为 ffmpeg_clip(M3)', async () => {

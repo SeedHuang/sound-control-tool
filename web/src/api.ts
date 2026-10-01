@@ -15,7 +15,11 @@ export const API_BASE = `http://127.0.0.1:${apiPort()}`;
 
 /** 业务错误:code 是后端 error.code(BAD_REQUEST/CONFLICT/INVALID_COOKIE/...),前端按 code 分支(如 CONFLICT → 覆盖确认弹窗) */
 export class ApiError extends Error {
-  constructor(message: string, public code?: string) { super(message); }
+  // status:HTTP 状态码(仅"服务端已回响应"的错误带;连不上/超时等本地错误为 undefined)。
+  // 2026-10-01 追加"纯加字段"的原因:调用方要按"恰好 404"分支(如 getWork 判定作品不存在),
+  // 而错误消息形如 `请求失败 ${status}:${path}`、path 里含作品 id —— 子串匹配会把 id=1404 的 500 误判成 404,
+  // 所以把状态码单独挂出来,调用方判 err.status 即可,不再玩字符串。
+  constructor(message: string, public code?: string, public status?: number) { super(message); }
 }
 
 // ---- 诊断日志(2026-09-29 用户反馈:一个按钮看前后端日志) ----
@@ -85,7 +89,7 @@ export async function apiGet<T>(path: string, timeoutMs = 10_000): Promise<T> {
   }
   if (!res.ok) {
     logFe('error', `请求失败 ${path}: ${res.status}`); // 诊断日志:HTTP 非 2xx 留痕
-    throw new ApiError(`请求失败 ${res.status}:${path}`);
+    throw new ApiError(`请求失败 ${res.status}:${path}`, undefined, res.status); // 带上真实状态码,调用方按 err.status 判(不再子串匹配 message)
   }
   // 非 JSON 响应(HTML 错误页/代理页)不再是裸 SyntaxError,统一包装为 ApiError
   try {
@@ -109,7 +113,7 @@ export async function apiPost<T>(path: string, body: unknown): Promise<T> {
       const msg = j?.error?.message ?? `请求失败 ${res.status}:${path}${j?.error?.next ? `。${j.error.next}` : ''}`;
       logFe('error', `请求失败 ${path}: ${msg}`); // 诊断日志:业务错误(400/409)也进前端面板
       // code 要带上:调用方按 code 分支(如 DUPLICATE → 弹「重新下载并替换」确认,2026-09-29)
-      throw new ApiError(msg, j?.error?.code);
+      throw new ApiError(msg, j?.error?.code, res.status); // 追加真实状态码(纯加字段,调用方可不看)
     }
     return (await res.json()) as T;
   } finally { clearTimeout(timer); }
@@ -193,39 +197,78 @@ export async function clipMedia(
   return apiPost<{ ok: boolean; jobId: number }>(`/api/media/${importId}/clip`, payload);
 }
 
-// ---- 剪辑工程 / 导出（P4，spec §0.3）----
-// 段：编辑期只有 start/end/label；服务端落库后才带 id/sort_order（PUT 按数组顺序定 sort_order）
+// ---- 剪辑作品 / 导出（2026-10-01 spec clip-works：旧「工程」语义整组改名「作品」）----
+// 为什么改名:import_id 不再唯一——同一个资料可以有多件作品(1:N),「工程」这个词连同 1:1 的暗示一起丢掉,
+// 统一叫「作品」,避免后面把「project 到底是资料还是作品」的歧义漏下去。
+// 段:编辑期只有 start/end/label;服务端落库后才带 id/sort_order(PUT 按数组顺序定 sort_order)
 export interface ClipSegmentDTO { id?: number; start_sec: number; end_sec: number; label?: string | null; sort_order?: number }
-export interface ClipProjectDTO { import_id: number; name: string | null; updated_at: string; segments: ClipSegmentDTO[] }
-export interface ClipProjectSummaryDTO { import_id: number; name: string | null; updated_at: string; segment_count: number }
+// 作品墙一张卡的数据(逐字对齐服务端 server/src/db/repo/clip-projects.ts 的 WorkSummaryRow)
+export interface WorkSummaryDTO {
+  id: number; import_id: number; name: string | null; updated_at: string;
+  segment_count: number; product_count: number; total_sec: number;
+  first_segment: { start_sec: number; end_sec: number } | null;
+  source: { title: string; site: string; kind: string; has_video: boolean } | null; // null = 资料已删
+  latest_product_id: number | null; // 最新一条成品的 id(hover 预览"只有音频的卡"要播它);没有成品 → null
+}
+export interface WorkDetailDTO { id: number; import_id: number; name: string | null; updated_at: string; segments: ClipSegmentDTO[] }
 
-/** GET /api/projects/:id：来源在但没工程 → null（正常态，不是错误） */
-export async function getProject(importId: number): Promise<ClipProjectDTO | null> {
-  const r = await apiGet<{ ok: boolean; project: ClipProjectDTO | null }>(`/api/projects/${importId}`);
-  return r.project;
+/** 作品列表（作品墙/首页复用）：后端 `{ ok, projects }`，键名仍是 projects，前端只按数组用 */
+export function listWorks(): Promise<WorkSummaryDTO[]> {
+  return apiGet<{ ok: boolean; projects: WorkSummaryDTO[] }>('/api/projects').then((r) => r.projects);
 }
-/** 工程列表（P5 首页复用） */
-export function listProjects(): Promise<ClipProjectSummaryDTO[]> {
-  return apiGet<{ ok: boolean; projects: ClipProjectSummaryDTO[] }>('/api/projects').then((r) => r.projects);
+/** 新建作品（spec D15）：入参是**资料 id**，回新作品详情（含服务端定的默认名与空段） */
+export function createWork(importId: number): Promise<WorkDetailDTO> {
+  logFe('info', `createWork import=${importId}`);
+  return apiPost<{ ok: boolean; project: WorkDetailDTO }>('/api/projects', { importId }).then((r) => r.project);
 }
-/** PUT 全量替换（服务端包事务 D18）；返回保存后的工程（含服务端定的 sort_order 顺序） */
-export function putProject(importId: number, body: { name: string | null; segments: { start_sec: number; end_sec: number; label?: string | null }[] }): Promise<{ ok: boolean; project: ClipProjectDTO }> {
-  logFe('info', `putProject import=${importId} 段数=${body.segments.length}`);
-  return apiPut<{ ok: boolean; project: ClipProjectDTO }>(`/api/projects/${importId}`, body);
+/** GET /api/projects/:id：作品不存在时后端回 404（NOT_FOUND）→ 这里收敛成 null（正常态，不是错误；见 T3 审查跨任务项）。
+ *  其它错误（网络/500）照常抛出，不静默吞。 */
+export async function getWork(projectId: number): Promise<WorkDetailDTO | null> {
+  try {
+    const r = await apiGet<{ ok: boolean; project: WorkDetailDTO }>(`/api/projects/${projectId}`);
+    return r.project;
+  } catch (err) {
+    // 404 = 作品已被删除（后端 error.next 会写"该作品已被删除，无法保存"）。
+    // 判据必须是"HTTP 状态码恰好等于 404"：apiGet 的错误消息形如 `请求失败 ${status}:${path}`，而 path 里含作品 id——
+    // 作品 id 本身带 "404"(如 1404) 时，500/网络错误的消息也会命中子串 '404'，会被误判成"作品不存在"→
+    // 静默吞掉真实错误 → 页面渲染成空编辑器（用户可能以为"这作品没剪辑点"而覆盖保存）。故改判 err.status（apiGet 已挂真实状态码）。
+    if (err instanceof ApiError && err.status === 404) return null;
+    throw err;
+  }
 }
-/** DELETE 工程（幂等；不删素材、不删已导出音频） */
-export function deleteProject(importId: number): Promise<{ ok: boolean; deleted: number }> {
-  logFe('info', `deleteProject import=${importId}`);
-  return apiDelete<{ ok: boolean; deleted: number }>(`/api/projects/${importId}`);
+/** PUT 全量替换（服务端包事务 D18）；返回保存后的作品（含服务端定的 sort_order 顺序） */
+export function putWork(projectId: number, body: { name: string | null; segments: { start_sec: number; end_sec: number; label?: string | null }[] }): Promise<WorkDetailDTO> {
+  logFe('info', `putWork project=${projectId} 段数=${body.segments.length}`);
+  return apiPut<{ ok: boolean; project: WorkDetailDTO }>(`/api/projects/${projectId}`, body).then((r) => r.project);
 }
-/** 导出：segments 必传（D15，以请求体为准，不读 DB 工程、不自动保存）；起 job + 走 SSE 订阅进度 */
-export function exportProject(importId: number, body: { mode: 'separate' | 'merge'; format: 'mp3' | 'm4a' | 'wav'; quality?: string; segments: { start_sec: number; end_sec: number; label?: string | null }[] }): Promise<{ ok: boolean; jobId: number }> {
-  logFe('info', `exportProject import=${importId} mode=${body.mode} 段数=${body.segments.length}`);
-  return apiPost<{ ok: boolean; jobId: number }>(`/api/projects/${importId}/export`, body);
+/** DELETE 作品（幂等；连带删该作品的成品 DB 行 + 磁盘文件，不删素材本身）。deleted_products = 连带删掉的成品数 */
+export function deleteWork(projectId: number): Promise<{ ok: boolean; deleted: number; deleted_products: number }> {
+  logFe('info', `deleteWork project=${projectId}`);
+  return apiDelete<{ ok: boolean; deleted: number; deleted_products: number }>(`/api/projects/${projectId}`);
+}
+/** 导出：segments 必传（D15，以请求体为准，不读 DB 作品、不自动保存）；起 job + 走 SSE 订阅进度 */
+export function exportWork(projectId: number, body: { mode: 'separate' | 'merge'; format: 'mp3' | 'm4a' | 'wav'; quality?: string; segments: { start_sec: number; end_sec: number; label?: string | null }[] }): Promise<{ ok: boolean; jobId: number }> {
+  logFe('info', `exportWork project=${projectId} mode=${body.mode} 段数=${body.segments.length}`);
+  return apiPost<{ ok: boolean; jobId: number }>(`/api/projects/${projectId}/export`, body);
+}
+/** 某作品的成品列表（spec D17：GET /api/audio?project=<作品id> → 裸数组；过滤落在服务端）。
+ *  成品 = source_type='edit' 且 source_work_id 指向该作品的行。 */
+export function listProducts(projectId: number): Promise<AudioRow[]> {
+  return apiGet<AudioRow[]>(`/api/audio?project=${projectId}`);
+}
+/** 剪辑室 hover 预览默认静音开关（spec clip-works D12）：读设置键，**键缺失视为静音**（默认 '1'）。 */
+export async function getPreviewMuted(): Promise<boolean> {
+  const s = await getSettings();
+  return (s['studio_preview_muted'] ?? '1') !== '0';
+}
+/** 写静音开关：'1' = 静音（默认），'0' = 出声。putSettings 内部已记日志，这里再记一条"用户动作"便于面板对账。 */
+export async function setPreviewMuted(muted: boolean): Promise<void> {
+  logFe('info', `setPreviewMuted ${muted ? '静音' : '出声'}`);
+  await putSettings({ studio_preview_muted: muted ? '1' : '0' });
 }
 
 // ---- 首页仪表盘(P5-T2,spec §0.3「其它」):GET /api/home → 两块 Top3 ----
-// 形状逐字对齐后端 server/src/db/repo/home.ts 的 HomeEditingRow / HomeRecentRow(editing 复用工程列表形状)
+// 形状逐字对齐后端 server/src/db/repo/home.ts 的 HomeEditingRow / HomeRecentRow(editing 复用作品列表形状)
 export interface HomeEditingRow { import_id: number; name: string | null; site: string; updated_at: string; segment_count: number }
 export interface HomeRecentRow { import_id: number; title: string; site: string; latest_audio_id: number; created_at: string }
 export interface HomeData { editing: HomeEditingRow[]; recent: HomeRecentRow[] }
@@ -270,6 +313,7 @@ export interface AudioRow {
   entry_index: number | null;     // 合集第几集;单视频/录制 → null
   collection_title: string | null; // 所属合集标题;非合集 → null
   source_import_id: number | null; // 2026-10-01 spec audio-lineage D1:来源 id(无来源 → null);剪辑室按它归并
+  source_work_id: number | null;   // 2026-10-01 spec clip-works D4:成品归属的作品 id(指向 clip_projects.id);非成品 → null
 }
 
 export function audioFileUrl(id: number): string {
@@ -344,14 +388,14 @@ export async function apiPut<T>(path: string, body: unknown): Promise<T> {
     // 后端 error.next 是「下一步怎么办」的指引(spec §0.5)。原实现只在 message 缺失时才拼 next,
     // 但 PUT /api/settings 的 400 恒带 message → next 永远到不了用户(只看到前半句)。
     // 改为 message 非空时也把 next 追加进展示消息;!base.includes 防同一句被拼两遍。
-    // 注意:apiPut 是共享代码(saveCookie / putProject 也走它),它们的失败消息也会多出这个「（…）」尾巴——
+    // 注意:apiPut 是共享代码(saveCookie / putWork 也走它),它们的失败消息也会多出这个「（…）」尾巴——
     // 这是有意改善(多给一步指引),不要去改那两处调用逻辑。code 参数保持原样不动。
     const body = j?.error;
     const base = body?.message ?? `请求失败 ${res.status}:${path}`;
     const next = typeof body?.next === 'string' && body.next.trim() !== '' && !base.includes(body.next) ? body.next : '';
     const msg = next === '' ? base : `${base}（${next}）`;
     logFe('error', `请求失败 ${path}: ${msg}`); // 诊断日志:业务错误(400/409)也进前端面板
-    throw new ApiError(msg, j?.error?.code);
+    throw new ApiError(msg, j?.error?.code, res.status); // 追加真实状态码(纯加字段,调用方可不看)
   }
   return (await res.json()) as T;
 }
@@ -396,7 +440,7 @@ export async function apiDelete<T>(path: string): Promise<T> {
       const j = (await res.json().catch(() => null)) as { error?: { message?: string; next?: string } } | null;
       const msg = j?.error?.message ?? `请求失败 ${res.status}:${path}${j?.error?.next ? `。${j.error.next}` : ''}`;
       logFe('error', `请求失败 ${path}: ${msg}`);
-      throw new ApiError(msg);
+      throw new ApiError(msg, undefined, res.status); // 追加真实状态码(纯加字段,调用方可不看)
     }
     return (await res.json()) as T;
   } finally { clearTimeout(timer); }
@@ -419,7 +463,7 @@ export interface ImportSource {
   id: number; url: string; title: string; site: string; kind: 'single' | 'playlist';
   entry_count: number; created_at: string;
   has_video: boolean;             // 该来源已登记视频素材(2026-09-30 P2 对齐服务端 /api/imports)
-  has_project: boolean;           // 已有剪辑工程(2026-09-30 P2 对齐服务端)
+  has_project: boolean;           // 已有剪辑作品(2026-09-30 P2 对齐服务端)
   segment_count: number;          // 已保存剪辑点数(D19 替换确认文案的条件句用)
   material_entry_index: number | null; // 这份素材是合集里的第几集(2026-09-30 P3-T1 对齐服务端);单视频/无素材 → null
 }

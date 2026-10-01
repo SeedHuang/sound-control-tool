@@ -773,8 +773,16 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
     if (old.status !== 'error') {
       return reply.code(409).send({ ok: false, error: { code: 'NOT_RETRYABLE', message: '只有失败的任务可以重试', next: '' } });
     }
-    let payload: Partial<DownloadJobPayload>;
-    try { payload = JSON.parse(old.payload) as Partial<DownloadJobPayload>; } catch {
+    // F-a(2026-10-01 OCR 审查):解析旧载荷时把「非对象」也一并兜底——JSON.parse('null') 是合法 JSON(不抛错)
+    // 却得到 null,之后任何 payload.xxx 解引用都会 TypeError → 端点 500。归一成 {} 后,下游各分支自然按
+    // 「字段缺失」处理(音频分支 → 400 缺 url;剪辑/导出分支 → 409 MEDIA_GONE),而不是 500。
+    // videoPath/projectId 是剪辑/导出分支的字段,不在 DownloadJobPayload 里,故并入本页重试用的载荷类型。
+    type RetryPayload = Partial<DownloadJobPayload> & { videoPath?: string; projectId?: unknown };
+    let payload: RetryPayload;
+    try {
+      const parsed: unknown = JSON.parse(old.payload);
+      payload = parsed !== null && typeof parsed === 'object' ? (parsed as RetryPayload) : {};
+    } catch {
       return reply.code(400).send({ ok: false, error: { code: 'BAD_REQUEST', message: '原任务参数损坏，无法重试', next: '重新提交下载' } });
     }
     // 批4(2026-09-29 spec m1c-video-clip):重试按旧 job 的 kind 分支——
@@ -786,7 +794,10 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
       : old.kind === 'ffmpeg_export' ? 'ffmpeg_export'
       : 'ytdlp_download';
     if (kind === 'ffmpeg_clip' || kind === 'ffmpeg_export') {
-      const p = JSON.parse(old.payload) as { videoPath?: string; projectId?: unknown };
+      // F-a(2026-10-01 OCR 审查):复用上面已解析并兜底的 payload —— **不要**再 JSON.parse(old.payload) 一次。
+      // 第二次裸解析会重新得到 null(payload 列是字面量 'null' 时),紧接着 p.videoPath 解引用就 500,
+      // 绕过了上面的兜底(上面那步既捕获语法错误,又把非对象归一成了 {})。
+      const p = payload;
       // 素材绝对路径已不在 → 明确失败(不静默:否则重试只会起一个注定失败的任务)
       if (typeof p.videoPath !== 'string' || !existsSync(p.videoPath)) {
         return reply.code(409).send({ ok: false, error: { code: 'MEDIA_GONE', message: '素材已不存在，请重新下载视频', next: '回到资料库重新下视频' } });

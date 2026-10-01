@@ -111,17 +111,28 @@ export function registerProjectRoutes(
     if (badId(projectId)) return reply.code(404).send({ ok: false, error: { code: 'NOT_FOUND', message: '作品不存在', next: '' } });
     // 1) 先取成品清单：file_path 必须先读出来，成品行一删就查不到了
     const products = db.prepare('SELECT id, file_path FROM audio_items WHERE source_work_id = ?').all(projectId) as Array<{ id: number; file_path: string }>;
-    // 2) 删作品 + 它的段（repo.delete 自带事务）
-    const deleted = projectsRepo.delete(projectId);
-    // 3) 删成品行（独立事务）——DB 行删掉就算"删了"
-    const deletedProducts = inTransaction(db, () => Number(db.prepare('DELETE FROM audio_items WHERE source_work_id = ?').run(projectId).changes));
-    // 4) 最后删磁盘文件：失败不阻断（ENOENT/权限等都只记日志）
+    // 2) 作品 + 段 + 成品行三条 DELETE 必须在**同一个事务**里同进同出（D6/D22）：任一步失败整体回滚。
+    //    否则会出现「作品行没了、成品行还在」——悬空的 source_work_id + 孤儿文件，正是 D6/D22 要避免的状态。
+    //    ⚠️ 不能调用 projectsRepo.delete：它内部自带事务，再套一层就是 node:sqlite 不支持的嵌套事务
+    //    （BEGIN 里再 BEGIN 会抛），故这里内联「删段 + 删作品」两条语句（与 repo.delete 逐字一致），与删成品行共用一个事务。
+    const { deleted, deletedProducts } = inTransaction(db, () => {
+      db.prepare('DELETE FROM clip_segments WHERE project_id = ?').run(projectId);
+      const d = Number(db.prepare('DELETE FROM clip_projects WHERE id = ?').run(projectId).changes);
+      const dp = Number(db.prepare('DELETE FROM audio_items WHERE source_work_id = ?').run(projectId).changes);
+      return { deleted: d, deletedProducts: dp };
+    });
+    // 3) 磁盘文件删除留在事务**之外**（提交之后再删）：文件 IO 失败不阻断接口（仓库铁律）
     for (const p of products) {
       try {
         unlinkSync(p.file_path);
         pushLog('info', 'project', `作品 ${projectId} 连带删除成品文件 id=${p.id} path=${p.file_path}`);
       } catch (err) {
-        pushLog('info', 'project', `作品 ${projectId} 成品文件删除跳过 id=${p.id} code=${(err as NodeJS.ErrnoException).code ?? '?'} path=${p.file_path} (DB 行已删)`);
+        // F-c(2026-10-01 OCR 审查):ENOENT = 文件本就不在,属正常态;其它 code(权限/占用等真 IO 失败)本仓也**不刷 error**——
+        // 铁律「删磁盘文件失败不让接口失败」:DB 行删掉就达到用户"删了"的语义,单点磁盘抖动不该刷 error 级。
+        // 本仓日志无 warn 级,故非 ENOENT 仍用 info,但加显眼前缀,便于在日志页里一眼区分真·IO 失败与"文件本就不在"。
+        const code = (err as NodeJS.ErrnoException).code ?? '?';
+        const prefix = code === 'ENOENT' ? '成品文件删除跳过' : '成品文件删除失败(非 ENOENT)';
+        pushLog('info', 'project', `作品 ${projectId} ${prefix} id=${p.id} code=${code} path=${p.file_path} (DB 行已删)`);
       }
     }
     pushLog('info', 'project', `作品已删除 id=${projectId} deleted=${deleted} deleted_products=${deletedProducts}`);
