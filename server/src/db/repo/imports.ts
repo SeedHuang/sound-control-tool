@@ -6,8 +6,10 @@ export interface ImportEntry { index: number; title: string }
 export interface ImportUpsert { url: string; title: string; site: string; kind: 'single' | 'playlist'; duration_sec: number | null; entries: ImportEntry[] | null; thumbnail?: string | null }
 export interface ImportSummaryRow {
   id: number; url: string; title: string; site: string; kind: 'single' | 'playlist'; entry_count: number; thumbnail: string | null; created_at: string;
-  /** P2 派生列(2026-09-30,LEFT JOIN 派生):该来源有没有视频素材 / 有没有剪辑工程 / 工程段数(无工程 0) */
+  /** P2 派生列(2026-09-30,派生):该来源有没有视频素材 / 有没有剪辑作品 / 段数(无作品 0) */
   has_video: boolean; has_project: boolean; segment_count: number;
+  /** clip-works(2026-10-01,1:N):该资料下的作品数(无作品 → 0) */
+  work_count: number;
   /** P3-T1 派生列(2026-09-30,同 LEFT JOIN 带出):该素材是合集里的第几集(单视频/无素材 → null),剪辑室据此显示「素材:第 N 集」 */
   material_entry_index: number | null;
 }
@@ -43,16 +45,19 @@ export function createImportsRepo(db: DB) {
     return row.id;
   };
 
-  // 派生列与 JOIN 抽成单一来源(T7-7):list 与详情/按 URL 两个查询共用——列名/别名改了只改一处,不会漂移。
-  //   s.* 带出 imported_sources 全部列(含 entries_json/duration_sec);派生列补素材/工程三态 + 素材集号。
-  //   ⚠️ imported_sources 本身没有 has_video/has_project/segment_count/material_entry_index 同名列,不会遮蔽派生值。
-  //   素材/工程与来源一对一(UNIQUE),LEFT JOIN 不复制行;无素材/无工程 → false/0,不是缺字段(前端资料库页三态标识靠它)
+  // 派生列与 JOIN(2026-10-01 clip-works 改):
+  //   s.* 带出 imported_sources 全部列;派生列补素材/作品/段数/素材集号。
+  //   ⚠️ 1:N 之后**不能再** LEFT JOIN clip_projects(那会把有多件作品的资料复制成多行)——
+  //   作品相关派生列全部走相关子查询,唯一 LEFT JOIN 只留一对一(UNIQUE)的 source_videos,保证"一行来源恒一行"。
+  //   ⚠️ imported_sources 本身没有 has_video/has_project/segment_count/work_count/material_entry_index 同名列,不会遮蔽派生值。
   const DERIVED_COLS =
     'CASE WHEN v.import_id IS NULL THEN 0 ELSE 1 END AS has_video, ' +
-    'CASE WHEN p.id IS NULL THEN 0 ELSE 1 END AS has_project, ' +
-    '(SELECT COUNT(*) FROM clip_segments seg WHERE seg.project_id = p.id) AS segment_count, ' +
+    'CASE WHEN EXISTS(SELECT 1 FROM clip_projects p WHERE p.import_id = s.id) THEN 1 ELSE 0 END AS has_project, ' +
+    // segment_count 口径(clip-works):该资料下**全部作品**的段数之和(不再是"唯一那个工程"的段数)
+    '(SELECT COUNT(*) FROM clip_segments seg JOIN clip_projects p2 ON p2.id = seg.project_id WHERE p2.import_id = s.id) AS segment_count, ' +
+    '(SELECT COUNT(*) FROM clip_projects p3 WHERE p3.import_id = s.id) AS work_count, ' +
     'v.entry_index AS material_entry_index';
-  const DERIVED_JOINS = 'FROM imported_sources s LEFT JOIN source_videos v ON v.import_id = s.id LEFT JOIN clip_projects p ON p.import_id = s.id ';
+  const DERIVED_JOINS = 'FROM imported_sources s LEFT JOIN source_videos v ON v.import_id = s.id ';
   const derivedJoin = `SELECT s.*, ${DERIVED_COLS} ${DERIVED_JOINS}`;
 
   /** 列表/详情共用的基础行映射(T7-7):只取 ImportSummaryRow 的字段,其余列忽略;
@@ -71,6 +76,7 @@ export function createImportsRepo(db: DB) {
       has_video: Number(r.has_video) === 1,
       has_project: Number(r.has_project) === 1,
       segment_count: Number(r.segment_count ?? 0),
+      work_count: Number(r.work_count ?? 0),
       material_entry_index: r.material_entry_index === null || r.material_entry_index === undefined ? null : Number(r.material_entry_index),
     };
   };

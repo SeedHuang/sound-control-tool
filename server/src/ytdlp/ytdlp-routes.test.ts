@@ -568,6 +568,26 @@ describe('GET /api/audio 与 GET /api/audio/:id/file', () => {
     expect(recorded.collection_title).toBe('入库时记的合集');
     expect(recorded.entry_index).toBe(5);
   });
+  // 2026-10-01 spec clip-works D17:?project=<作品id> 只回该作品的成品;不传 = 维持现状(全部);
+  // 不存在的 id = 空数组(过滤语义,不是资源寻址,不 404 —— §0.4 契约)
+  it('GET /api/audio?project=<作品id>:只回该作品成品;不传=全部;不存在的 id=空数组', async () => {
+    const audioRepo = createAudioItemsRepo(db);
+    const clipRepo = createClipProjectsRepo(db);
+    const w1 = clipRepo.create(1, '作品甲').id;
+    const w2 = clipRepo.create(1, '作品乙').id;
+    audioRepo.create({ title: '成品A', source_type: 'edit', source_url: '', file_path: 'C:/x/a.mp3', format: 'mp3', duration_sec: 1, file_size: 1, source_work_id: w1 });
+    audioRepo.create({ title: '成品B', source_type: 'edit', source_url: '', file_path: 'C:/x/b.mp3', format: 'mp3', duration_sec: 1, file_size: 1, source_work_id: w2 });
+    audioRepo.create({ title: '无作品', source_type: 'edit', source_url: '', file_path: 'C:/x/c.mp3', format: 'mp3', duration_sec: 1, file_size: 1 });
+    makeApp('yt-dlp', 'tok2');
+    // 不传 → 维持现状:全部(3 条,含无作品的那条)
+    expect(((await app.inject({ method: 'GET', url: '/api/audio' })).json() as unknown[]).length).toBe(3);
+    // 传作品 id → 只回该作品成品
+    const onlyW1 = (await app.inject({ method: 'GET', url: `/api/audio?project=${w1}` })).json() as Array<{ title: string }>;
+    expect(onlyW1.map((r) => r.title)).toEqual(['成品A']);
+    // 不存在 / 非法 id → 回全部、不报错(过滤语义,不是资源寻址)
+    expect((await app.inject({ method: 'GET', url: '/api/audio?project=99999' })).json()).toEqual([]); // 合法正整数但不存在 → 空数组
+    expect(((await app.inject({ method: 'GET', url: '/api/audio?project=abc' })).json() as unknown[]).length).toBe(3); // 乱传 → 全部
+  });
 });
 
 // CORS 修复(2026-09-29 用户反馈):SSE 路由 hijack reply 后,Fastify 的 onSend 钩子不会运行,
@@ -985,9 +1005,9 @@ describe('下载视频素材(produce=video)', () => {
     expect(row).not.toBeNull();
     expect(row!.entry_index).toBe(3);
   });
-  // P2 D19 服务端(2026-09-30):换集下载完成 → 清空该来源的剪辑工程(段 + 工程行);同集换清晰度 → 保留。
-  // 前置状态用原生 SQL 造(clip_projects/clip_segments 的"建"在 P4):旧素材 entry_index=2 + 工程 2 段
-  it('视频换集(旧 2 → 新 5)下载完成 → 剪辑工程被清空,日志留痕「清空剪辑工程」', async () => {
+  // 2026-10-01 spec clip-works D8(替换 D19 旧语义):换集重下 = 只清空该资料下**所有作品**的剪辑点,
+  // 作品行与成品都保留(剪辑点指向旧视频而必须作废;作品名与成品是用户劳动成果,不该连坐)。
+  it('换集重下:清空该资料下所有作品的段,保留作品行与成品', async () => {
     const importId = createImportsRepo(db).upsertByUrl({ url: 'https://a/v', title: '凡人', site: 'bilibili', kind: 'playlist', duration_sec: null, entries: null });
     const producedPath = join(tempDir, 'vid5.mp4');
     writeFileSync(producedPath, 'VIDEOBYTES');
@@ -1004,19 +1024,25 @@ describe('下载视频素材(produce=video)', () => {
     writeFileSync(oldVideo, 'OLD');
     createSourceVideosRepo(db).upsert({ importId, filePath: oldVideo, height: 480, fileSize: 3, entryIndex: 2 });
     const clipRepo = createClipProjectsRepo(db);
-    const pid = Number(db.prepare('INSERT INTO clip_projects (import_id) VALUES (?)').run(importId).lastInsertRowid);
-    db.prepare('INSERT INTO clip_segments (project_id, start_sec, end_sec) VALUES (?, ?, ?)').run(pid, 0, 10);
-    db.prepare('INSERT INTO clip_segments (project_id, start_sec, end_sec) VALUES (?, ?, ?)').run(pid, 10, 20);
+    // 1 资料 + 2 作品(各有段) + 1 成品(T2 起用 repo.create 建多作品;成品挂第 1 个作品)
+    const w1 = clipRepo.create(importId, '作品甲').id;
+    const w2 = clipRepo.create(importId, '作品乙').id;
+    db.prepare('INSERT INTO clip_segments (project_id, start_sec, end_sec) VALUES (?, ?, ?)').run(w1, 0, 10);
+    db.prepare('INSERT INTO clip_segments (project_id, start_sec, end_sec) VALUES (?, ?, ?)').run(w2, 0, 10);
+    db.prepare('INSERT INTO clip_segments (project_id, start_sec, end_sec) VALUES (?, ?, ?)').run(w2, 10, 20);
+    createAudioItemsRepo(db).create({ title: '成品', source_type: 'edit', source_url: '', file_path: 'C:/x/p.mp3', format: 'mp3', duration_sec: 1, file_size: 1, source_work_id: w1 });
     const res = await app.inject({ method: 'POST', url: '/api/ytdlp/download', payload: { url: 'https://a/v', options: { format: 'mp3', entryIndices: [5] }, produce: 'video', title: '凡人', entryIndex: 5 } });
     expect(res.statusCode).toBe(201);
     const jobId = res.json().jobId as number;
-    fire!(); // 下载进程退出 → finalizeVideoDownload(记 entry_index=5 + D19 清工程)
+    fire!(); // 下载进程退出 → finalizeVideoDownload(记 entry_index=5 + 换集清剪辑点)
     const deadline = Date.now() + 2000;
     while (Date.now() < deadline && createJobsRepo(db).get(jobId)!.status !== 'done') await new Promise((r) => setTimeout(r, 20));
     expect(createSourceVideosRepo(db).get(importId)!.entry_index).toBe(5); // 新集号已落库
-    expect(clipRepo.countSegmentsByImportId(importId)).toBe(0); // 段被清
-    expect((db.prepare('SELECT COUNT(*) AS n FROM clip_projects WHERE import_id = ?').get(importId) as { n: number }).n).toBe(0); // 工程行被清
-    expect(getLogs().some((l) => l.source === 'job' && l.message.includes('清空剪辑工程'))).toBe(true); // 仓库铁律:关键步骤必须有日志
+    expect(clipRepo.countSegmentsByImportId(importId)).toBe(0); // 两个作品的段都被清
+    expect((db.prepare('SELECT COUNT(*) AS n FROM clip_projects WHERE import_id = ?').get(importId) as { n: number }).n).toBe(2); // 作品行保留
+    expect(createAudioItemsRepo(db).list()).toHaveLength(1); // 成品保留
+    // 仓库铁律:关键步骤必须有日志,且按新文案说清影响面(作品数 / 段数)
+    expect(getLogs().some((l) => l.source === 'job' && l.message.includes('清空该资料下作品的剪辑点') && l.message.includes('作品2个/段3个'))).toBe(true);
   });
   it('视频同集换清晰度(旧 2 → 新 2)下载完成 → 剪辑工程保留(用户剪辑点不丢)', async () => {
     const importId = createImportsRepo(db).upsertByUrl({ url: 'https://a/v', title: '凡人', site: 'bilibili', kind: 'playlist', duration_sec: null, entries: null });
@@ -1209,7 +1235,7 @@ describe('POST /api/jobs/:id/retry 按 kind 分支(批4)', () => {
     const videoPath = join(tempDir, 'media-export-src.mp4');
     writeFileSync(videoPath, 'VIDEOBYTES'); // retry 分支 existsSync(videoPath) 要真文件
     const jobsRepo = createJobsRepo(db);
-    const exportPayload = { importId: 1, videoPath, mode: 'merge', format: 'mp3', quality: '192k', prefix: '凡人', segments: [{ start_sec: 0, end_sec: 10 }] };
+    const exportPayload = { importId: 1, projectId: 7, videoPath, mode: 'merge', format: 'mp3', quality: '192k', prefix: '凡人', segments: [{ start_sec: 0, end_sec: 10 }] };
     const oldId = jobsRepo.create('ffmpeg_export', exportPayload);
     jobsRepo.fail(oldId, 'ffmpeg 失败'); // 仅 error 可重试(P1-4)
     const calls: Array<{ jobId: number; payload: unknown }> = [];
@@ -1224,12 +1250,28 @@ describe('POST /api/jobs/:id/retry 按 kind 分支(批4)', () => {
     const videoPath = join(tempDir, 'media-export-nowire.mp4');
     writeFileSync(videoPath, 'VIDEOBYTES');
     const jobsRepo = createJobsRepo(db);
-    const jid = jobsRepo.create('ffmpeg_export', { importId: 1, videoPath, mode: 'merge', format: 'mp3', segments: [] });
+    const jid = jobsRepo.create('ffmpeg_export', { importId: 1, projectId: 7, videoPath, mode: 'merge', format: 'mp3', segments: [] });
     jobsRepo.fail(jid, 'ffmpeg 失败');
     makeApp('yt-dlp', 'tok2'); // 不注入 exportStarter
     const res = await app.inject({ method: 'POST', url: `/api/jobs/${jid}/retry` });
     expect(res.statusCode).toBe(500);
     expect(res.json().error.code).toBe('NOT_WIRED');
+  });
+  // 2026-10-01 T3 跨任务项:升级前的旧导出 job payload **没有 projectId**。若照旧送进 startExportJob,
+  // 会被 D22 判成"作品已删除"(假理由,违反本仓"日志必须诚实")。故重试时先查这一条,缺则跳过 + 诚实日志。
+  it('重试旧导出任务(payload 无 projectId)→ 400 + 诚实日志,不送进导出器', async () => {
+    const videoPath = join(tempDir, 'legacy-export.mp4');
+    writeFileSync(videoPath, 'VIDEOBYTES'); // 需先过 retry 分支的 existsSync(videoPath)
+    const jobsRepo = createJobsRepo(db);
+    const jid = jobsRepo.create('ffmpeg_export', { importId: 1, videoPath, mode: 'merge', format: 'mp3', segments: [] }); // 老 payload:无 projectId
+    jobsRepo.fail(jid, 'ffmpeg 失败');
+    const calls: unknown[] = [];
+    makeApp('yt-dlp', 'tok2', undefined, undefined, undefined, undefined, async (jobId, payload) => { calls.push({ jobId, payload }); });
+    const res = await app.inject({ method: 'POST', url: `/api/jobs/${jid}/retry` });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error.code).toBe('NO_WORK_INFO');
+    expect(calls).toEqual([]); // 没交给 exportStarter
+    expect(getLogs().some((l) => l.source === 'job' && l.message.includes('旧导出任务缺少作品信息'))).toBe(true);
   });
 });
 
@@ -1246,19 +1288,22 @@ describe('DELETE /api/imports/:id 连带清素材(批4)', () => {
     expect(createSourceVideosRepo(db).get(importId)).toBeNull();
     expect(existsSync(p)).toBe(false);
   });
-  // 修复轮 1(2026-09-30,spec §0.4):删来源必须级联清剪辑工程与段(库没开外键,不显式删会留孤儿工程)。
-  // 造数先例同"换集"用例:clip_projects/clip_segments 的建行路由在 P4 才有,这里原生 SQL 造
-  it('删来源 → 该来源的剪辑工程行与段一并清空;再删一次(工程已不存在)不报错', async () => {
+  // 2026-10-01 spec clip-works D7:删资料 = 现状减去"清剪辑数据" —— 作品与成品全部保留(资料没了,作品只读)。
+  it('删来源 → 不再动剪辑作品与成品(作品行/段/成品都保留)', async () => {
     makeApp('yt-dlp', 'tok2');
     const importId = createImportsRepo(db).upsertByUrl({ url: 'https://a/clip', title: '凡人', site: 'bilibili', kind: 'single', duration_sec: null, entries: null });
     const pid = Number(db.prepare('INSERT INTO clip_projects (import_id) VALUES (?)').run(importId).lastInsertRowid);
     db.prepare('INSERT INTO clip_segments (project_id, start_sec, end_sec) VALUES (?, ?, ?)').run(pid, 0, 10);
     db.prepare('INSERT INTO clip_segments (project_id, start_sec, end_sec) VALUES (?, ?, ?)').run(pid, 10, 20);
+    createAudioItemsRepo(db).create({ title: '成品', source_type: 'edit', source_url: '', file_path: 'C:/x/p.mp3', format: 'mp3', duration_sec: 1, file_size: 1, source_work_id: pid });
     expect((await app.inject({ method: 'DELETE', url: `/api/imports/${importId}` })).statusCode).toBe(200);
-    expect((db.prepare('SELECT COUNT(*) AS n FROM clip_projects WHERE import_id = ?').get(importId) as { n: number }).n).toBe(0); // 工程行被清
-    expect((db.prepare('SELECT COUNT(*) AS n FROM clip_segments WHERE project_id = ?').get(pid) as { n: number }).n).toBe(0); // 该工程的段被清
-    expect(getLogs().some((l) => l.source === 'job' && l.message.includes('连带清剪辑工程 2 段'))).toBe(true); // 仓库铁律:关键步骤留痕,N 段计数要看得见
-    expect((await app.inject({ method: 'DELETE', url: `/api/imports/${importId}` })).statusCode).toBe(200); // 幂等:工程已不存在,再删同一来源不报错
+    expect(createImportsRepo(db).get(importId)).toBeNull(); // 资料本身删了
+    expect((db.prepare('SELECT COUNT(*) AS n FROM clip_projects WHERE import_id = ?').get(importId) as { n: number }).n).toBe(1); // 作品行保留
+    expect((db.prepare('SELECT COUNT(*) AS n FROM clip_segments WHERE project_id = ?').get(pid) as { n: number }).n).toBe(2); // 段保留
+    expect(createAudioItemsRepo(db).list()).toHaveLength(1); // 成品保留
+    // 仓库铁律:关键步骤留痕;新文案要说明"保留"而不是"连带清空"
+    expect(getLogs().some((l) => l.source === 'project' && l.message.includes('剪辑作品与成品保留'))).toBe(true);
+    expect((await app.inject({ method: 'DELETE', url: `/api/imports/${importId}` })).statusCode).toBe(200); // 幂等:已删来源再删不报错
   });
 });
 
@@ -1299,5 +1344,20 @@ describe('/api/imports 派生列(has_video/has_project/segment_count/material_en
     expect(res.statusCode).toBe(200);
     expect((res.json() as { import: { has_video: boolean; has_project: boolean; segment_count: number; material_entry_index: number | null } }).import)
       .toMatchObject({ has_video: true, has_project: true, segment_count: 1, material_entry_index: 4 });
+  });
+  // 2026-10-01 spec clip-works:1:N 之后——一个资料两件作品时,列表仍**恰好一行**(不能因 JOIN 作品表被复制成多行),
+  // 且 work_count=2、segment_count=两件作品段数之和
+  it('1:N:一个资料两件作品 → 列表仍一行;work_count=2;segment_count=两作品段数之和', async () => {
+    makeApp('yt-dlp', 'tok2');
+    const imp = createImportsRepo(db).upsertByUrl({ url: 'https://a/two', title: '两作品', site: 'bilibili', kind: 'single', duration_sec: null, entries: null });
+    const clipRepo = createClipProjectsRepo(db);
+    const w1 = clipRepo.create(imp, '甲').id;
+    const w2 = clipRepo.create(imp, '乙').id;
+    db.prepare('INSERT INTO clip_segments (project_id, start_sec, end_sec) VALUES (?, ?, ?)').run(w1, 0, 10);
+    db.prepare('INSERT INTO clip_segments (project_id, start_sec, end_sec) VALUES (?, ?, ?)').run(w2, 0, 10);
+    db.prepare('INSERT INTO clip_segments (project_id, start_sec, end_sec) VALUES (?, ?, ?)').run(w2, 10, 20);
+    const body = (await app.inject({ method: 'GET', url: '/api/imports' })).json() as { imports: Array<{ id: number; has_project: boolean; segment_count: number; work_count: number }> };
+    expect(body.imports.filter((r) => r.id === imp)).toHaveLength(1); // 不因多作品被复制成多行
+    expect(body.imports.find((r) => r.id === imp)).toMatchObject({ has_project: true, segment_count: 3, work_count: 2 });
   });
 });

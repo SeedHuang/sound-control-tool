@@ -25,7 +25,8 @@ afterEach(async () => {
 
 interface HomeBody {
   ok: boolean;
-  editing: Array<{ import_id: number; name: string | null; site: string; updated_at: string; segment_count: number }>;
+  // 2026-10-01 spec clip-works D18:editing 改成**作品维度**——一行 = 一个作品,新增 project_id(前端用它跳转)
+  editing: Array<{ project_id: number; import_id: number; name: string | null; site: string; updated_at: string; segment_count: number }>;
   recent: Array<{ import_id: number; title: string; site: string; latest_audio_id: number; created_at: string }>;
 }
 const getHome = async (): Promise<HomeBody> =>
@@ -50,10 +51,13 @@ function addAudio(opts: {
   return id;
 }
 
-/** 造一个剪辑工程(带 segCount 段)并**显式指定 updated_at**(upsert 里写的是 now,测试要能控序) */
-function addProject(importId: number, name: string | null, segCount: number, updatedAt: string): void {
-  createClipProjectsRepo(db).upsert(importId, name, Array.from({ length: segCount }, (_, i) => ({ start_sec: i, end_sec: i + 1 })));
-  db.prepare('UPDATE clip_projects SET updated_at = ? WHERE import_id = ?').run(updatedAt, importId);
+/** 造一个剪辑作品(带 segCount 段)并**显式指定 updated_at**(create 里写的是 now,测试要能控序)。返回作品 id。 */
+function addProject(importId: number, name: string | null, segCount: number, updatedAt: string): number {
+  const repo = createClipProjectsRepo(db);
+  const work = repo.create(importId, name); // T2 起:create(资料id, 名字) —— 一个资料可建多个作品(1:N)
+  repo.update(work.id, name, Array.from({ length: segCount }, (_, i) => ({ start_sec: i, end_sec: i + 1 })));
+  db.prepare('UPDATE clip_projects SET updated_at = ? WHERE id = ?').run(updatedAt, work.id);
+  return work.id;
 }
 
 describe('GET /api/home —— editing(正在编辑 Top3)', () => {
@@ -67,16 +71,29 @@ describe('GET /api/home —— editing(正在编辑 Top3)', () => {
     const a = addImport('https://b/1', '来源A', 'bilibili');
     const b = addImport('https://b/2', '来源B', 'youtube');
     const c = addImport('https://b/3', '来源C', 'other');
-    addProject(a, '工程A', 2, '2026-09-01 10:00:00');
-    addProject(b, null, 0, '2026-09-02 10:00:00'); // 没命名 + 没段
-    addProject(c, '工程C', 5, '2026-09-03 10:00:00');
+    const pa = addProject(a, '工程A', 2, '2026-09-01 10:00:00');
+    const pb = addProject(b, null, 0, '2026-09-02 10:00:00'); // 没命名 + 没段
+    const pc = addProject(c, '工程C', 5, '2026-09-03 10:00:00');
 
     const body = await getHome();
     expect(body.editing).toEqual([
-      { import_id: c, name: '工程C', site: 'other', updated_at: '2026-09-03 10:00:00', segment_count: 5 },
-      { import_id: b, name: null, site: 'youtube', updated_at: '2026-09-02 10:00:00', segment_count: 0 }, // name 为 NULL → null;无段 → 0
-      { import_id: a, name: '工程A', site: 'bilibili', updated_at: '2026-09-01 10:00:00', segment_count: 2 },
-    ]); // 整体断言:顺序(新→旧)+ 字段形状 + NULL 归一一次到位
+      { project_id: pc, import_id: c, name: '工程C', site: 'other', updated_at: '2026-09-03 10:00:00', segment_count: 5 },
+      { project_id: pb, import_id: b, name: null, site: 'youtube', updated_at: '2026-09-02 10:00:00', segment_count: 0 }, // name 为 NULL → null;无段 → 0
+      { project_id: pa, import_id: a, name: '工程A', site: 'bilibili', updated_at: '2026-09-01 10:00:00', segment_count: 2 },
+    ]); // 整体断言:顺序(新→旧)+ 字段形状(含 project_id)+ NULL 归一一次到位
+  });
+
+  // 2026-10-01 spec clip-works D18:editing 是**作品维度**——同一资料有两个作品就必须出两行(去重维度从资料换成作品)
+  it('同一资料两个作品 → 两条,project_id 不同(作品维度而非资料维度)', async () => {
+    const imp = addImport('https://b/two', '来源T');
+    const p1 = addProject(imp, '作品1', 1, '2026-09-01 10:00:00');
+    const p2 = addProject(imp, '作品2', 2, '2026-09-02 10:00:00');
+
+    const body = await getHome();
+    expect(body.editing).toEqual([
+      { project_id: p2, import_id: imp, name: '作品2', site: 'bilibili', updated_at: '2026-09-02 10:00:00', segment_count: 2 },
+      { project_id: p1, import_id: imp, name: '作品1', site: 'bilibili', updated_at: '2026-09-01 10:00:00', segment_count: 1 },
+    ]);
   });
 
   it('超过 3 个工程只回 3 条', async () => {

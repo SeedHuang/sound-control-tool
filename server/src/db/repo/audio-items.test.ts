@@ -74,4 +74,13 @@ describe('audio-items repo', () => {
     const b = repo.create({ title: '无血缘', source_type: 'recording', source_url: null, file_path: 'C:/tmp/nb.wav', format: 'wav', duration_sec: null, file_size: 1 });
     expect(repo.get(b)!.source_import_id).toBeNull();
   });
+  // 2026-10-01 spec clip-works D4：成品挂作品 —— source_work_id 落库/回读，不传即 null
+  it('source_work_id 落库并回读;不传 → null', () => {
+    const repo = createAudioItemsRepo(db);
+    const a = repo.create({ title: '成品', source_type: 'edit', source_url: '', source_work_id: 5, file_path: 'C:/tmp/w.mp3', format: 'mp3', duration_sec: null, file_size: 1 });
+    expect(repo.get(a)!.source_work_id).toBe(5);
+    expect(repo.list()[0]!.source_work_id).toBe(5);
+    const b = repo.create({ title: '无作品', source_type: 'download', source_url: 'u', file_path: 'C:/tmp/nw.mp3', format: 'mp3', duration_sec: null, file_size: 1 });
+    expect(repo.get(b)!.source_work_id).toBeNull();
+  });
 });

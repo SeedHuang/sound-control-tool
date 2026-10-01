@@ -10,6 +10,8 @@ export const SETTINGS_KEYS = {
   maxConcurrentDownloads: 'max_concurrent_downloads', // 同时下载数，默认 '1'，合法 1..5
   downloadSleepSeconds: 'download_sleep_seconds', // 合集批量请求间隔(秒)，默认 '0'，合法 0..10
   downloadLimitRate: 'download_limit_rate', // 限速，默认 ''（不限），非空须形如 '500K'
+  // 剪辑室 hover 预览的默认开关（spec clip-works D12）：'1' = 静音（默认）。加入白名单才能被 PUT。
+  studioPreviewMuted: 'studio_preview_muted',
 } as const;
 
 // B 站 Cookie 存储键:故意不加入 SETTINGS_KEYS——settings 路由的白名单按 Object.values(SETTINGS_KEYS) 过滤,

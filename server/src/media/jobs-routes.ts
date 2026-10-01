@@ -8,6 +8,7 @@ import type { FastifyInstance } from 'fastify';
 import type { DB } from '../db/index.js';
 import { createJobsRepo, type ActiveJobRow } from '../db/repo/jobs.js';
 import { createImportsRepo } from '../db/repo/imports.js';
+import { pushLog } from '../logs.js';
 
 /**
  * 下载批次统计（spec D16）：分数「已完成/本批总数」必须有明确口径，且**只统计下载类**。
@@ -63,17 +64,36 @@ export interface JobsRoutesDeps {
 }
 
 /** payload 里本接口需要的字段（全 unknown，逐个类型守卫后再用——payload 是外部可写列） */
-type JobPayloadShape = { title?: unknown; url?: unknown; importId?: unknown; entryIndex?: unknown };
+type JobPayloadShape = { title?: unknown; url?: unknown; importId?: unknown; entryIndex?: unknown; workName?: unknown };
 
+/**
+ * 解析 job payload（外部可写列）。**必须兜底**：`JSON.parse('null')` 返回 `null`（合法 JSON，不抛），
+ * 随后解引用会 TypeError → `GET /api/jobs` 直接 500，连带拖垮任务抽屉与托盘（2026-10-01 挂账项）。
+ * 故：解析失败、或结果不是对象 → 一律按空载荷处理 + 一行 error 日志（不得静默 catch，仓库铁律）。
+ */
 function parsePayload(raw: string): JobPayloadShape {
-  try { return JSON.parse(raw) as JobPayloadShape; } catch { return {}; }
+  let v: unknown;
+  try {
+    v = JSON.parse(raw);
+  } catch (e) {
+    pushLog('error', 'job', `job payload JSON 解析失败(按空载荷处理): ${e instanceof Error ? e.message : String(e)} raw=${raw.slice(0, 80)}`);
+    return {};
+  }
+  if (v === null || typeof v !== 'object' || Array.isArray(v)) {
+    pushLog('error', 'job', `job payload 不是对象(按空载荷处理): raw=${raw.slice(0, 80)}`);
+    return {};
+  }
+  return v as JobPayloadShape;
 }
 
 /**
- * 标题三级回退（spec §0.3）：payload.title ?? payload.url ?? 按 payload.importId join imported_sources.title ?? #<id>。
- * 下载任务的 payload 带 title；剪辑/导出（ffmpeg_*）的 payload 只有 importId，必须回查来源表才有标题。
+ * 标题回退（spec §0.3 + clip-works D19）：payload.workName ?? payload.title ?? payload.url ?? 按 payload.importId
+ * join imported_sources.title ?? #<id>。
+ * 下载任务的 payload 带 title；剪辑/导出（ffmpeg_*）的 payload 带 workName（作品名，优先显示）/importId，回查来源表才有资料标题。
  */
 function resolveTitle(db: DB, row: ActiveJobRow, payload: JobPayloadShape): string {
+  // D19(clip-works):优先显示**作品名**——作品可无名字(name 为 null → payload.workName 是 null/空),故空串/空白回退下一级
+  if (typeof payload.workName === 'string' && payload.workName.trim() !== '') return payload.workName;
   if (typeof payload.title === 'string' && payload.title.trim() !== '') return payload.title;
   if (typeof payload.url === 'string' && payload.url.trim() !== '') return payload.url;
   if (typeof payload.importId === 'number' && Number.isInteger(payload.importId) && payload.importId > 0) {

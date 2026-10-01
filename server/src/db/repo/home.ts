@@ -4,10 +4,12 @@
 // (SQL 返回的裸列是 unknown,统一在这里归一成类型化行,避免形状漂到路由层)。
 import type { DB } from '../index.js';
 
-/** editing:正在编辑的工程(按 updated_at 倒序 Top3);形状与 GET /api/projects 对齐 → 前端复用同一渲染 */
+/** editing:正在编辑的**作品**(按作品 updated_at 倒序 Top3);形状与 GET /api/projects 对齐 → 前端复用同一渲染。
+ *  2026-10-01 spec clip-works D18:口径从"资料维度"改成"作品维度"——一行 = 一个作品,新增 project_id(前端据此跳 /studio/:projectId)。 */
 export interface HomeEditingRow {
-  import_id: number;
-  name: string | null; // 用户没命名过 → null(前端显示「未命名工程」)
+  project_id: number;  // 作品 id(clip_projects.id):前端跳转目标
+  import_id: number;   // 所属资料 id:前端取封面/素材用
+  name: string | null; // 用户没命名过 → null(前端显示「未命名作品」)
   site: string;        // 供前端画平台 logo
   updated_at: string;
   segment_count: number;
@@ -23,17 +25,20 @@ export interface HomeRecentRow {
 }
 
 export function createHomeRepo(db: DB) {
-  /** 正在编辑 Top3。JOIN imported_sources 是必须的:clip_projects 只存 import_id,site 在来源表里。
-   *  用 INNER JOIN —— 工程指向的来源若已不存在(删来源的清理漏网),这条就不该出现在首页(与「排除裸 import_id」同义)。
-   *  segment_count 用相关子查询算段数:一个工程段数极少(≤50),比 LEFT JOIN + GROUP BY 更直白、也不影响 Top3 的行数。 */
+  /** 正在编辑 Top3(**作品维度**,clip-works D18)。
+   *  JOIN imported_sources 是必须的:clip_projects 只存 import_id,site 在来源表里。
+   *  用 INNER JOIN —— 作品指向的资料若已不存在(删资料的清理漏网),这条就不该出现在首页(与「排除裸 import_id」同义)。
+   *  segment_count 用相关子查询算**该作品**的段数(一个作品段数极少,比 LEFT JOIN + GROUP BY 更直白)。
+   *  ORDER BY p.updated_at DESC, p.id DESC:同一资料多件作品按各自更新时间排,同一时刻用 id 兜底稳定。 */
   const editing = (): HomeEditingRow[] =>
     (db.prepare(
-      'SELECT p.import_id AS import_id, p.name AS name, s.site AS site, p.updated_at AS updated_at, ' +
+      'SELECT p.id AS project_id, p.import_id AS import_id, p.name AS name, s.site AS site, p.updated_at AS updated_at, ' +
       '(SELECT COUNT(*) FROM clip_segments seg WHERE seg.project_id = p.id) AS segment_count ' +
       'FROM clip_projects p ' +
       'JOIN imported_sources s ON s.id = p.import_id ' +
-      'ORDER BY p.updated_at DESC, p.import_id DESC LIMIT 3',
+      'ORDER BY p.updated_at DESC, p.id DESC LIMIT 3',
     ).all() as Array<Record<string, unknown>>).map((r) => ({
+      project_id: Number(r.project_id),
       import_id: Number(r.import_id),
       name: r.name === null || r.name === undefined ? null : String(r.name), // NULL 归一(沿用 clip-projects repo 写法)
       site: String(r.site),

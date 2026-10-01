@@ -103,6 +103,22 @@ describe('ingestDownloadedFile', () => {
     });
     expect(audioRepo.get(nid)!.source_import_id).toBeNull();
   });
+  // 2026-10-01 spec clip-works D4：sourceWorkId 透传到 source_work_id（缺省 → null）
+  it('sourceWorkId 透传进 source_work_id(缺省 → null)', () => {
+    const audioRepo = createAudioItemsRepo(db);
+    const t1 = join(dir, 'work.mp3'); writeFileSync(t1, 'x');
+    const { audioId } = ingestDownloadedFile({
+      tmpPath: t1, title: '挂作品', format: 'mp3', durationSec: null, fileSize: 1,
+      sourceUrl: '', sourceWorkId: 9, audioDir: dir, exists: existsSync, audioRepo,
+    });
+    expect(audioRepo.get(audioId)!.source_work_id).toBe(9);
+    const t2 = join(dir, 'nowork.mp3'); writeFileSync(t2, 'y');
+    const { audioId: nid } = ingestDownloadedFile({
+      tmpPath: t2, title: '无作品', format: 'mp3', durationSec: null, fileSize: 1,
+      sourceUrl: '', audioDir: dir, exists: existsSync, audioRepo,
+    });
+    expect(audioRepo.get(nid)!.source_work_id).toBeNull();
+  });
 });
 
 describe('moveIntoPlace(跨盘兜底, spec D6)', () => {

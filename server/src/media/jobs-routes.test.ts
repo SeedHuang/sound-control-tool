@@ -42,6 +42,24 @@ describe('GET /api/jobs（spec D9/D16）', () => {
     const titles = (await app.inject({ method: 'GET', url: '/api/jobs?active=1' })).json().jobs.map((j: { title: string }) => j.title);
     expect(titles).toEqual(['有标题', 'https://a/only-url', '来源标题']);
   });
+  // 2026-10-01 spec clip-works D19:导出任务优先显示作品名(payload.workName),取不到才回退现有三级
+  it('title 优先用 payload.workName;空作品名回退 payload.title', async () => {
+    db.prepare('INSERT INTO imported_sources (url,title,site,kind) VALUES (?,?,?,?)').run('https://a/w', '资料标题', 'bilibili', 'single');
+    addJob('ffmpeg_export', 'running', { importId: 1, workName: '我的作品', title: '资料标题' });
+    addJob('ffmpeg_export', 'running', { importId: 1, workName: '', title: '回退标题' }); // 空串/空白应回退
+    const titles = (await app.inject({ method: 'GET', url: '/api/jobs?active=1' })).json().jobs.map((j: { title: string }) => j.title);
+    expect(titles).toEqual(['我的作品', '回退标题']);
+  });
+  // 2026-10-01 挂账项:job payload 是 `null`(合法 JSON)时 JSON.parse 返回 null,旧实现直接解引用 → GET /api/jobs 500
+  // → 拖垮任务抽屉与托盘。解析失败/非对象一律按空载荷处理 + 一行 error 日志(不得静默)。
+  it("payload 是 'null' → 不 500,按空载荷处理(标题回退 #id)", async () => {
+    const id = Number(db.prepare('INSERT INTO jobs (kind, payload, status) VALUES (?,?,?)').run('ffmpeg_export', 'null', 'running').lastInsertRowid);
+    const res = await app.inject({ method: 'GET', url: '/api/jobs?active=1' });
+    expect(res.statusCode).toBe(200);
+    const job = (res.json().jobs as Array<{ id: number; title: string; subtitle: string | null }>).find((j) => j.id === id)!;
+    expect(job.title).toBe(`#${id}`);
+    expect(job.subtitle).toBeNull();
+  });
   it('subtitle：payload.entryIndex 有值 → 「第 N 集」，否则 null', async () => {
     addJob('ytdlp_video', 'running', { url: 'https://a/e', entryIndex: 3 });
     addJob('ytdlp_video', 'running', { url: 'https://a/n' });

@@ -215,11 +215,12 @@ function createDownloadHandlers(deps: YtdlpDeps) {
       invalidateDerived(derivedDirFor(mediaDir), row.id);
       // D19 判定留痕(Task 2 消费):集号变没变一眼可查(pushLog source 联合类型无 'ytdlp',与 finalize 其余日志同源用 'job')
       pushLog('info', 'job', `video 素材 entry_index: ${oldEntryIndex} → ${newEntryIndex} import=${row.id}`);
-      // D19 服务端(2026-09-30):换集 → 清空该来源的剪辑工程(段 + 工程行);同集换清晰度重下 → 保留,用户的剪辑点不丢。
+      // 2026-10-01 spec clip-works D8(替换 D19 旧语义):换集 → 只清空该资料下**所有作品**的剪辑点,
+      // 作品行与成品都保留(T2 已把 clearByImportId 换成 clearSegmentsByImportId —— 后者不删作品行)。
       // NULL 语义:两侧都 ?? null 归一后再比——同为 NULL(单视频重下)视为相同,不清
       if ((oldEntryIndex ?? null) !== (newEntryIndex ?? null)) {
-        const cleared = createClipProjectsRepo(db).clearByImportId(row.id);
-        pushLog('info', 'job', `换集 ${oldEntryIndex} → ${newEntryIndex}: 清空剪辑工程 ${cleared} 段 import=${row.id}`);
+        const r = createClipProjectsRepo(db).clearSegmentsByImportId(row.id);
+        pushLog('info', 'job', `换集 ${oldEntryIndex} → ${newEntryIndex}: 清空该资料下作品的剪辑点 作品${r.works}个/段${r.segments}个 import=${row.id}`);
       } else {
         pushLog('debug', 'job', `video entry_index 未变(${String(newEntryIndex)}),保留剪辑工程 import=${row.id}`);
       }
@@ -681,10 +682,9 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
     // R3-2：删来源连带删素材 → 派生图作废。无条件调用（v === null 也调）：防「素材行已删但派生图残留」。
     // 删失败只记日志、不阻断（invalidateDerived 内部兜底），接口仍返回来源删除结果
     invalidateDerived(derivedDirFor(mediaDir), id);
-    // 修复轮 1(2026-09-30,spec §0.4):删来源还要显式级联清剪辑工程与段 —— 同因库没开外键,不清会留孤儿工程。
-    // 排在删素材之后同一条链路里;clearByImportId 幂等(无工程删 0 行返 0 不抛),无条件调用即安全
-    const clearedSegs = createClipProjectsRepo(db).clearByImportId(id);
-    pushLog('info', 'job', `来源 ${id} 删除 → 连带清剪辑工程 ${clearedSegs} 段`);
+    // D7(2026-10-01 spec clip-works):删资料**不再清剪辑作品与成品** —— 作品与成品全部保留(资料没了,作品只读)。
+    // 旧写法在此调 clearByImportId 会连作品行一起删;T2 已移除该方法,这里只留一行说明性日志。
+    pushLog('info', 'project', `来源 ${id} 删除 → 剪辑作品与成品保留(只读)`);
     // 顺手清掉这个来源的封面失败冷却(2026-09-29 评审补):id 是自增的,不清就会随进程一直攒着(慢泄漏)。
     // 正在抓的那发不动 —— 它的 finally 自己会从 coverInFlight 里摘掉。
     coverFailedAt.delete(id);
@@ -786,12 +786,20 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
       : old.kind === 'ffmpeg_export' ? 'ffmpeg_export'
       : 'ytdlp_download';
     if (kind === 'ffmpeg_clip' || kind === 'ffmpeg_export') {
-      const p = JSON.parse(old.payload) as { videoPath?: string };
+      const p = JSON.parse(old.payload) as { videoPath?: string; projectId?: unknown };
       // 素材绝对路径已不在 → 明确失败(不静默:否则重试只会起一个注定失败的任务)
       if (typeof p.videoPath !== 'string' || !existsSync(p.videoPath)) {
         return reply.code(409).send({ ok: false, error: { code: 'MEDIA_GONE', message: '素材已不存在，请重新下载视频', next: '回到资料库重新下视频' } });
       }
       if (kind === 'ffmpeg_export') {
+        // 2026-10-01 spec clip-works(T3 跨任务项):升级前的旧导出 job payload **没有 projectId**。
+        // 若照旧送进 startExportJob,ffmpeg-export 的 D22 校验会把缺字段判成"作品已被删除"——那是假理由
+        // (旧任务根本没有作品信息),违反本仓"日志必须诚实"。故在此先查这一处:缺 projectId → 跳过重试 + 如实留痕。
+        // 注:改这里而不是 ffmpeg-export.ts(那是 T3 已审过的文件;它只管运行时,重试的取舍归路由)。
+        if (typeof p.projectId !== 'number') {
+          pushLog('info', 'job', `旧导出任务缺少作品信息,跳过重试 job=${id}`);
+          return reply.code(400).send({ ok: false, error: { code: 'NO_WORK_INFO', message: '旧导出任务缺少作品信息，无法重试', next: '请从作品重新导出' } });
+        }
         if (deps.exportStarter === undefined) return reply.code(500).send({ ok: false, error: { code: 'NOT_WIRED', message: '导出重试未接线', next: '' } });
         const newId = jobsRepo.create('ffmpeg_export', p); // 原载荷整体复用(p 运行时是完整 payload,类型注解只是收窄)
         pushLog('info', 'job', `export job ${newId} created by retry of ${id}`); // 诊断日志:重试也留痕
@@ -842,9 +850,18 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
     }
     return out;
   };
-  app.get('/api/audio', async () =>
-    audioRepo.list().map((row) => ({ ...row, ...fillEpisodeFromImport(row), site: detectSite(row.source_url ?? '') })),
-  );
+  // 2026-10-01 spec clip-works D17:新增查询参数 `?project=<作品id>`——只回该作品的成品(source_work_id = ?)。
+  // 契约(spec §0.4):不传 / 乱传 → 维持现状回全部;传不存在的正整数 → **空数组**(它是列表过滤,不是资源寻址,不报 404)。
+  // 过滤落在路由层(audioRepo 只有 list())——不为它改 repo,也不新开端点。
+  app.get('/api/audio', async (req) => {
+    const q = (req.query ?? {}) as { project?: string };
+    const projectId = Number(q.project);
+    const onlyWork = q.project !== undefined && Number.isInteger(projectId) && projectId > 0;
+    return audioRepo
+      .list()
+      .filter((row) => !onlyWork || row.source_work_id === projectId)
+      .map((row) => ({ ...row, ...fillEpisodeFromImport(row), site: detectSite(row.source_url ?? '') }));
+  });
 
   // 诊断日志(2026-09-29 用户反馈):环形缓冲最近 500 条,前端"日志"按钮拉取。
   // 守卫不需要改——index.ts 的 onRequest 对 /api/* 校验 token(localhost 来源豁免),

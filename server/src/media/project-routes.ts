@@ -1,12 +1,16 @@
 // server/src/media/project-routes.ts
-// 剪辑工程路由（P4，spec §0.3 剪辑工程）：GET 列表/详情、PUT 全量替换、DELETE 幂等、POST 导出（job）。
+// 剪辑**作品**路由（2026-10-01 spec clip-works D3/D6/D15）：
+//   POST 新建作品 · GET 列表/详情 · PUT 全量替换段 · DELETE（连带成品）· POST 导出（job）。
+// ⚠️ 路由参数 `:projectId` 是**作品 id**（clip_projects.id），不再是 import_id —— 两者都是 number，
+//    TypeScript 抓不到这种「含义漂移」；改动/审查时必须逐处核对实参来源（见各 handler 注释）。
 import type { FastifyInstance } from 'fastify';
-import { existsSync } from 'node:fs';
+import { existsSync, unlinkSync } from 'node:fs';
 import type { DB } from '../db/index.js';
 import { createImportsRepo } from '../db/repo/imports.js';
 import { createClipProjectsRepo } from '../db/repo/clip-projects.js';
 import { createJobsRepo } from '../db/repo/jobs.js';
 import { createSourceVideosRepo } from '../db/repo/source-videos.js';
+import { inTransaction } from '../db/tx.js';
 import { pushLog } from '../logs.js';
 import { startExportJob, type ExportJobPayload } from './ffmpeg-export.js';
 
@@ -47,49 +51,90 @@ export function registerProjectRoutes(
   const { db } = deps;
   const projectsRepo = createClipProjectsRepo(db);
   const importsRepo = createImportsRepo(db);
-  const badId = (importId: number): boolean => !Number.isInteger(importId) || importId <= 0;
+  const videosRepo = createSourceVideosRepo(db);
+  /** 参数是**作品 id**（不是 import_id）——名字刻意叫 projectId，防含义漂移 */
+  const badId = (projectId: number): boolean => !Number.isInteger(projectId) || projectId <= 0;
 
   app.get('/api/projects', async () => ({ ok: true, projects: projectsRepo.list() }));
 
-  app.get('/api/projects/:importId', async (req, reply) => {
-    const importId = Number((req.params as { importId: string }).importId);
-    if (badId(importId)) return reply.code(404).send({ ok: false, error: { code: 'NOT_FOUND', message: '来源不存在', next: '' } });
-    if (importsRepo.get(importId) === null) return reply.code(404).send({ ok: false, error: { code: 'NOT_FOUND', message: '来源不存在', next: '' } });
-    return { ok: true, project: projectsRepo.get(importId) }; // 来源在、没工程 → project:null（正常）
+  // 新建作品（D15）：默认名走 repo.nextName（D23：现存最大序号 + 1）。三道前置校验，每道都带可执行的 next。
+  app.post('/api/projects', async (req, reply) => {
+    const body = (req.body ?? {}) as { importId?: unknown };
+    const importId = typeof body.importId === 'number' ? body.importId : NaN; // 这里的 id 是**资料 id**
+    if (badId(importId)) return reply.code(404).send({ ok: false, error: { code: 'NOT_FOUND', message: '资料不存在', next: '资料不存在，可能已被删除' } });
+    const importRow = importsRepo.get(importId);
+    if (importRow === null) return reply.code(404).send({ ok: false, error: { code: 'NOT_FOUND', message: '资料不存在', next: '资料不存在，可能已被删除' } });
+    const video = videosRepo.get(importId);
+    if (video === null) {
+      // 前端只能凭 has_video 判断"可剪"，列不出"素材行在但文件丢了"的资料 → 报错必须自己把话说全（spec §0.4）
+      return reply.code(404).send({ ok: false, error: { code: 'NOT_FOUND', message: '该资料还没有视频素材', next: '先到资料库下载视频素材' } });
+    }
+    if (!existsSync(video.file_path)) {
+      return reply.code(404).send({ ok: false, error: { code: 'FILE_MISSING', message: '素材文件已丢失，请重新下载视频', next: '回到资料库重新下视频' } });
+    }
+    const work = projectsRepo.create(importId, projectsRepo.nextName(importId, importRow.title));
+    pushLog('info', 'project', `作品已创建 id=${work.id} import=${importId} name=${work.name}`);
+    return reply.code(201).send({ ok: true, project: work });
   });
 
-  app.put('/api/projects/:importId', async (req, reply) => {
-    const importId = Number((req.params as { importId: string }).importId);
-    if (badId(importId)) return reply.code(404).send({ ok: false, error: { code: 'NOT_FOUND', message: '来源不存在', next: '' } });
-    if (importsRepo.get(importId) === null) {
-      // 评审盲点 P1-11：来源被删后不能只给裸 404——要告诉前端「这条来源已没了」，否则用户反复点保存不知为何失败
-      return reply.code(404).send({ ok: false, error: { code: 'NOT_FOUND', message: '来源不存在', next: '该来源已被删除，无法保存' } });
+  app.get('/api/projects/:projectId', async (req, reply) => {
+    const projectId = Number((req.params as { projectId: string }).projectId); // 作品 id
+    if (badId(projectId)) return reply.code(404).send({ ok: false, error: { code: 'NOT_FOUND', message: '作品不存在', next: '' } });
+    const project = projectsRepo.get(projectId);
+    if (project === null) return reply.code(404).send({ ok: false, error: { code: 'NOT_FOUND', message: '作品不存在', next: '' } });
+    return { ok: true, project };
+  });
+
+  app.put('/api/projects/:projectId', async (req, reply) => {
+    const projectId = Number((req.params as { projectId: string }).projectId); // 作品 id
+    if (badId(projectId)) return reply.code(404).send({ ok: false, error: { code: 'NOT_FOUND', message: '作品不存在', next: '' } });
+    const existing = projectsRepo.get(projectId);
+    if (existing === null) {
+      // 作品被删后不能只给裸 404——要告诉前端「这件作品已没了」，否则用户反复点保存不知为何失败
+      return reply.code(404).send({ ok: false, error: { code: 'NOT_FOUND', message: '作品不存在', next: '该作品已被删除，无法保存' } });
     }
     const body = (req.body ?? {}) as { name?: unknown; segments?: unknown };
     const parsed = parseSegments(body.segments);
     if (!parsed.ok) return reply.code(400).send({ ok: false, error: { code: 'BAD_REQUEST', message: parsed.message, next: parsed.next } });
-    const existing = projectsRepo.get(importId);
     const name = typeof body.name === 'string'
       ? (body.name.trim() === '' ? null : body.name.trim())
-      : (existing?.name ?? null); // 不传 → 更新时保留旧名；首次创建 → null
-    const saved = projectsRepo.upsert(importId, name, parsed.segments);
-    pushLog('info', 'project', `工程已保存 import=${importId} 段数=${saved.segments.length} name=${name ?? '(无)'}`);
+      : existing.name; // 不传 → 保留旧名（空白串 → null）
+    const saved = projectsRepo.update(projectId, name, parsed.segments);
+    pushLog('info', 'project', `作品已保存 id=${projectId} 段数=${saved.segments.length} name=${name ?? '(无)'}`);
     return { ok: true, project: saved };
   });
 
-  app.delete('/api/projects/:importId', async (req, reply) => {
-    const importId = Number((req.params as { importId: string }).importId);
-    if (badId(importId)) return reply.code(404).send({ ok: false, error: { code: 'NOT_FOUND', message: '来源不存在', next: '' } });
-    const deleted = projectsRepo.delete(importId); // 不删素材、不删已导出音频
-    pushLog('info', 'project', `工程已删除 import=${importId} deleted=${deleted}`);
-    return { ok: true, deleted }; // 幂等：不存在 → deleted:0，仍 200
+  // 删作品（D6）：连带删它的成品（DB 行 + 磁盘文件）。顺序 = 先读成品路径(行还在才读得到) → 删作品+段
+  // → 删成品行 → 最后删磁盘文件。文件删除在事务外，失败只记日志、接口仍 200 —— DB 行删掉就达到用户"删了"的语义（仓库铁律）。
+  app.delete('/api/projects/:projectId', async (req, reply) => {
+    const projectId = Number((req.params as { projectId: string }).projectId); // 作品 id
+    if (badId(projectId)) return reply.code(404).send({ ok: false, error: { code: 'NOT_FOUND', message: '作品不存在', next: '' } });
+    // 1) 先取成品清单：file_path 必须先读出来，成品行一删就查不到了
+    const products = db.prepare('SELECT id, file_path FROM audio_items WHERE source_work_id = ?').all(projectId) as Array<{ id: number; file_path: string }>;
+    // 2) 删作品 + 它的段（repo.delete 自带事务）
+    const deleted = projectsRepo.delete(projectId);
+    // 3) 删成品行（独立事务）——DB 行删掉就算"删了"
+    const deletedProducts = inTransaction(db, () => Number(db.prepare('DELETE FROM audio_items WHERE source_work_id = ?').run(projectId).changes));
+    // 4) 最后删磁盘文件：失败不阻断（ENOENT/权限等都只记日志）
+    for (const p of products) {
+      try {
+        unlinkSync(p.file_path);
+        pushLog('info', 'project', `作品 ${projectId} 连带删除成品文件 id=${p.id} path=${p.file_path}`);
+      } catch (err) {
+        pushLog('info', 'project', `作品 ${projectId} 成品文件删除跳过 id=${p.id} code=${(err as NodeJS.ErrnoException).code ?? '?'} path=${p.file_path} (DB 行已删)`);
+      }
+    }
+    pushLog('info', 'project', `作品已删除 id=${projectId} deleted=${deleted} deleted_products=${deletedProducts}`);
+    return { ok: true, deleted, deleted_products: deletedProducts }; // 幂等：不存在 → deleted:0 / deleted_products:0，仍 200
   });
 
-  // 导出（spec D9/D15/D8）：POST 起 job，201 带 jobId；产物由 job 异步入库（sourceType='edit'）。
-  // segments 必传（D15：以请求体为准，不读 DB 工程、不自动保存）；mode/format 非法 → 400。
-  app.post('/api/projects/:importId/export', async (req, reply) => {
-    const importId = Number((req.params as { importId: string }).importId);
-    if (badId(importId)) return reply.code(404).send({ ok: false, error: { code: 'NOT_FOUND', message: '素材不存在', next: '' } });
+  // 导出（spec D9/D15/D22）：POST 起 job，201 带 jobId；产物由 job 异步入库（sourceType='edit'，挂作品 D4）。
+  // segments 必传（D15：以请求体为准，不读 DB 作品、不自动保存）；mode/format 非法 → 400。
+  app.post('/api/projects/:projectId/export', async (req, reply) => {
+    const projectId = Number((req.params as { projectId: string }).projectId); // 作品 id
+    if (badId(projectId)) return reply.code(404).send({ ok: false, error: { code: 'NOT_FOUND', message: '作品不存在', next: '' } });
+    const project = projectsRepo.get(projectId);
+    if (project === null) return reply.code(404).send({ ok: false, error: { code: 'NOT_FOUND', message: '作品不存在', next: '' } });
     const body = (req.body ?? {}) as { mode?: unknown; format?: unknown; quality?: unknown; segments?: unknown };
     if (body.mode !== 'separate' && body.mode !== 'merge') {
       return reply.code(400).send({ ok: false, error: { code: 'BAD_REQUEST', message: 'mode 只能是 separate 或 merge', next: '选择导出方式' } });
@@ -102,18 +147,20 @@ export function registerProjectRoutes(
     const parsed = parseSegments(body.segments); // D15：segments 必传，导出以请求体为准
     if (!parsed.ok) return reply.code(400).send({ ok: false, error: { code: 'BAD_REQUEST', message: parsed.message, next: parsed.next } });
     if (parsed.segments.length === 0) return reply.code(400).send({ ok: false, error: { code: 'BAD_REQUEST', message: '没有可导出的剪辑段', next: '先添加剪辑段' } });
-    const video = createSourceVideosRepo(db).get(importId);
+    // 视频素材与标题回退都靠作品的 import_id（成品归属才是作品，见 D4/D5）
+    const importId = project.import_id;
+    const video = videosRepo.get(importId);
     if (!video) return reply.code(404).send({ ok: false, error: { code: 'NOT_FOUND', message: '素材不存在', next: '先下载视频' } });
     if (!existsSync(video.file_path)) return reply.code(404).send({ ok: false, error: { code: 'FILE_MISSING', message: '素材文件已丢失，请重新下载视频', next: '' } });
     const importRow = importsRepo.get(importId);
-    const project = projectsRepo.get(importId);
-    const prefix = project?.name ?? importRow?.title ?? '剪辑音频'; // 前缀由服务端定（D9）：工程名 → 无则来源标题
+    const prefix = project.name ?? importRow?.title ?? '剪辑音频'; // 前缀由服务端定（D9）：作品名 → 无则资料标题
     const payload: ExportJobPayload = {
       importId, videoPath: video.file_path, mode: body.mode, format,
       quality: typeof body.quality === 'string' ? body.quality : undefined, prefix, segments: parsed.segments,
+      projectId, workName: project.name, // D19：任务抽屉优先显示作品名
     };
     const jobId = createJobsRepo(db).create('ffmpeg_export', payload);
-    pushLog('info', 'job', `export job ${jobId} created import=${importId} mode=${body.mode} 段数=${parsed.segments.length}`);
+    pushLog('info', 'job', `export job ${jobId} created project=${projectId} import=${importId} mode=${body.mode} 段数=${parsed.segments.length}`);
     // 不 await（同 clip 路由）：201 先回，前端拿 jobId 建 SSE 订阅；异步完成后事件才有人收
     void startExportJob(jobId, payload, { db, audioDir: deps.audioDir, tempDir: deps.tempDir });
     return reply.code(201).send({ ok: true, jobId });

@@ -1,9 +1,11 @@
 // 导出任务(spec D9/D15/D8):separate 每段一条音频入库;merge concat 成一条。
 // 与 clip-job.ts 同族:产物走 ingestDownloadedFile + sourceType='edit'(D8),标题由后端强制拼(前端传的 label/title 不作前缀)。
+// 2026-10-01 spec clip-works:成品挂作品(D4)、payload 带作品名(D19)、入库前校验作品仍在(D22)。
 import { existsSync, mkdirSync, rmSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import type { DB } from '../db/index.js';
 import { createAudioItemsRepo } from '../db/repo/audio-items.js';
+import { createClipProjectsRepo } from '../db/repo/clip-projects.js';
 import { createJobsRepo } from '../db/repo/jobs.js';
 import { runClip, runFfmpegArgs } from '../ffmpeg/clip.js';
 import { buildMergeArgs } from '../ffmpeg/export-args.js';
@@ -19,6 +21,10 @@ export interface ExportSegment { start_sec: number; end_sec: number; label?: str
 export interface ExportJobPayload {
   importId: number; videoPath: string; mode: 'separate' | 'merge';
   format: 'mp3' | 'm4a' | 'wav'; quality?: string; prefix: string; segments: ExportSegment[];
+  /** 2026-10-01 spec clip-works D4：成品归属的作品 id（写入 audio_items.source_work_id） */
+  projectId: number;
+  /** 2026-10-01 spec clip-works D19：任务抽屉优先显示的作品名；无命名 → null */
+  workName: string | null;
 }
 /** merge 的标题:前缀 [共N段](spec §0.3) */
 export function formatMergeTitle(prefix: string, count: number): string { return `${prefix} [共${count}段]`; }
@@ -29,9 +35,18 @@ const ffprobePathFrom = (ffmpegPath: string): string => ffmpegPath.replace(/ffmp
 
 export async function startExportJob(jobId: number, payload: ExportJobPayload, deps: { db: DB; audioDir: string; tempDir: string }): Promise<void> {
   const jobsRepo = createJobsRepo(deps.db);
+  const projectsRepo = createClipProjectsRepo(deps.db);
   jobsRepo.update(jobId, { status: 'running' });
   // 失败收敛:置 error + 日志 + SSE 终态(一次写完,避免逐处漂移)——source 用 'job'(导出是 job 语义)
   const fail = (msg: string): void => { jobsRepo.fail(jobId, msg); pushLog('error', 'job', `export job ${jobId} 失败: ${msg}`); emit(jobId, { type: 'status', state: 'error', message: msg }); };
+  // D22:导出是异步长任务(几十秒到几分钟),用户完全可能中途删掉作品 → 入库前必须重查,
+  // 否则会写出一条指向已删作品的成品(悬空行 + 白占一份文件)。丢弃产物 + 置 error + 记日志。
+  const discardIfWorkGone = (tmp: string): boolean => {
+    if (projectsRepo.get(payload.projectId) !== null) return false;
+    try { rmSync(tmp, { force: true }); } catch { /* 尽力清理 */ }
+    fail('作品已被删除，产物已丢弃');
+    return true;
+  };
   try {
     // 素材绝对路径已不在 → 明确失败(不静默;retry 路径也据此拦,见 ytdlp-routes)
     if (!existsSync(payload.videoPath)) { fail('素材已不存在，请重新下载视频'); return; }
@@ -56,10 +71,11 @@ export async function startExportJob(jobId: number, payload: ExportJobPayload, d
         tmpPath: tmp, title, format: payload.format, durationSec,
         fileSize: statSync(tmp).size, sourceUrl: '', entryIndex: null, collectionTitle: null,
         sourceType: 'edit',
-        sourceImportId: payload.importId, // 2026-10-01 spec audio-lineage D3:导出产物同样记血缘(改造前恒为 NULL)
+        sourceImportId: payload.importId, // Spec A 的冗余列,继续写(权威是作品 D5)
+        sourceWorkId: payload.projectId,   // 2026-10-01 spec clip-works D4:成品挂作品
         audioDir: outputDir, exists: existsSync, audioRepo,
       }).audioId;
-      pushLog('info', 'job', `export job ${jobId} 入库 audio=${audioId} source_import_id=${payload.importId}`);
+      pushLog('info', 'job', `export job ${jobId} 入库 audio=${audioId} source_import_id=${payload.importId} source_work_id=${payload.projectId}`);
       return audioId;
     };
 
@@ -74,6 +90,7 @@ export async function startExportJob(jobId: number, payload: ExportJobPayload, d
         const title = formatClipTitle(payload.prefix, seg.start_sec, seg.end_sec); // 前端传的 label/title 不作前缀（后端强制拼）
         const dur = await probeDuration(ffprobePath, tmp);
         pushLog('info', 'job', `export job ${jobId} 第 ${i + 1}/${payload.segments.length} 段请求 ${seg.start_sec}-${seg.end_sec}s，实测 ${dur ?? '?'}s`);
+        if (discardIfWorkGone(tmp)) return; // D22:逐段入库前校验(作品没了就丢弃这一段)
         produced.push(ingest(tmp, title, dur));
         emit(jobId, { type: 'progress', percent: Math.round(((i + 1) / payload.segments.length) * 100) });
       }
@@ -91,6 +108,7 @@ export async function startExportJob(jobId: number, payload: ExportJobPayload, d
     if (!r.ok) { try { rmSync(tmp, { force: true }); } catch { /* 尽力清理 */ } fail(`合并导出失败：${tail(r.stderr)}`); return; }
     const title = formatMergeTitle(payload.prefix, payload.segments.length);
     const dur = await probeDuration(ffprobePath, tmp);
+    if (discardIfWorkGone(tmp)) return; // D22:合并产物入库前校验一次
     const audioId = ingest(tmp, title, dur);
     jobsRepo.finish(jobId);
     pushLog('info', 'job', `export job ${jobId} done mode=merge → audio ${audioId} @ ${title}`);
