@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - 页面地图与命名（D1）：首页 `/`、资料库 `/library`、剪辑室 `/studio`、剪辑详情 `/studio/:importId`、设置 `/settings`；导航四项。
-- 页面头（D2）：两行 —— ① 平台 logo + 标题 + 元信息 ② 工具栏；**固定不滚**。设置页用简化形态（无工具栏行）。
+- 页面头（D2）：两行 —— ① 平台 logo + 标题 + 元信息 ② 工具栏；**固定不滚**。资料库是双栏页，它的页面头属于**右栏**、不是整页。（"设置页用简化形态"是当时的设想；实况设置页并未引用 `PageHeader`——它是一摞 `Card`，由 2026-09-30 切片扫正。）
 - 滚动（D3）：layout 内容区不再滚（`overflow:hidden`）；**每页根容器 `height:100% / minHeight:0`，超出的部分由页内自己的容器滚**。
 - **禁止**用 `{children}` 渲染 Umi 4 布局子页面，必须 `<Outlet />`。
 - **禁止并行对同一个文件发两次编辑**；每步编辑后从磁盘读回核对。
@@ -40,7 +40,7 @@
 // web/src/components/PageHeader.tsx
 // 统一页面头(spec m2-workspace D2):① 平台 logo + 标题 + 元信息(右)  ② 工具栏。
 // 固定不滚:调用方把它作为 flex 列的**第一个 flexShrink:0** 子项,滚动交给后面的内容容器。
-// toolbar 不传 → 不渲染第二行(设置页用这个简化形态)。
+// toolbar 不传 → 不渲染第二行(当时设想给设置页用;实况设置页并未引用本组件——它是一摞 Card,已扫正)。
 import type { ReactNode } from 'react';
 
 export interface PageHeaderProps {
@@ -541,7 +541,7 @@ git commit -m "chore: 全站文案随页面改名清扫(获取→资料库 / 音
 
 **1. Spec 覆盖**
 - D1 页面地图与去 tab → Task 3（路由）+ Task 4（导航）。⚠️ **去 tab 只做了一半**：spec 的 P1 原文是"删掉 Segmented"，但本计划把它改成"挪进工具栏、行为不变"，删掉它并换成"产物类型 Radio"归 P2。**因此我已同步修订 spec 的 P1 段**（把"删掉"改为"挪进工具栏"）—— 若你更希望 P1 就删干净，需要把"产物类型 Radio"提前到 P1，那会让 P1 与 P2 的边界糊掉，不建议。
-- D2 页面头 → Task 1 + Task 5（资料库）+ Task 3 Step 3（详情占位页已用上）。设置页的"简化形态"体现在 Task 2 Step 3（只加滚动容器，不加头）——**设置页的 PageHeader 留到 P2**，因为 P1 给设置页加两行头没有实际收益（没有工具栏可放）。
+- D2 页面头 → Task 1 + Task 5（资料库）+ Task 3 Step 3（详情占位页已用上）。资料库是双栏页，页面头最终挂在**右栏**（非整页）。原计划给设置页"简化形态"两行头，**实况是设置页（一摞 `Card`）最终并未引用 `PageHeader`**——P1 只给它加了滚动容器（Task 2 Step 3）。
 - D3 滚动收口 → Task 2。
 - D11 改名清扫 → Task 6。
 - §0.7 手工目验"顶部不再空一截" → Task 5 Step 4。
@@ -550,7 +550,7 @@ git commit -m "chore: 全站文案随页面改名清扫(获取→资料库 / 音
 
 **3. 类型一致性**：`PageHeader` 的 props 名（`icon` / `title` / `meta` / `toolbar`）在 Task 1 定义，在 Task 3 与 Task 5 使用，三处一致；`studio-detail.tsx` 用 `PageHeader` 时只传了 `title` / `meta` / `toolbar`（`icon` 可选，未传合法）。
 
-**4. 遗漏自查发现的偏差（已在上文标注）**：设置页的 PageHeader 延到 P2；"删 Segmented"降级为"挪位置"。两处都已在 spec 或本 Self-Review 中写明理由，避免执行者照 P1 原文去删而制造功能真空。
+**4. 遗漏自查发现的偏差（已在上文标注）**：设置页最终并未引用 `PageHeader`（它是一摞 `Card`）——原计划"延到 P2"的说法与实况不符，已扫正；"删 Segmented"降级为"挪位置"。两处都已在 spec 或本 Self-Review 中写明理由，避免执行者照 P1 原文去删而制造功能真空。
 
 ---
 

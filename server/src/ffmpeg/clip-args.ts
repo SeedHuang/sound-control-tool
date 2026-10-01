@@ -9,7 +9,8 @@ export interface ClipArgsOpts {
   quality?: string;
 }
 
-const CODEC_BY_FORMAT: Record<ClipArgsOpts['format'], string[]> = {
+// 导出供复用(P4 导出):merge 拼接与"抽一段"共用同一张「格式 → 编码器」表,避免两处各写一份漂移
+export const CODEC_BY_FORMAT: Record<ClipArgsOpts['format'], string[]> = {
   mp3: ['-c:a', 'libmp3lame'],
   m4a: ['-c:a', 'aac'],
   wav: ['-c:a', 'pcm_s16le'],

@@ -12,6 +12,19 @@ export interface JobRow {
   finished_at: string | null;
 }
 
+// 在途任务行(spec D9,2026-09-30 download-queue-tray):比 JobRow 多一个 created_at。
+// 为什么不直接给 JobRow 加列:JobRow 是既有 get() 的返回类型,加列会波及所有既有使用方;
+// 而本接口要的正是「列表 + 创建时间」,单独声明一行类型更贴切、零影响。
+export interface ActiveJobRow {
+  id: number;
+  kind: string;
+  payload: string;
+  status: string;
+  progress: number;
+  message: string | null;
+  created_at: string;
+}
+
 export interface JobsRepo {
   markAllInterrupted(message: string): number;
   create(kind: string, payload: unknown): number;
@@ -20,6 +33,8 @@ export interface JobsRepo {
   finish(id: number, progress?: number): void;
   fail(id: number, message: string): void;
   findActiveByUrl(url: string, kind: string): { id: number } | null; // P1-1:防同 URL 并发下载;kind 参数化后音频/视频任务互不挡
+  /** 在途任务(pending + running),按 id 升序 = 提交顺序 = 队列顺序(spec D9)。GET /api/jobs?active=1 用 */
+  listActive(): ActiveJobRow[];
 }
 
 export function createJobsRepo(db: DB): JobsRepo {
@@ -68,5 +83,11 @@ export function createJobsRepo(db: DB): JobsRepo {
         .get(kind, `%${esc}%`);
       return row && typeof (row as { id: unknown }).id === 'number' ? { id: (row as { id: number }).id } : null;
     },
+    // 只取在途(pending + running):排队复用 pending,故它天然就是"队列里还没跑的";
+    // ORDER BY id ASC = 提交顺序 = 队列顺序(前端直接照序渲染,不必二次排序)
+    listActive: () =>
+      db
+        .prepare('SELECT id, kind, payload, status, progress, message, created_at FROM jobs WHERE status IN (\'pending\',\'running\') ORDER BY id ASC')
+        .all() as unknown as ActiveJobRow[],
   };
 }

@@ -14,7 +14,7 @@ export interface SourceVideoRow {
 
 export function createSourceVideosRepo(db: DB) {
   /** 一个来源一份素材 → 冲突即覆盖(换清晰度重下就是这条路径)。
-   *  P2:entryIndex 可选(缺省绑 NULL)——既有不带该参的调用方不必改动 */
+   *  P2:entryIndex 可选;**缺省即绑 NULL(= 清空该列),不是保留旧值**——不带该参的调用方会把集号写成 NULL */
   const upsert = (v: { importId: number; filePath: string; height: number | null; fileSize: number | null; entryIndex?: number | null }): void => {
     db.prepare(
       'INSERT INTO source_videos (import_id, file_path, height, file_size, entry_index) VALUES (?, ?, ?, ?, ?) ' +

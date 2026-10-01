@@ -1,13 +1,17 @@
 // web/src/pages/studio.tsx(剪辑室)
 // 2026-09-29 用户拍板:列表 + 名称搜索 + 分页 + 平台 logo + 原视频地址 + 剧集「第几集/该集名字」;
 // 又在搜索栏右侧加了「视图切换」:平铺(逐条列表)/ 剧集分组(作品聚合卡片墙,点卡片进该作品自己的音频列表)。
+// 2026-09-30 P3-T2:改造成「以来源驱动的媒体中心」——根因是老逻辑只列 audio_items,
+//   用户「下载了视频素材但还没剪出音频」时剪辑室一片空白;现在列表由 /api/imports(全量来源)∪ 孤儿音频驱动,
+//   只有视频、没有音频的来源也会出现一张媒体卡(封面 + 标题 + 素材状态 + 音频数 + 编辑入口)。
 // 布局与资料库同款:整页锁死内容区高度 —— 头(搜索/切换/计数)、身(自己滚)、脚(分页)三段;
 // 行内 flexWrap + maxWidth,窄窗自动折行。
 // 注意:本项目没有全局 reset,div 默认 content-box —— 凡「height:100% + padding」的这一层都要 boxSizing: border-box,
 // 否则会比外框高出内边距那几像素、外框出现滚动条(2026-09-29 实测踩过:内容区 778 vs 本层 810)。
-import { Button, Empty, Input, Modal, Pagination, Progress, Segmented, Tag, Typography } from 'antd';
+import { Button, Empty, Input, Modal, Pagination, Progress, Segmented, Tag, Tooltip, Typography } from 'antd';
 import { AppstoreOutlined, ArrowLeftOutlined, SearchOutlined, UnorderedListOutlined } from '@ant-design/icons';
-import { useEffect, useRef, useState } from 'react';
+import { useNavigate } from '@umijs/max';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { apiGet, audioFileUrl, coverUrl, deleteAudio, listImports, logFe, onAudioChanged, type AudioRow, type ImportSource } from '@/api';
 import SiteLogo, { siteColor } from '@/components/SiteLogo';
 
@@ -42,12 +46,12 @@ function formatDuration(sec: number): string {
 
 /** 一个「作品」= 同一来源网址下的全部入库音频(番剧/课程/合集)。没有来源网址的(理论上只有录制)各自成卡 */
 interface WorkGroup {
-  key: string;                 // 来源网址
+  key: string;                 // 来源网址(孤儿用 #item-<id> 兜底)
   title: string;               // 作品名(合集名)
   site: string;                // 平台(算 logo 与品牌色)
-  items: AudioRow[];           // 已下载的音频
-  importRow: ImportSource | null; // 解析时落库的来源行(拿封面 + 总集数);来源被删了就是 null
-  latest: string;              // 最近入库时间
+  items: AudioRow[];           // 已下载的音频(可能为空:来源有视频素材但还没剪出音频)
+  importRow: ImportSource | null; // 解析时落库的来源行(拿封面 + 总集数 + 素材状态);孤儿来源就是 null
+  latest: string;              // 最近入库时间(该组音频最大 created_at;无音频时退来源创建的 created_at)
 }
 /** 「已下 N 集 / 共 M 集」文案;单条作品/无来源记录各有说法 */
 function workCountText(w: WorkGroup): string {
@@ -56,8 +60,9 @@ function workCountText(w: WorkGroup): string {
   return `已下 ${w.items.length} 集 / 共 ${w.importRow.entry_count} 集`;
 }
 
-/** 作品聚合卡片:封面(没图退纯色底 + 平台 logo)+ 作品名 + 已下/共集数 + 细进度条 + 最近入库 */
+/** 作品聚合卡片:封面(没图退纯色底 + 平台 logo)+ 作品名 + 已下/共集数 + 素材状态 + 细进度条 + 最近入库 + 编辑入口 */
 function WorkCard({ work, onOpen }: { work: WorkGroup; onOpen: () => void }) {
+  const navigate = useNavigate();
   const [coverBroken, setCoverBroken] = useState(false);
   const [coverLoaded, setCoverLoaded] = useState(false);
   const imp = work.importRow;
@@ -66,6 +71,33 @@ function WorkCard({ work, onOpen }: { work: WorkGroup; onOpen: () => void }) {
   const showCover = imp !== null && !coverBroken;
   const tint = siteColor(work.site);
   const total = imp === null || imp.kind === 'single' ? null : imp.entry_count;
+  // 素材状态(D17):有视频素材才显示「素材:第 N 集」/「素材:集数未知」;没素材就不加这个标记
+  // (不加比加个"素材:无"更有辨识度——没标记=还没下视频,一眼能看出来)
+  const materialText = imp !== null && imp.has_video
+    ? (imp.material_entry_index !== null ? `素材:第 ${imp.material_entry_index} 集` : '素材:集数未知')
+    : null;
+  // 编辑入口(验收②):有素材才可点 → 进 /studio/:importId(P4 编辑器接手);
+  // 无素材(has_video=false)/ 孤儿来源(importRow=null)一律禁用 + tooltip 说明原因。
+  // disabled 的原生 button 不触发鼠标事件 → Tooltip 收不到,必须垫一层 <span> 才能悬停出提示。
+  const editNode = imp !== null && imp.has_video ? (
+    <Button
+      size="small"
+      type="primary"
+      onClick={(e) => {
+        e.stopPropagation(); // 别把点击冒泡给整张卡(那会变成"打开该来源的音频列表")
+        logFe('info', `进入剪辑详情 import=${imp.id}`);
+        navigate(`/studio/${imp.id}`); // Umi 纪律:用 useNavigate,不走 window.location.hash
+      }}
+    >
+      编辑
+    </Button>
+  ) : (
+    <Tooltip title={imp === null ? '未关联来源,无法进入剪辑' : '这个来源还没有视频素材,先去资料库下视频'}>
+      <span style={{ display: 'inline-block' }}>
+        <Button size="small" disabled>编辑</Button>
+      </span>
+    </Tooltip>
+  );
   return (
     <div
       className="sct-card"
@@ -98,11 +130,18 @@ function WorkCard({ work, onOpen }: { work: WorkGroup; onOpen: () => void }) {
       </div>
       <div style={{ padding: '10px 12px', display: 'flex', flexDirection: 'column', gap: 4 }}>
         <Typography.Text strong ellipsis={{ tooltip: work.title }} style={{ minWidth: 0 }}>{work.title}</Typography.Text>
-        <Typography.Text type="secondary" style={{ fontSize: 12 }}>{workCountText(work)}</Typography.Text>
+        {/* 音频数(workCountText)+ 素材状态同一行;不再另叠一个重复的音频数文案 */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>{workCountText(work)}</Typography.Text>
+          {materialText !== null && <Tag color="green" style={{ marginInlineEnd: 0 }}>{materialText}</Tag>}
+        </div>
         {total !== null && total > 0 && (
           <Progress percent={Math.min(100, Math.round((work.items.length / total) * 100))} showInfo={false} size="small" strokeColor={tint.fg} />
         )}
-        <Typography.Text type="secondary" style={{ fontSize: 12 }}>最近入库 {work.latest}</Typography.Text>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>最近入库 {work.latest}</Typography.Text>
+          {editNode}
+        </div>
       </div>
     </div>
   );
@@ -110,12 +149,14 @@ function WorkCard({ work, onOpen }: { work: WorkGroup; onOpen: () => void }) {
 
 type ViewKind = 'flat' | 'group';
 
-export default function LibraryPage() {
+export default function StudioPage() {
+  const navigate = useNavigate(); // 「编辑」入口 + 空态「去资料库」用;Umi 纪律:走 useNavigate 而非 window.location.hash
   const [items, setItems] = useState<AudioRow[]>([]);
   const [imports, setImports] = useState<ImportSource[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [query, setQuery] = useState('');
-  const [view, setView] = useState<ViewKind>('flat');
+  // 默认「剧集分组」(D12 要求;Ruling P3-2):媒体卡墙是这一页的主体,平铺作为可选项保留
+  const [view, setView] = useState<ViewKind>('group');
   const [openKey, setOpenKey] = useState<string | null>(null); // 进入了哪个作品(用来源网址当 key)
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(10);
@@ -179,21 +220,28 @@ export default function LibraryPage() {
     });
   };
 
-  // 按来源网址聚合成作品(2026-09-29 用户拍板)。刻意按网址而不是按名字:同名作品不会错并,
-  // 单视频也各自成卡;代价是同一作品被两种网址变体下载过会分成两张卡(取语义正确优先)。
+  // 媒体中心(P3-T2):列表**由来源驱动** ∪ 孤儿音频。
+  // 根因:老逻辑只遍历音频,「下载了视频素材但还没剪出音频」时整页空白——本任务就是修这个。
+  // 刻意按来源网址聚合并建卡:同名作品不会错并,单视频也各自成卡;代价是同一作品被两种网址变体下载过会分成两张卡(取语义正确优先)。
   const works: WorkGroup[] = (() => {
-    const byUrl = new Map(imports.map((i) => [i.url, i]));
     const map = new Map<string, WorkGroup>();
+    // ① 来源先建卡:latest 先用来源创建时间兜底(该来源还没音频时,排序键就是它)
+    for (const imp of imports) {
+      map.set(imp.url, { key: imp.url, title: imp.title, site: imp.site, items: [], importRow: imp, latest: imp.created_at });
+    }
+    // ② 音频按 source_url 挂到对应来源卡下;挂不上的(空 source_url / 来源已被删)算孤儿,各自成卡
     for (const it of items) {
       // 空串也要当"没有网址"(2026-09-29 评审修):下面 renderRow 判的是 `!== null && !== ''`,
       // 这里只用 ?? 会把所有空串来源并成 key='' 的一张假作品卡(标题和「已下 N 集」都是错的)
-      const key = it.source_url !== null && it.source_url !== '' ? it.source_url : `#item-${it.id}`;
-      const cur = map.get(key);
+      const url = it.source_url !== null && it.source_url !== '' ? it.source_url : null;
+      const cur = url !== null ? map.get(url) : undefined;
       if (cur) {
+        // 该组首条音频接管排序键(覆盖来源创建时间),之后取最大 —— 即「该组音频最大 created_at」
+        if (cur.items.length === 0 || it.created_at > cur.latest) cur.latest = it.created_at;
         cur.items.push(it);
-        if (it.created_at > cur.latest) cur.latest = it.created_at;
       } else {
-        map.set(key, { key, title: mainTitle(it), site: it.site, items: [it], importRow: byUrl.get(key) ?? null, latest: it.created_at });
+        const key = url ?? `#item-${it.id}`;
+        map.set(key, { key, title: mainTitle(it), site: it.site, items: [it], importRow: null, latest: it.created_at });
       }
     }
     return [...map.values()].sort((a, b) => (a.latest < b.latest ? 1 : -1)); // 最近入库在前
@@ -225,15 +273,11 @@ export default function LibraryPage() {
   const openCard = (key: string): void => { setOpenKey(key); setPage(1); };
   const backToCards = (): void => { setOpenKey(null); setPage(1); };
 
-  const emptyNode = (
-    <Empty
-      description={
-        items.length === 0 ? '暂无音频,先去资料库下载吧'
-          : cardLevel ? `没有匹配「${query.trim()}」的作品`
-            : `没有匹配「${query.trim()}」的音频`
-      }
-      style={{ marginTop: 64 }}
-    />
+  // 整页空:既没有任何来源、也没有任何音频 —— 这是**唯一**该出现「去资料库」引导的情况(P3-T2 空态要求)
+  const wholeEmptyNode = (
+    <Empty description="还没有任何来源或音频,先去资料库添加吧" style={{ marginTop: 64 }}>
+      <Button type="primary" onClick={() => navigate('/library')}>去资料库</Button>
+    </Empty>
   );
 
   /** 平铺层/作品内的同一条行 UI(播放器、原视频、删除都在这一行) */
@@ -276,6 +320,34 @@ export default function LibraryPage() {
       </div>
     </div>
   );
+
+  // 正文四态(P3-T2):整页空 → 「去资料库」;卡片墙;进入某来源(零音频说明 / 搜索结果 / 音频行);平铺行。
+  // 关键区分:进入的**来源**零音频时,说的是「这个来源还没有下载音频」——不复用「先去资料库下载」,
+  // 用户可能早就下了视频、只是还没剪,那句会把人误导回去重下。
+  let body: ReactNode;
+  if (imports.length === 0 && items.length === 0) {
+    body = wholeEmptyNode;
+  } else if (cardLevel) {
+    body = pageWorks.length === 0
+      ? <Empty description={`没有匹配「${query.trim()}」的作品`} style={{ marginTop: 64 }} />
+      : (
+        /* 卡片墙:auto-fill + 最小宽 —— 窗口宽了自动加列;整块居中限宽,超宽屏不把卡片拉成巨幅 */
+        <div style={{ display: 'grid', gridTemplateColumns: `repeat(auto-fill, minmax(${CARD_MIN_WIDTH}px, 1fr))`, gap: 12, width: '100%', maxWidth: CARDS_MAX_WIDTH, margin: '0 auto' }}>
+          {pageWorks.map((w) => <WorkCard key={w.key} work={w} onOpen={() => openCard(w.key)} />)}
+        </div>
+      );
+  } else if (openWork !== null && openWork.items.length === 0) {
+    body = <Empty description="这个来源还没有下载音频" style={{ marginTop: 64 }} />;
+  } else {
+    body = pageRows.length === 0
+      ? <Empty description={query.trim() === '' ? '暂无音频' : `没有匹配「${query.trim()}」的音频`} style={{ marginTop: 64 }} />
+      : (
+        /* 列表:整块居中限宽,超宽屏上播放器/文字不横跨整屏 */
+        <div style={{ width: '100%', maxWidth: CARDS_MAX_WIDTH, minWidth: 0, margin: '0 auto' }}>
+          {pageRows.map(renderRow)}
+        </div>
+      );
+  }
 
   if (error) return <Typography.Text type="danger">{error}</Typography.Text>;
   return (
@@ -325,19 +397,7 @@ export default function LibraryPage() {
         className="sct-view-enter"
         style={{ boxSizing: 'border-box', flex: 1, minHeight: 0, overflowY: 'auto', paddingRight: 4, paddingTop: 12 }}
       >
-        {items.length === 0 ? emptyNode : cardLevel ? (
-          pageWorks.length === 0 ? emptyNode : (
-            /* 卡片墙:auto-fill + 最小宽 —— 窗口宽了自动加列;整块居中限宽,超宽屏不把卡片拉成巨幅 */
-            <div style={{ display: 'grid', gridTemplateColumns: `repeat(auto-fill, minmax(${CARD_MIN_WIDTH}px, 1fr))`, gap: 12, width: '100%', maxWidth: CARDS_MAX_WIDTH, margin: '0 auto' }}>
-              {pageWorks.map((w) => <WorkCard key={w.key} work={w} onOpen={() => openCard(w.key)} />)}
-            </div>
-          )
-        ) : pageRows.length === 0 ? emptyNode : (
-          /* 列表:整块居中限宽,超宽屏上播放器/文字不横跨整屏 */
-          <div style={{ width: '100%', maxWidth: CARDS_MAX_WIDTH, minWidth: 0, margin: '0 auto' }}>
-            {pageRows.map(renderRow)}
-          </div>
-        )}
+        {body}
       </div>
 
       {/* 脚:分页固定在底部(列表滚它不滚) */}

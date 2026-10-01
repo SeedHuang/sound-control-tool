@@ -7,7 +7,8 @@ import { tmpdir } from 'node:os';
 import Fastify, { type FastifyInstance } from 'fastify';
 import { openDatabase, type DB } from '../db/index.js';
 import { initSchema } from '../db/schema.js';
-import { registerYtdlpRoutes, type YtdlpDeps } from './ytdlp-routes.js';
+import { registerYtdlpRoutes, type DownloadJobPayload, type YtdlpDeps } from './ytdlp-routes.js';
+import { createDownloadQueue } from './download-queue.js';
 import { createDownloadManager } from './download.js';
 import { createJobsRepo } from '../db/repo/jobs.js';
 import { createAudioItemsRepo } from '../db/repo/audio-items.js';
@@ -56,22 +57,42 @@ function makeApp(
   coverFetcher?: YtdlpDeps['coverFetcher'],
   coverWriter?: YtdlpDeps['coverWriter'],
   clipStarter?: YtdlpDeps['clipStarter'],
+  exportStarter?: YtdlpDeps['exportStarter'],
 ) {
   // audioDir 用临时子目录:Cookie 注入会把 cookies.txt 物化到 dirname(audioDir),不能写真机 C:/ 根
   const audioDir = join(tempDir, 'audio');
   mkdirSync(audioDir, { recursive: true });
   // 视频素材目录(批4 裁定 5:YtdlpDeps 加 mediaDir 后 makeApp 的必要连带)
   mkdirSync(mediaDir, { recursive: true });
-  registerSettingsRoutes(app, db); // /api/settings 白名单用例需要真实 settings 路由
+  registerSettingsRoutes(app, db, audioDir); // 第三参=导出目录默认值（留空时用它）
+  // Task 1:提交/重试改走并发受限队列——测试里装配一个「上限 1」的真队列(与 index.ts 同款接线),
+  // 既有用例因此继续走「提交即 201 → job 转 running → dm.start 被调」这条路径。
+  const jobsRepo = createJobsRepo(db);
+  let handlers: {
+    startDownload: (jobId: number, payload: DownloadJobPayload, onSettled?: () => void) => Promise<void>;
+  } | null = null;
+  const queue = createDownloadQueue({
+    limit: () => 1,
+    start: (jobId) =>
+      new Promise<void>((resolve) => {
+        const job = jobsRepo.get(jobId);
+        if (job === null || handlers === null) { resolve(); return; }
+        void handlers.startDownload(jobId, JSON.parse(job.payload) as DownloadJobPayload, resolve).catch(() => resolve());
+      }),
+    markCancelled: (jobId) => jobsRepo.update(jobId, { status: 'cancelled' }),
+  });
   return registerYtdlpRoutes(app, {
     db,
     binProvider: async () => ({ path: binPath }),
     downloadManager: dm ?? createDownloadManager(),
     audioDir, mediaDir, tempDir, token,
+    queue,
+    onDownloadHandlers: (h) => { handlers = h; },
     // 默认注入桩:两条抓封面路径都失败。否则解析用例(带 mock 出来的封面地址)会真的发网络请求 / 真拉 yt-dlp(测试必须封闭)
     coverFetcher: coverFetcher ?? (async () => false),
     coverWriter: coverWriter ?? (async () => false),
     clipStarter,
+    exportStarter,
   });
 }
 
@@ -190,6 +211,24 @@ describe('POST /api/ytdlp/download', () => {
     const res = await app.inject({ method: 'POST', url: '/api/ytdlp/download', payload: { url: 'https://a/1', options: { format: 'mp3', force: true } } });
     expect(res.statusCode).toBe(409);
     expect(res.json().error.code).toBe('BUSY');
+  });
+  // D8(2026-09-30 spec):引入队列后 pending 从「毫秒级窗口」变成「分钟级」——同 URL 去重必须把「排队中」也算在途。
+  // 让上限 1 的队列把第 1 个卡在 running(dm 从不发终态)、第 2 个停在 pending,再提交同第 2 个 URL → 必须 409 BUSY。
+  it('D8:同 URL 去重把「排队中(pending)」也算在途 → 409 BUSY', async () => {
+    const dm = { start: vi.fn(), cancel: vi.fn(async () => {}), dispose: vi.fn(async () => {}) }; // 从不发终态:A 永久 running
+    makeApp('yt-dlp', 'tok2', dm as unknown as ReturnType<typeof createDownloadManager>);
+    // A 占住唯一槽位 → 转 running
+    const a = await app.inject({ method: 'POST', url: '/api/ytdlp/download', payload: { url: 'https://a/A', options: { format: 'mp3' } } });
+    expect(a.statusCode).toBe(201);
+    expect(createJobsRepo(db).get(a.json().jobId as number)!.status).toBe('running');
+    // B 不同 URL,队列无空槽 → 停在 pending(排队中)
+    const b = await app.inject({ method: 'POST', url: '/api/ytdlp/download', payload: { url: 'https://a/B', options: { format: 'mp3' } } });
+    expect(b.statusCode).toBe(201);
+    expect(createJobsRepo(db).get(b.json().jobId as number)!.status).toBe('pending');
+    // 再提交同 B 的 URL → 即使 B 只是 pending,也必须被挡(否则排队窗口里同一集会被重复入队)
+    const dup = await app.inject({ method: 'POST', url: '/api/ytdlp/download', payload: { url: 'https://a/B', options: { format: 'mp3' } } });
+    expect(dup.statusCode).toBe(409);
+    expect(dup.json().error.code).toBe('BUSY');
   });
   it('download 合法 → 201 返回 jobId', async () => {
     // 注:注入假 DownloadManager(只记录 start,不真 spawn)——brief 原用 createDownloadManager(),
@@ -815,8 +854,8 @@ describe('下载视频素材(produce=video)', () => {
     const dm = { start: vi.fn(), cancel: vi.fn(async () => {}), dispose: vi.fn(async () => {}) };
     makeApp('yt-dlp', 'tok2', dm as unknown as ReturnType<typeof createDownloadManager>);
     expect((await app.inject({ method: 'POST', url: '/api/ytdlp/download', payload: { url: 'https://a/v', options: { format: 'mp3' }, produce: 'movie' } })).statusCode).toBe(400);
-    // videoHeight 在 options 里(与 DownloadOptions 同位置);999 不在 360|480|720|1080 档位 → 400
-    expect((await app.inject({ method: 'POST', url: '/api/ytdlp/download', payload: { url: 'https://a/v', options: { format: 'mp3', videoHeight: 999 }, produce: 'video' } })).statusCode).toBe(400);
+    // Task 2(spec D10):档位放宽为整数 144..4320 后,999 已属**合法**;改用越界值 5000 验证仍然 400
+    expect((await app.inject({ method: 'POST', url: '/api/ytdlp/download', payload: { url: 'https://a/v', options: { format: 'mp3', videoHeight: 5000 }, produce: 'video' } })).statusCode).toBe(400);
     // 缺省 videoHeight → 480 档:视频分支用 buildVideoDownloadArgs(不是 -x 抽音轨),job kind 是 ytdlp_video
     const res = await app.inject({ method: 'POST', url: '/api/ytdlp/download', payload: { url: 'https://a/v', options: { format: 'mp3' }, produce: 'video', title: 't' } });
     expect(res.statusCode).toBe(201);
@@ -975,6 +1014,108 @@ describe('下载视频素材(produce=video)', () => {
     expect((db.prepare('SELECT COUNT(*) AS n FROM clip_projects WHERE import_id = ?').get(importId) as { n: number }).n).toBe(1); // 工程行还在
     expect(getLogs().some((l) => l.source === 'job' && l.message.includes('保留剪辑工程'))).toBe(true);
   });
+  // T7-3(2026-09-30,backlog 收口):单视频重下的 NULL→NULL 保留路径。
+  // 旧素材 entry_index=NULL(单视频);新下载也没带 entryIndex(仍 NULL)——D19 两侧 ?? null 归一后相等,
+  // 工程与段必须原样保留,别把「单视频重下」误判成「换集」而清掉用户的剪辑点。
+  it('视频单视频重下(旧 NULL → 新 NULL)下载完成 → 剪辑工程保留(未误判为换集)', async () => {
+    const importId = createImportsRepo(db).upsertByUrl({ url: 'https://a/v', title: '凡人', site: 'bilibili', kind: 'single', duration_sec: null, entries: null });
+    const producedPath = join(tempDir, 'vidRedl.mp4');
+    writeFileSync(producedPath, 'VIDEOBYTESREDL');
+    let fire: (() => void) | undefined;
+    const dm = {
+      start: vi.fn((opts: { jobId: number; onEvent: (jid: number, ev: unknown) => void }) => {
+        fire = () => opts.onEvent(opts.jobId, { type: 'status', state: 'done', producedPath });
+      }),
+      cancel: vi.fn(async () => {}),
+      dispose: vi.fn(async () => {}),
+    };
+    makeApp('yt-dlp', 'tok2', dm as unknown as ReturnType<typeof createDownloadManager>); // mediaDir 在 makeApp 里才 mkdir,写旧素材文件必须在其后
+    const oldVideo = join(mediaDir, `media-${importId}.mp4`);
+    writeFileSync(oldVideo, 'OLD480');
+    createSourceVideosRepo(db).upsert({ importId, filePath: oldVideo, height: 480, fileSize: 5 }); // 不带 entryIndex → entry_index 落 NULL
+    const clipRepo = createClipProjectsRepo(db);
+    const pid = Number(db.prepare('INSERT INTO clip_projects (import_id) VALUES (?)').run(importId).lastInsertRowid);
+    db.prepare('INSERT INTO clip_segments (project_id, start_sec, end_sec) VALUES (?, ?, ?)').run(pid, 0, 10);
+    db.prepare('INSERT INTO clip_segments (project_id, start_sec, end_sec) VALUES (?, ?, ?)').run(pid, 10, 20);
+    // 不带 entryIndex → 新集号仍为 NULL(单视频重下)
+    const res = await app.inject({ method: 'POST', url: '/api/ytdlp/download', payload: { url: 'https://a/v', options: { format: 'mp3', videoHeight: 720 }, produce: 'video', title: '凡人' } });
+    expect(res.statusCode).toBe(201);
+    const jobId = res.json().jobId as number;
+    fire!(); // 下载进程退出 → finalizeVideoDownload(NULL → NULL 视为同集 → 保留工程)
+    const deadline = Date.now() + 2000;
+    while (Date.now() < deadline && createJobsRepo(db).get(jobId)!.status !== 'done') await new Promise((r) => setTimeout(r, 20));
+    expect(createSourceVideosRepo(db).get(importId)!.entry_index).toBeNull(); // 新集号仍 NULL
+    expect(createSourceVideosRepo(db).get(importId)!.height).toBe(720); // 素材确实换了清晰度
+    expect(clipRepo.countSegmentsByImportId(importId)).toBe(2); // 段原样保留
+    expect((db.prepare('SELECT COUNT(*) AS n FROM clip_projects WHERE import_id = ?').get(importId) as { n: number }).n).toBe(1); // 工程行原样保留
+    expect(getLogs().some((l) => l.source === 'job' && l.message.includes('保留剪辑工程'))).toBe(true);
+  });
+});
+
+// ---- Task 2(2026-09-30 spec D10):videoHeight 类型放宽为整数 + 服务端校验(整数且 144..4320) ----
+describe('POST /api/ytdlp/download videoHeight 放宽 + 校验(Task 2)', () => {
+  // Task 1 起提交走并发受限队列(测试里上限 1):同一 dm 连发两单时,必须让前一单进终态释放槽位,
+  // 否则第二个会永远停在 pending 不启动(既有用例假设"直接 start")。这里让 start 同步补发一个 error 终态,
+  // 只为放行槽位——本 describe 的断言只关心状态码与 args,不关心任务成败。
+  const mkDm = () => ({
+    start: vi.fn((opts: { jobId: number; onEvent: (jid: number, ev: unknown) => void }) => {
+      opts.onEvent(opts.jobId, { type: 'status', state: 'error', message: 'test: 立即终结以释放队列槽位' });
+    }),
+    cancel: vi.fn(async () => {}),
+    dispose: vi.fn(async () => {}),
+  });
+  const lastArgs = (dm: ReturnType<typeof mkDm>): string[] =>
+    (dm.start.mock.calls[dm.start.mock.calls.length - 1]?.[0] as unknown as { args: string[] }).args;
+  // 成功用例各自用**不同 URL**:路由有「同 URL 同 kind 并发 → 409 BUSY」,同址连发会被误判
+  const post = (videoHeight: unknown, produce: string | undefined, url: string) =>
+    app.inject({
+      method: 'POST', url: '/api/ytdlp/download',
+      payload: { url, options: { format: 'mp3', videoHeight }, ...(produce === undefined ? {} : { produce }), title: 't' },
+    });
+
+  it('实测档 1440 → 201 且 args 含 height<=1440', async () => {
+    const dm = mkDm();
+    makeApp('yt-dlp', 'tok2', dm as unknown as ReturnType<typeof createDownloadManager>);
+    const res = await post(1440, 'video', 'https://a/v1');
+    expect(res.statusCode).toBe(201);
+    expect(lastArgs(dm).join(' ')).toContain('height<=1440');
+  });
+
+  it('边界 144(下界)/ 4320(上界)→ 201 且表达式用原值', async () => {
+    const dm = mkDm();
+    makeApp('yt-dlp', 'tok2', dm as unknown as ReturnType<typeof createDownloadManager>);
+    expect((await post(144, 'video', 'https://a/v2')).statusCode).toBe(201);
+    expect(lastArgs(dm).join(' ')).toContain('height<=144');
+    expect((await post(4320, 'video', 'https://a/v3')).statusCode).toBe(201);
+    expect(lastArgs(dm).join(' ')).toContain('height<=4320');
+  });
+
+  it.each([100, 143, 4321, 5000, 'abc', 720.5])('非法 videoHeight %s → 400 BAD_REQUEST', async (bad) => {
+    makeApp('yt-dlp', 'tok2', mkDm() as unknown as ReturnType<typeof createDownloadManager>);
+    const res = await post(bad, 'video', 'https://a/bad');
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error.code).toBe('BAD_REQUEST');
+  });
+
+  // 缺省(不传)与显式 null 都退回 480:与磁盘既有 `Number(raw ?? 480)` 语义一致,也符合「没选档位不是非法」。
+  // (计划 Step 1 的示例把 null 列入「非法 → 400」,与计划自带实现/磁盘现状矛盾——以磁盘为准,见报告偏离记录)
+  it('缺省(不传)与 null → 退回 480,不报错(沿用既有缺省语义)', async () => {
+    const dm = mkDm();
+    makeApp('yt-dlp', 'tok2', dm as unknown as ReturnType<typeof createDownloadManager>);
+    expect((await post(undefined, 'video', 'https://a/v4')).statusCode).toBe(201);
+    expect(lastArgs(dm).join(' ')).toContain('height<=480');
+    expect((await post(null, 'video', 'https://a/v5')).statusCode).toBe(201);
+    expect(lastArgs(dm).join(' ')).toContain('height<=480');
+  });
+
+  it('音频支(produce 缺省)不受该校验影响:越界 videoHeight 也 201(不能让它把音频下载 400)', async () => {
+    const dm = mkDm();
+    makeApp('yt-dlp', 'tok2', dm as unknown as ReturnType<typeof createDownloadManager>);
+    const res = await post(5000, undefined, 'https://a/v6');
+    expect(res.statusCode).toBe(201);
+    expect(lastArgs(dm)).toContain('-x'); // 音频支参数(抽音轨)
+    expect(lastArgs(dm).join(' ')).not.toContain('height<='); // 不掺视频档位表达式
+  });
 });
 
 // ---- 批4 R2 补测:retry 按 kind 分支 ----
@@ -1017,6 +1158,43 @@ describe('POST /api/jobs/:id/retry 按 kind 分支(批4)', () => {
     expect(calls).toEqual([{ jobId: newId, payload: clipPayload }]); // payload 原样透传(JSON 存取往返后深相等)
     expect(createJobsRepo(db).get(newId)!.kind).toBe('ffmpeg_clip');
   });
+  // P4 T4:导出任务(ffmpeg_export)重试同族——素材已删拦截、成功交接 exportStarter、未接线 500
+  it('导出任务重试但素材已删 → 409 MEDIA_GONE(P4-T4)', async () => {
+    const jobsRepo = createJobsRepo(db);
+    const jid = jobsRepo.create('ffmpeg_export', { importId: 1, videoPath: join(tempDir, 'gone.mp4'), mode: 'merge', format: 'mp3', segments: [] });
+    jobsRepo.fail(jid, 'ffmpeg 失败');
+    makeApp('yt-dlp', 'tok2');
+    const res = await app.inject({ method: 'POST', url: `/api/jobs/${jid}/retry` });
+    expect(res.statusCode).toBe(409);
+    expect(res.json().error.code).toBe('MEDIA_GONE');
+    expect(res.json().error.message).toContain('素材已不存在');
+  });
+  it('导出任务重试成功 → 201 + exportStarter 被调且 payload 正确 + 新 job kind 为 ffmpeg_export(P4-T4)', async () => {
+    const videoPath = join(tempDir, 'media-export-src.mp4');
+    writeFileSync(videoPath, 'VIDEOBYTES'); // retry 分支 existsSync(videoPath) 要真文件
+    const jobsRepo = createJobsRepo(db);
+    const exportPayload = { importId: 1, videoPath, mode: 'merge', format: 'mp3', quality: '192k', prefix: '凡人', segments: [{ start_sec: 0, end_sec: 10 }] };
+    const oldId = jobsRepo.create('ffmpeg_export', exportPayload);
+    jobsRepo.fail(oldId, 'ffmpeg 失败'); // 仅 error 可重试(P1-4)
+    const calls: Array<{ jobId: number; payload: unknown }> = [];
+    makeApp('yt-dlp', 'tok2', undefined, undefined, undefined, undefined, async (jobId, payload) => { calls.push({ jobId, payload }); });
+    const res = await app.inject({ method: 'POST', url: `/api/jobs/${oldId}/retry` });
+    expect(res.statusCode).toBe(201);
+    const newId = res.json().jobId as number;
+    expect(calls).toEqual([{ jobId: newId, payload: exportPayload }]); // payload 原样透传
+    expect(createJobsRepo(db).get(newId)!.kind).toBe('ffmpeg_export');
+  });
+  it('导出任务重试但未接线 exportStarter → 500 NOT_WIRED(P4-T4)', async () => {
+    const videoPath = join(tempDir, 'media-export-nowire.mp4');
+    writeFileSync(videoPath, 'VIDEOBYTES');
+    const jobsRepo = createJobsRepo(db);
+    const jid = jobsRepo.create('ffmpeg_export', { importId: 1, videoPath, mode: 'merge', format: 'mp3', segments: [] });
+    jobsRepo.fail(jid, 'ffmpeg 失败');
+    makeApp('yt-dlp', 'tok2'); // 不注入 exportStarter
+    const res = await app.inject({ method: 'POST', url: `/api/jobs/${jid}/retry` });
+    expect(res.statusCode).toBe(500);
+    expect(res.json().error.code).toBe('NOT_WIRED');
+  });
 });
 
 // ---- 批4 R2-c:DELETE /api/imports/:id 连带清素材 ----
@@ -1049,7 +1227,8 @@ describe('DELETE /api/imports/:id 连带清素材(批4)', () => {
 });
 
 // ---- P2(2026-09-30):/api/imports 派生列 has_video/has_project/segment_count(spec D7 两表提前建后补出参) ----
-describe('/api/imports 派生列(has_video/has_project/segment_count)', () => {
+// ---- P3-T1(2026-09-30):同组派生列再加 material_entry_index(素材集号;无素材/单视频 → null,剪辑室卡片「素材:第 N 集」) ----
+describe('/api/imports 派生列(has_video/has_project/segment_count/material_entry_index)', () => {
   const seedProjectWithSegments = (impId: number, segCount: number): void => {
     const pid = Number(db.prepare('INSERT INTO clip_projects (import_id) VALUES (?)').run(impId).lastInsertRowid);
     for (let i = 0; i < segCount; i++) {
@@ -1068,21 +1247,21 @@ describe('/api/imports 派生列(has_video/has_project/segment_count)', () => {
     seedProjectWithSegments(full, 2);
     const res = await app.inject({ method: 'GET', url: '/api/imports' });
     expect(res.statusCode).toBe(200);
-    const rows = (res.json() as { imports: Array<{ id: number; has_video: boolean; has_project: boolean; segment_count: number; has_cover: boolean }> }).imports;
+    const rows = (res.json() as { imports: Array<{ id: number; has_video: boolean; has_project: boolean; segment_count: number; has_cover: boolean; material_entry_index: number | null }> }).imports;
     const byId = new Map(rows.map((r) => [r.id, r]));
-    expect(byId.get(bare)).toMatchObject({ has_video: false, has_project: false, segment_count: 0 });
-    expect(byId.get(withVideo)).toMatchObject({ has_video: true, has_project: false, segment_count: 0 });
-    expect(byId.get(full)).toMatchObject({ has_video: true, has_project: true, segment_count: 2 });
+    expect(byId.get(bare)).toMatchObject({ has_video: false, has_project: false, segment_count: 0, material_entry_index: null }); // 无素材 → 集号 null(前端据此判「无素材」)
+    expect(byId.get(withVideo)).toMatchObject({ has_video: true, has_project: false, segment_count: 0, material_entry_index: 1 }); // 有素材 entry_index=1 → 原样带出
+    expect(byId.get(full)).toMatchObject({ has_video: true, has_project: true, segment_count: 2, material_entry_index: 2 }); // 有素材 entry_index=2 → 原样带出
   });
   it('GET /api/imports/:id 详情行同样带出派生列(ImportDetailRow 与列表同型)', async () => {
     makeApp('yt-dlp', 'tok2');
     const id = createImportsRepo(db).upsertByUrl({ url: 'https://a/full', title: '全都有', site: 'bilibili', kind: 'single', duration_sec: null, entries: null });
     writeFileSync(join(mediaDir, `media-${id}.mp4`), 'V');
-    createSourceVideosRepo(db).upsert({ importId: id, filePath: join(mediaDir, `media-${id}.mp4`), height: 720, fileSize: 1 });
+    createSourceVideosRepo(db).upsert({ importId: id, filePath: join(mediaDir, `media-${id}.mp4`), height: 720, fileSize: 1, entryIndex: 4 }); // derivedJoin 走 SELECT s.*,素材集号需显式补出
     seedProjectWithSegments(id, 1);
     const res = await app.inject({ method: 'GET', url: `/api/imports/${id}` });
     expect(res.statusCode).toBe(200);
-    expect((res.json() as { import: { has_video: boolean; has_project: boolean; segment_count: number } }).import)
-      .toMatchObject({ has_video: true, has_project: true, segment_count: 1 });
+    expect((res.json() as { import: { has_video: boolean; has_project: boolean; segment_count: number; material_entry_index: number | null } }).import)
+      .toMatchObject({ has_video: true, has_project: true, segment_count: 1, material_entry_index: 4 });
   });
 });

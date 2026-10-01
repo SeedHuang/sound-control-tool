@@ -69,15 +69,15 @@
 
 ## 遗留裁决与留观项
 
-（来源：P2 台账；全部不阻塞，随对应阶段收口）
-1. `clearByImportId` 两条 DELETE 未包事务 —— 随 P4 D18 PUT 事务顺手包
-2. NULL→NULL 保留路径无专门用例 —— P4 建工程 CRUD 时补
-3. D20 卡片缺 `aria-pressed` —— P4 编辑器/网格触碰时补
-4. video 进度尾缀"正在写进剪辑室"措辞 —— P4 重做进度 UI 时改
-5. `source-videos.ts` upsert 注释误导（缺省=清 NULL 非保留）—— P4 触碰时改
-6. imports 派生列 SQL 两份（list() 内联 + derivedJoin）—— P4 触碰 imports.ts 时去重
-7. mediaRev 刷新页面归零的陈旧缓存窄窗口 —— P4 编辑器版本串拼 `file_size` 收口（纯前端一行）
-8. 导入弹窗 placeholder"播客"措辞（纯音频播客源无视频流）—— 随 P3/P4 文案统一
+（来源：P2 台账。**2026-09-30 P4 收口后状态更新**——已办项列落点，未办项列现状）
+1. ✅ 已办：`clearByImportId` 两条 DELETE **已包事务** —— P4-T7 T7-2（`clip-projects.ts` 用 `inTransaction`）
+2. ✅ 已办：NULL→NULL 保留路径**已补专门用例** —— P4-T7 T7-3（`ytdlp-routes.test.ts`）
+3. ✅ 已办：D20 卡片**已补 `aria-pressed`** —— P4-T7 T7-4（`library.tsx` 集数网格卡片）
+4. ✅ 已核查、**无残留**：全仓 grep `正在写进剪辑室` 零命中；现文案为「正在登记视频素材,稍等」（`library.tsx:412`）—— 无需改动（Ruling P4-4 / T7-5）
+5. ✅ 已办：`source-videos.ts` upsert 注释**已校正**（缺省=清 NULL 非保留）—— P4-T7 T7-6
+6. ✅ 已办：imports 派生列 SQL **已去重**（`list()` 复用 `derivedJoin`）—— P4-T7 T7-7
+7. ✅ 已办：mediaRev 陈旧缓存窄窗口**已收口**（`studio-detail.tsx` 预览/派生图版本串拼 `file_size`）—— P4-T7 T7-1
+8. ⬜ **仍留观（未处理）**：导入弹窗 placeholder「播客」措辞 —— `library.tsx:429` 现仍为「粘贴 B 站/YouTube/播客 URL」；资料库已仅下载视频，"播客"（纯音频）源不适用，措辞待后续统一
 
 ## 开工前先做
 

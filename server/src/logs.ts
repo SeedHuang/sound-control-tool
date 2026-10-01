@@ -10,8 +10,9 @@ export interface LogRow {
   // debug(2026-09-29 增):例行但排查时有用的一类——hijacked 端点的 CORS 摘要、跳过某个慢路径的决定等。
   // 这类日志一屏好几条,默认在前端面板里折叠,需要时一键展开(仓库规则里说的"debug 级"就是这一档)
   level: 'debug' | 'info' | 'error';
-  // source 联合类型:批4 加 'clip'(与批 1 加 'media' 同性质)——剪辑任务(clip-job.ts)的日志行要用它
-  source: 'server' | 'job' | 'http' | 'audio.file' | 'audio.delete' | 'audio.replace' | 'cover' | 'media' | 'clip' | 'web';
+  // source 联合类型:批4 加 'clip'(与批 1 加 'media' 同性质)——剪辑任务(clip-job.ts)的日志行要用它;
+  // P4 加 'project'——剪辑工程 保存/删除(project-routes.ts)的日志行要用它
+  source: 'server' | 'job' | 'http' | 'audio.file' | 'audio.delete' | 'audio.replace' | 'cover' | 'media' | 'clip' | 'project' | 'web';
   message: string;
 }
 

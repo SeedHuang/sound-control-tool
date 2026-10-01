@@ -1,7 +1,7 @@
 // server/src/media/media-routes.ts
 // 媒体素材路由(2026-09-29 spec m1c-video-clip §0.3):列表 / 视频流(带 Range) / 删素材 / 剪音频。
-import type { FastifyInstance } from 'fastify';
-import { existsSync, statSync } from 'node:fs';
+import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
+import { createReadStream, existsSync, statSync } from 'node:fs';
 import { createImportsRepo } from '../db/repo/imports.js';
 import { createJobsRepo } from '../db/repo/jobs.js';
 import { createSourceVideosRepo } from '../db/repo/source-videos.js';
@@ -11,6 +11,7 @@ import { sendFileWithRange } from '../http/file-range.js';
 import { pushLog } from '../logs.js';
 import { deleteVideoFiles } from './media-files.js';
 import { startClipJob, type ClipJobPayload } from './clip-job.js';
+import { derivedDirFor, ensureDerivedImage, invalidateDerived, type DerivedKind } from './derived-images.js';
 
 export { formatClipTitle } from './clip-job.js';
 
@@ -23,6 +24,33 @@ export function registerMediaRoutes(
 ): void {
   const { db, mediaDir, token } = deps;
   const videosRepo = createSourceVideosRepo(db);
+
+  // —— P4 派生图（波形/胶片条，spec D6/D14/§0.3）——
+  const serveDerived = (kind: DerivedKind) => async (req: FastifyRequest, reply: FastifyReply) => {
+    const importId = Number((req.params as { importId: string }).importId);
+    const q = (req.query ?? {}) as { token?: string };
+    const origin = typeof req.headers.origin === 'string' ? req.headers.origin : '';
+    // 鉴权口径同 /api/media/:id/file 与 /cover：<img> 不带 Origin、加不了 header → 认 query token / 本机 Origin / 本机 Referer
+    if (q.token !== token && !isAllowedLocalOrigin(origin) && !isLocalPageReferer(req.headers.referer)) {
+      pushLog('error', 'media', `派生图 401 kind=${kind} import=${importId} origin=${origin || '(none)'} token=${q.token ? 'present' : 'missing'} referer=${req.headers.referer ?? '(none)'}`);
+      return reply.code(401).send({ ok: false, error: { code: 'UNAUTHORIZED', message: 'token 无效', next: '' } });
+    }
+    if (!Number.isInteger(importId) || importId <= 0) return reply.code(404).send({ ok: false, error: { code: 'NOT_FOUND', message: '素材不存在', next: '' } });
+    const row = videosRepo.get(importId);
+    if (!row) return reply.code(404).send({ ok: false, error: { code: 'NOT_FOUND', message: '素材不存在', next: '' } });
+    if (!existsSync(row.file_path)) {
+      // 素材行在但文件被外部删了（同 /file 的两种 404 文案）
+      return reply.code(404).send({ ok: false, error: { code: 'FILE_MISSING', message: '素材文件已丢失，请重新下载视频', next: '回到资料库重新下视频' } });
+    }
+    const r = await ensureDerivedImage({ kind, importId, videoPath: row.file_path, derivedDir: derivedDirFor(mediaDir), tempDir: deps.tempDir, db });
+    if (!r.ok) return reply.code(500).send({ ok: false, error: { code: r.code, message: r.message, next: '到设置页检查 ffmpeg 配置' } });
+    // 静态派生图走「封面式裸流」，不用 sendFileWithRange（实测 H：<img> 不发 Range，PNG 无 seek 语义）。
+    // cache-control no-store：素材一变派生图即作废、URL 不变，长缓存会显示上一集的波形（见计划 C-1）
+    reply.header('content-type', 'image/png').header('cache-control', 'no-store');
+    return reply.send(createReadStream(r.path));
+  };
+  app.get('/api/media/:importId/waveform', serveDerived('wave'));
+  app.get('/api/media/:importId/filmstrip', serveDerived('film'));
 
   app.get('/api/media', async () => ({ ok: true, media: videosRepo.list() }));
 
@@ -58,6 +86,7 @@ export function registerMediaRoutes(
     // 删文件失败不让接口失败(与 DELETE /api/audio/:id 同款语义:DB 行删了就算"删了")
     const r = deleteVideoFiles(mediaDir, importId);
     videosRepo.delete(importId);
+    invalidateDerived(derivedDirFor(mediaDir), importId); // R3-2：素材没了 → 派生图一并作废（失败只记日志）
     pushLog('info', 'media', `素材已删 import=${importId} deleted=${r.deleted.length} failed=${r.failed.length}`);
     return { ok: true, deleted: r.deleted.length };
   });

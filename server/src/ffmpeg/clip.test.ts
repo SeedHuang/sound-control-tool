@@ -1,5 +1,25 @@
 import { describe, expect, it } from 'vitest';
-import { runClip } from './clip.js';
+import { runClip, runFfmpegArgs } from './clip.js';
+
+// P4 T4：runFfmpegArgs 是 runClip 抽出的通用 runner（导出 merge 复用）——直测三条：成功 / exit0 无产物 / err 带 stderr
+describe('runFfmpegArgs', () => {
+  const opts = { ffmpegPath: 'ffmpeg', args: ['-i', 'v.mp4', '-y', 'o.mp3'], outPath: 'o.mp3' };
+  it('成功:exit 0 且产物非空 → ok', async () => {
+    const doExec = ((_b: string, _a: string[], _o: unknown, cb: (e: null, so: string, se: string) => void) => cb(null, '', '')) as never;
+    expect((await runFfmpegArgs({ ...opts, doExec, fileSize: () => 1024 })).ok).toBe(true);
+  });
+  it('退出码 0 但没写出文件 → 失败（不信退出码）', async () => {
+    const doExec = ((_b: string, _a: string[], _o: unknown, cb: (e: null, so: string, se: string) => void) => cb(null, '', '')) as never;
+    expect((await runFfmpegArgs({ ...opts, doExec, fileSize: () => null })).ok).toBe(false);
+  });
+  it('非零退出 → 失败且把 stderr 带回来', async () => {
+    const doExec = ((_b: string, _a: string[], _o: unknown, cb: (e: NodeJS.ErrnoException, so: string, se: string) => void) =>
+      cb(Object.assign(new Error('boom'), { code: '1' }), '', 'concat failed')) as never;
+    const r = await runFfmpegArgs({ ...opts, doExec, fileSize: () => null });
+    expect(r.ok).toBe(false);
+    expect(r.stderr).toContain('concat failed');
+  });
+});
 
 const base = { ffmpegPath: 'ffmpeg', inputPath: 'v.mp4', outPath: 'o.mp3', start: 0, end: 10, format: 'mp3' as const };
 

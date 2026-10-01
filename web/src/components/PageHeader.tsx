@@ -1,6 +1,6 @@
 // 统一页面头(spec m2-workspace D2):① 平台 logo + 标题 + 元信息(右)  ② 工具栏。
 // 固定不滚:调用方把它作为 flex 列的**第一个 flexShrink:0** 子项,滚动交给后面的内容容器。
-// toolbar 不传 → 不渲染第二行(设置页用这个简化形态)。
+// toolbar 不传 → 不渲染第二行(当前无调用方这样用;曾误记为"设置页用这个简化形态",实际设置页是一摞 Card,并未引用本组件)。
 import type { ReactNode } from 'react';
 
 export interface PageHeaderProps {

@@ -66,7 +66,7 @@
 
 - body 新增两个可选字段：
   - `produce?: 'audio' | 'video'`（`undefined` / `null` / `''` 一律按 `'audio'`；**其它非二者之一的值 → 400**，评审补：把空串归到 audio 而不是报错，否则前端"没选"会被当成非法）
-  - `options.videoHeight?: 360 | 480 | 720 | 1080`（仅 `produce='video'` 有意义）。**缺省 = 480**（评审补：与 UI 默认一致，直接打 API 的人不必猜）；传了但不在白名单 → 400
+  - `options.videoHeight?: number`（仅 `produce='video'` 有意义）。**缺省 = 480**（评审补：与 UI 默认一致，直接打 API 的人不必猜）。**2026-09-30 变更（library-ui-polish D10）**：档位改为按视频实测，类型由窄联合 `360|480|720|1080` 放宽为整数；校验改为「整数且落在 144..4320」，越界/非整数 → 400（不再只认四档）。详见 `2026-09-30-library-ui-polish.md` §0.3。
 - 校验新增：如上两条；其余校验（format / section / entryIndices 长度 1）沿用现状
 - job kind：`produce='video'` → 新建 **`ytdlp_video`**；否则仍是 `ytdlp_download`（kind 分开是为了让并发检查与任务列表各自语义清楚）
 - 产物落点：`produce='video'` → `<数据目录>/media/media-<importId>.<ext>`（ext 由实际产物决定，见 §0.4）
@@ -145,6 +145,8 @@ CREATE TABLE IF NOT EXISTS source_videos (
   - 因此本层的输出目录 = 既有 `tempDir`；finalize 里 `ingestDownloadedFile({ tmpPath: 临时产物, ... })` 一步到位
 
 ## 0.6 web（获取页新增一个模式）
+
+> ⚠️ **已废弃（2026-09-30，M2 工作台重构 `m2-workspace`）**：本节描述的「获取页新增一个模式（视频预览剪音频）」**已作废**。「获取」页已改名为**资料库**（仅下载视频素材，不再有模式切换器），原"下视频 → 画面上打点 → 剪出音频"的交互**迁至剪辑室 / 剪辑详情**：剪辑室 `/studio` 是媒体列表（含"编辑"入口），剪辑详情 `/studio/:importId` 是同屏时间轴（画轨胶片条 + 音轨波形）打点编辑。下文保留为当时的历史设计。新落点见 `docs/superpowers/specs/m2-workspace.md`（§0.2 D4/D6/D17/D20、§0.3 接口、§0.5 P3/P4）。
 
 获取页现在是"左列表 + 主区"，模式切换器放在页面顶部：
 

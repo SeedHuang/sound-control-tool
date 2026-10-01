@@ -66,9 +66,11 @@ export function onAudioChanged(fn: AudioChangedHandler): () => void {
   return () => { audioChangedHandlers.delete(fn); };
 }
 
-export async function apiGet<T>(path: string): Promise<T> {
+/** timeoutMs 可选:默认仍是 10s(其它调用方行为不变);探测类慢接口可显式调大——见 getFormats:
+ *  服务端探测超时是 15s,客户端若仍用 10s 会先 abort,慢视频明明服务端能探到却只看到降级四档 */
+export async function apiGet<T>(path: string, timeoutMs = 10_000): Promise<T> {
   const ctl = new AbortController();
-  const timer = setTimeout(() => ctl.abort(), 10_000);
+  const timer = setTimeout(() => ctl.abort(), timeoutMs);
   let res: Response;
   try {
     const headers: Record<string, string> = {};
@@ -126,7 +128,9 @@ export interface DownloadPayload {
   durationSec?: number;
   entryIndex?: number;      // 合集第几集(1 起);单视频不传(2026-09-29 用户拍板:剪辑室要显示第几集)
   collectionTitle?: string; // 所属合集标题;单视频不传
-  options: { entryIndices?: number[]; section?: { start: number; end: number }; videoHeight?: 360 | 480 | 720 | 1080; format: 'mp3' | 'm4a' | 'wav'; quality?: string; force?: boolean };
+  // videoHeight(spec D10,Task 4):档位来自前端实测 → 可能是 1056/1440/2160 等任意整数,类型放宽为 number;
+  // 服务端已补校验(整数 144..4320,越界 400),前端只负责把实测值原样传下去
+  options: { entryIndices?: number[]; section?: { start: number; end: number }; videoHeight?: number; format: 'mp3' | 'm4a' | 'wav'; quality?: string; force?: boolean };
   produce?: 'audio' | 'video'; // 产物类型(2026-09-29 spec m1c-video-clip):video=下完整视频素材(带音轨),缺省 audio=抽音轨
 }
 
@@ -163,6 +167,19 @@ export function mediaFileUrl(importId: number): string {
   return `${API_BASE}/api/media/${importId}/file?token=${encodeURIComponent(token ?? '')}`;
 }
 
+/** 派生图地址（P4）：固定 1600 宽的波形 / 胶片条，服务端 ffmpeg 生成并按素材缓存（<数据目录>/derived/，D14）。
+ *  取图口径同 mediaFileUrl —— <img> 带不了 header，只能走 query token；
+ *  rev 版本串由调用方拼：素材被替换后 URL 不变，靠 rev 变化 + 服务端 no-store 双保险避免拿到上一集的图。
+ *  这里**不写日志**：一页两张图、每次渲染都会取地址，逐条 logFe 只会把日志面板刷爆。 */
+export function waveformUrl(importId: number, rev: string | number): string {
+  const token = apiToken();
+  return `${API_BASE}/api/media/${importId}/waveform?token=${encodeURIComponent(token ?? '')}&rev=${encodeURIComponent(String(rev))}`;
+}
+export function filmstripUrl(importId: number, rev: string | number): string {
+  const token = apiToken();
+  return `${API_BASE}/api/media/${importId}/filmstrip?token=${encodeURIComponent(token ?? '')}&rev=${encodeURIComponent(String(rev))}`;
+}
+
 export async function deleteMedia(importId: number): Promise<{ ok: boolean; deleted: number }> {
   logFe('info', `deleteMedia import=${importId}`);
   return apiDelete<{ ok: boolean; deleted: number }>(`/api/media/${importId}`);
@@ -174,6 +191,70 @@ export async function clipMedia(
 ): Promise<{ ok: boolean; jobId: number }> {
   logFe('info', `clipMedia import=${importId} ${payload.start}-${payload.end}s format=${payload.format}`);
   return apiPost<{ ok: boolean; jobId: number }>(`/api/media/${importId}/clip`, payload);
+}
+
+// ---- 剪辑工程 / 导出（P4，spec §0.3）----
+// 段：编辑期只有 start/end/label；服务端落库后才带 id/sort_order（PUT 按数组顺序定 sort_order）
+export interface ClipSegmentDTO { id?: number; start_sec: number; end_sec: number; label?: string | null; sort_order?: number }
+export interface ClipProjectDTO { import_id: number; name: string | null; updated_at: string; segments: ClipSegmentDTO[] }
+export interface ClipProjectSummaryDTO { import_id: number; name: string | null; updated_at: string; segment_count: number }
+
+/** GET /api/projects/:id：来源在但没工程 → null（正常态，不是错误） */
+export async function getProject(importId: number): Promise<ClipProjectDTO | null> {
+  const r = await apiGet<{ ok: boolean; project: ClipProjectDTO | null }>(`/api/projects/${importId}`);
+  return r.project;
+}
+/** 工程列表（P5 首页复用） */
+export function listProjects(): Promise<ClipProjectSummaryDTO[]> {
+  return apiGet<{ ok: boolean; projects: ClipProjectSummaryDTO[] }>('/api/projects').then((r) => r.projects);
+}
+/** PUT 全量替换（服务端包事务 D18）；返回保存后的工程（含服务端定的 sort_order 顺序） */
+export function putProject(importId: number, body: { name: string | null; segments: { start_sec: number; end_sec: number; label?: string | null }[] }): Promise<{ ok: boolean; project: ClipProjectDTO }> {
+  logFe('info', `putProject import=${importId} 段数=${body.segments.length}`);
+  return apiPut<{ ok: boolean; project: ClipProjectDTO }>(`/api/projects/${importId}`, body);
+}
+/** DELETE 工程（幂等；不删素材、不删已导出音频） */
+export function deleteProject(importId: number): Promise<{ ok: boolean; deleted: number }> {
+  logFe('info', `deleteProject import=${importId}`);
+  return apiDelete<{ ok: boolean; deleted: number }>(`/api/projects/${importId}`);
+}
+/** 导出：segments 必传（D15，以请求体为准，不读 DB 工程、不自动保存）；起 job + 走 SSE 订阅进度 */
+export function exportProject(importId: number, body: { mode: 'separate' | 'merge'; format: 'mp3' | 'm4a' | 'wav'; quality?: string; segments: { start_sec: number; end_sec: number; label?: string | null }[] }): Promise<{ ok: boolean; jobId: number }> {
+  logFe('info', `exportProject import=${importId} mode=${body.mode} 段数=${body.segments.length}`);
+  return apiPost<{ ok: boolean; jobId: number }>(`/api/projects/${importId}/export`, body);
+}
+
+// ---- 首页仪表盘(P5-T2,spec §0.3「其它」):GET /api/home → 两块 Top3 ----
+// 形状逐字对齐后端 server/src/db/repo/home.ts 的 HomeEditingRow / HomeRecentRow(editing 复用工程列表形状)
+export interface HomeEditingRow { import_id: number; name: string | null; site: string; updated_at: string; segment_count: number }
+export interface HomeRecentRow { import_id: number; title: string; site: string; latest_audio_id: number; created_at: string }
+export interface HomeData { editing: HomeEditingRow[]; recent: HomeRecentRow[] }
+
+/** 首页数据(editing / recent 各最多 3 条;服务端已按来源去重、排除无来源条目) */
+export function getHome(): Promise<HomeData> {
+  return apiGet<{ ok: boolean; editing: HomeEditingRow[]; recent: HomeRecentRow[] }>('/api/home').then((r) => ({ editing: r.editing, recent: r.recent }));
+}
+
+// ---- 在途任务列表(spec download-queue-tray §0.3「新增：任务列表」,2026-09-30)----
+// 抽屉与托盘都要「队列全貌」(D9/D11),而单任务 SSE 只盯一个 job,做不到。故新增这条轮询接口。
+// 字段名/类型严格对齐服务端 server/src/media/jobs-routes.ts 的返回:不自己加字段、不改名。
+export interface ActiveJob {
+  id: number;
+  kind: string;                                  // ytdlp_video / ytdlp_download / ffmpeg_clip / ffmpeg_export
+  status: 'pending' | 'running';                 // pending = 排队中, running = 进行中
+  progress: number;
+  title: string;
+  subtitle: string | null;                       // 合集才有的「第 N 集」,单视频为 null
+  message: string | null;
+  createdAt: string;
+}
+/** 下载批次分数(D16):口径由服务端统一,前端不各算一遍 */
+export interface DownloadBatch { total: number; done: number; running: number; queued: number }
+
+/** 在途任务(下载/剪辑/导出)+ 下载批次分数(spec D9/D16)。
+ *  抽屉每 1s(在途非空)/ 5s(空闲)轮询它;失败由调用方 logFe + 抽屉内 Alert 呈现(D10)。 */
+export function listActiveJobs(): Promise<{ ok: boolean; jobs: ActiveJob[]; downloads: DownloadBatch }> {
+  return apiGet('/api/jobs?active=1');
 }
 
 export async function cancelJob(jobId: number): Promise<{ ok: boolean }> {
@@ -211,7 +292,8 @@ export function coverUrl(importId: number): string {
 /** done 事件联合类型(spec m1c-video-clip):audio=进剪辑室(下载与剪辑共用;旧下载事件无 kind 字段 → 按缺省 audio 读);
  *  video=视频素材就位(importId 即来源 id,拿它拼 /api/media/:id/file 流地址;fileSize 为素材字节数) */
 export type DoneEvent =
-  | { kind?: 'audio'; audioId: number; title: string; format: string; replaced?: boolean }
+  // count:P4 一次导出多条（separate 模式）时的条数（plan C-2）;单条导出/下载不返回该字段
+  | { kind?: 'audio'; audioId: number; title: string; format: string; replaced?: boolean; count?: number }
   | { kind: 'video'; importId: number; title: string; filePath: string; height: number | null; fileSize: number };
 
 export function subscribeJob(jobId: number, handlers: {
@@ -258,11 +340,31 @@ export async function apiPut<T>(path: string, body: unknown): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, { method: 'PUT', headers, body: JSON.stringify(body) });
   if (!res.ok) {
     const j = (await res.json().catch(() => null)) as { error?: { code?: string; message?: string; next?: string } } | null;
-    const msg = j?.error?.message ?? `请求失败 ${res.status}:${path}${j?.error?.next ? `。${j.error.next}` : ''}`;
+    // 后端 error.next 是「下一步怎么办」的指引(spec §0.5)。原实现只在 message 缺失时才拼 next,
+    // 但 PUT /api/settings 的 400 恒带 message → next 永远到不了用户(只看到前半句)。
+    // 改为 message 非空时也把 next 追加进展示消息;!base.includes 防同一句被拼两遍。
+    // 注意:apiPut 是共享代码(saveCookie / putProject 也走它),它们的失败消息也会多出这个「（…）」尾巴——
+    // 这是有意改善(多给一步指引),不要去改那两处调用逻辑。code 参数保持原样不动。
+    const body = j?.error;
+    const base = body?.message ?? `请求失败 ${res.status}:${path}`;
+    const next = typeof body?.next === 'string' && body.next.trim() !== '' && !base.includes(body.next) ? body.next : '';
+    const msg = next === '' ? base : `${base}（${next}）`;
     logFe('error', `请求失败 ${path}: ${msg}`); // 诊断日志:业务错误(400/409)也进前端面板
     throw new ApiError(msg, j?.error?.code);
   }
   return (await res.json()) as T;
+}
+
+/** GET /api/settings:白名单键 + 计算字段 output_dir_resolved(导出目录实际生效值,spec D11)。
+ *  这里返回 Record<string,string> 而非具体形状:白名单键会随服务端演进,前端只按遇到的键取用。 */
+export function getSettings(): Promise<Record<string, string>> {
+  return apiGet<Record<string, string>>('/api/settings');
+}
+
+/** PUT /api/settings:值必须是字符串(服务端约束);失败时 apiPut 已把后端 error.message/error.next 拼进错误消息 */
+export function putSettings(patch: Record<string, string>): Promise<{ ok: boolean }> {
+  logFe('info', `putSettings ${Object.keys(patch).join(',')}`);
+  return apiPut<{ ok: boolean }>('/api/settings', patch);
 }
 
 /** GET /api/cookie:只回元数据(count/有效期);Cookie 内容永不回传 UI(server 端键不在 settings 白名单) */
@@ -318,6 +420,7 @@ export interface ImportSource {
   has_video: boolean;             // 该来源已登记视频素材(2026-09-30 P2 对齐服务端 /api/imports)
   has_project: boolean;           // 已有剪辑工程(2026-09-30 P2 对齐服务端)
   segment_count: number;          // 已保存剪辑点数(D19 替换确认文案的条件句用)
+  material_entry_index: number | null; // 这份素材是合集里的第几集(2026-09-30 P3-T1 对齐服务端);单视频/无素材 → null
 }
 export interface ImportDetail extends Omit<ImportSource, 'entry_count'> { duration_sec: number | null; entries: { index: number; title: string }[] | null }
 
@@ -337,6 +440,18 @@ export async function getImport(id: number): Promise<ImportDetail> {
 export async function deleteImport(id: number): Promise<void> {
   logFe('info', `deleteImport id=${id}`);
   await apiDelete(`/api/imports/${id}`);
+}
+
+/** 可用清晰度探测(spec D6/D6a,Task 4):GET /api/imports/:id/formats?entry=<n>。
+ *  服务端保证不报错——探测失败/超时会回固定四档 + fallback:true(前端据此静默降级)。
+ *  返回的是**实测高度**(B 站实测形如 [1056,704,470],不规整),标签归一由界面负责(见 library.tsx 的 tierLabel);
+ *  Radio 的 value 必须用实测值,下载才能精确命中该路流。
+ *  entry 仅合集需要(第几集,1 起);单视频不传。 */
+export function getFormats(importId: number, entry?: number): Promise<{ ok: boolean; heights: number[]; fallback: boolean }> {
+  const q = entry !== undefined ? `?entry=${entry}` : '';
+  // 20s > 服务端探测超时 15s:慢视频(B 站大合集)探测可能接近 15s,客户端若用默认 10s 会先 abort,
+  // 明明服务端能探到、用户却只看到降级四档(第二次进入命中服务端缓存才正常)
+  return apiGet<{ ok: boolean; heights: number[]; fallback: boolean }>(`/api/imports/${importId}/formats${q}`, 20_000);
 }
 
 // ---- 日志清空(2026-09-29 用户拍板:日志要可删除) ----

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { join } from 'node:path';
-import { buildDownloadArgs, buildParseArgs, buildVideoDownloadArgs, buildWriteThumbnailArgs } from './args.js';
+import { buildDownloadArgs, buildParseArgs, buildProbeFormatsArgs, buildVideoDownloadArgs, buildWriteThumbnailArgs } from './args.js';
 describe('buildParseArgs', () => {
   it('固定 -J --flat-playlist --no-warnings', () => {
     expect(buildParseArgs('https://b23.tv/abc')).toEqual(['-J', '--flat-playlist', '--no-warnings', 'https://b23.tv/abc']);
@@ -88,5 +88,50 @@ describe('buildVideoDownloadArgs(下视频做定位素材)', () => {
     const args = buildVideoDownloadArgs(base);
     expect(args).toContain('--no-playlist');
     expect(args).not.toContain('--playlist-items');
+  });
+  // Task 2(2026-09-30 spec D10):videoHeight 类型放宽为整数 → 实测档/非规整值都能直接拼进表达式(表达式本身未改)
+  it('任意整数档位(1440、1056 等非规整实测值)直接拼进 height<=N', () => {
+    expect(buildVideoDownloadArgs({ url: 'u', outDir: 'D:/t', videoHeight: 1440 }).join(' ')).toContain('height<=1440');
+    expect(buildVideoDownloadArgs({ url: 'u', outDir: 'D:/t', videoHeight: 1056 }).join(' ')).toContain('height<=1056');
+  });
+});
+// Task 3(2026-09-30 spec D15/D18):风控节流只作用于下载,0/空一律不拼(默认即"不限",保持既有行为)
+describe('风控节流参数(spec D15/D18)', () => {
+  const baseVideo = { url: 'https://a/v', outDir: 'C:/tmp/job1', videoHeight: 480 };
+  const baseAudio = { url: 'u', options: { format: 'mp3' as const }, outDir: 'D:/tmp' };
+  it('视频 sleepSeconds>0 → 下载参数含 --sleep-requests <n>', () => {
+    const a = buildVideoDownloadArgs({ ...baseVideo, throttle: { sleepSeconds: 2 } });
+    expect(a[a.indexOf('--sleep-requests') + 1]).toBe('2');
+  });
+  it('音频 sleepSeconds>0 → 同样含 --sleep-requests <n>(两支都受保护)', () => {
+    const a = buildDownloadArgs({ ...baseAudio, throttle: { sleepSeconds: 3 } });
+    expect(a[a.indexOf('--sleep-requests') + 1]).toBe('3');
+  });
+  it('sleepSeconds=0/缺省 → 不含 --sleep-requests(两支)', () => {
+    expect(buildVideoDownloadArgs({ ...baseVideo, throttle: { sleepSeconds: 0 } })).not.toContain('--sleep-requests');
+    expect(buildVideoDownloadArgs(baseVideo)).not.toContain('--sleep-requests');
+    expect(buildDownloadArgs({ ...baseAudio, throttle: { sleepSeconds: 0 } })).not.toContain('--sleep-requests');
+    expect(buildDownloadArgs(baseAudio)).not.toContain('--sleep-requests');
+  });
+  it('limitRate 非空 → 含 --limit-rate;空串/缺省 → 不含(两支)', () => {
+    expect(buildDownloadArgs({ ...baseAudio, throttle: { limitRate: '500K' } })).toContain('--limit-rate');
+    expect(buildVideoDownloadArgs({ ...baseVideo, throttle: { limitRate: '500K' } })).toContain('--limit-rate');
+    expect(buildDownloadArgs({ ...baseAudio, throttle: { limitRate: '' } })).not.toContain('--limit-rate');
+    expect(buildVideoDownloadArgs(baseVideo)).not.toContain('--limit-rate');
+  });
+  it('节流只进下载参数——探测/解析/封面参数不含(拿 buildProbeFormatsArgs / buildParseArgs / buildWriteThumbnailArgs 断言)', () => {
+    expect(buildProbeFormatsArgs('https://a/v')).not.toContain('--sleep-requests');
+    expect(buildProbeFormatsArgs('https://a/v')).not.toContain('--limit-rate');
+    expect(buildParseArgs('https://a/v')).not.toContain('--limit-rate');
+    expect(buildParseArgs('https://a/v')).not.toContain('--sleep-requests');
+    expect(buildWriteThumbnailArgs('https://a/v', 'D:/c/x.%(ext)s')).not.toContain('--limit-rate');
+  });
+  // 回归保护:默认设置(0/空/缺省)下,拼了 throttle 与不拼 throttle 的参数必须逐字一致——
+  // 这条钉死"改造未改变既有下载行为",任何一处多拼/少拼都会红
+  it('默认值(0/空/缺省)与不传 throttle 逐字一致(默认行为不变)', () => {
+    expect(buildDownloadArgs({ ...baseAudio, throttle: { sleepSeconds: 0, limitRate: '' } }))
+      .toEqual(buildDownloadArgs(baseAudio));
+    expect(buildVideoDownloadArgs({ ...baseVideo, throttle: { sleepSeconds: 0, limitRate: '' } }))
+      .toEqual(buildVideoDownloadArgs(baseVideo));
   });
 });

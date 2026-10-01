@@ -25,8 +25,13 @@ import { parseMetadata, YtdlpRunError } from './parse.js';
 import { createSourceVideosRepo } from '../db/repo/source-videos.js';
 import { createClipProjectsRepo } from '../db/repo/clip-projects.js';
 import { deleteVideoFiles, placeVideo } from '../media/media-files.js';
+import { derivedDirFor, invalidateDerived } from '../media/derived-images.js';
 // SSE 事件桥(2026-09-29 抽到 job-events.ts):下载路由与媒体剪辑路由共用,连接表/节流状态都在那边
 import { addSseConnection, emit, logSseClose, progressBucketChanged, removeSseConnection, type SseConn } from './job-events.js';
+// Task 1(2026-09-30 spec download-queue-tray):并发受限下载队列——提交/重试入队,cancel 先试队列
+import type { DownloadQueue } from './download-queue.js';
+// Task 4:下载批次统计(spec D16)——在「任务创建 / 转入运行 / 终态」三处打点,供 GET /api/jobs 出分数
+import type { JobBatch } from '../media/jobs-routes.js';
 
 // Task 7:文件流 Content-Type 按扩展名映射——给 <audio> 标签可识别的 MIME,未知格式回退 octet-stream
 const MIME: Record<string, string> = { mp3: 'audio/mpeg', m4a: 'audio/mp4', wav: 'audio/wav' };
@@ -40,10 +45,22 @@ export interface YtdlpDeps {
   mediaDir: string;
   /** 剪辑启动器(Task 10 注入):retry 遇到 ffmpeg_clip 任务时把新任务交给它;未接线时 retry 返回 501 NOT_WIRED */
   clipStarter?: (jobId: number, payload: unknown) => Promise<void>;
+  /** 导出启动器(P4 注入):retry 遇到 ffmpeg_export 任务时把新任务交给它;未接线 → 500 NOT_WIRED */
+  exportStarter?: (jobId: number, payload: unknown) => Promise<void>;
   /** 封面抓取(2026-09-29):默认走 covers.ts 的真实实现(带 Referer 抓 B 站图床);单测注入桩,避免真发网络 */
   coverFetcher?: CoverFetcher;
   /** 封面兜底抓法:让 yt-dlp 自己写图(--write-thumbnail)。外网图床只能走它(Node fetch 不走系统代理) */
   coverWriter?: CoverWriter;
+  /** 并发受限下载队列(Task 1):提交下载与 retry 的下载支入队;cancel 先试队列(spec D1/D3/D5) */
+  queue: DownloadQueue;
+  /** 下载批次统计(Task 4,spec D16):可选——不传时(单测/未接线)打点被跳过,行为不变。
+   *  由 index.ts 建好 createJobBatch() 后从这一层传入,与 GET /api/jobs 出的是同一个实例(单一事实源)。 */
+  batch?: JobBatch;
+  /** 装配方(index.ts)接住下载处理器:把返回的 startDownload 喂给 queue.start(spec Step 8)。
+   *  不进 createDownloadHandlers 的返回值暴露面,只用这个回调把闭包里的引用交出去。 */
+  onDownloadHandlers?: (h: {
+    startDownload: (jobId: number, payload: DownloadJobPayload, onSettled?: () => void) => Promise<void>;
+  }) => void;
 }
 
 /** 抓一张作品封面并落盘;返回是否成功(失败只记日志,不抛) */
@@ -66,7 +83,7 @@ export interface DownloadJobPayload {
 // B 站 Cookie 注入(parse/download 两处共用):settings 里存了 Cookie → 物化 cookies.txt 到数据目录
 // (dirname(audioDir),与 db 同级,不进仓库);未设置/全空白/物化失败 → 返回 undefined 并留痕,不阻断下载
 // (Cookie 只是增强,不能因为它让无 Cookie 场景挂掉)。
-function resolveCookiePath(db: DB, audioDir: string): string | undefined {
+export function resolveCookiePath(db: DB, audioDir: string): string | undefined {
   const content = createSettingsRepo(db).get(BILI_COOKIE_KEY);
   if (!content || content.trim().length === 0) return undefined;
   try {
@@ -75,6 +92,19 @@ function resolveCookiePath(db: DB, audioDir: string): string | undefined {
     pushLog('error', 'job', `cookie 文件物化失败，跳过 --cookies 注入: ${e instanceof Error ? e.message : String(e)}`);
     return undefined;
   }
+}
+
+/**
+ * spec D10(2026-09-30):清晰度档位改为「按视频实测」,前端的实测值可能是 1440/2160 甚至 B 站那种 1056/704 的非规整值,
+ * 类型已放宽为 number —— **必须**配套校验,否则等于把任意值拼进 yt-dlp 的 `-f` 表达式。
+ * 合法 = 整数且落在 144..4320(下界=240p 以下对素材无意义;上界=8K 天花板)。
+ * 缺省(undefined/null)沿用既有 480 —— 前端"没选档位"不是非法。
+ * 返回 null 表示非法(调用方据此回 400);返回数字表示放行。
+ */
+function validateVideoHeight(v: unknown): number | null {
+  if (v === undefined || v === null) return 480;
+  if (typeof v !== 'number' || !Number.isInteger(v)) return null;
+  return v >= 144 && v <= 4320 ? v : null;
 }
 
 /** 覆盖下载(2026-09-29 用户拍板:同一集/同一视频重下 → 删掉库里原来那一份,只留新的)。
@@ -94,7 +124,7 @@ function replaceSameItems(audioRepo: AudioItemsRepo, opts: { url: string; entryI
 
 // 模块级辅助(在 registerYtdlpRoutes 外,通过参数注入 deps 更易测;此处为可注入闭包工厂)
 function createDownloadHandlers(deps: YtdlpDeps) {
-  const { db, binProvider, downloadManager, audioDir, mediaDir, tempDir, token } = deps;
+  const { db, binProvider, downloadManager, audioDir, mediaDir, tempDir, token, batch } = deps;
   const jobsRepo = createJobsRepo(db);
   const audioRepo = createAudioItemsRepo(db);
   let ffprobePath: string | null = null; // 首次用时惰性探测
@@ -173,6 +203,8 @@ function createDownloadHandlers(deps: YtdlpDeps) {
       const newEntryIndex = payload.entryIndex ?? null;
       // 批4 裁定 R6:落库路径必须用 placed.path 原样(Windows 反斜杠风格,不 normalize,与磁盘真实路径逐字节一致)
       videosRepo.upsert({ importId: row.id, filePath: placed.path, height: videoHeight, fileSize: size, entryIndex: newEntryIndex });
+      // R3-2：素材变了（换集/换清晰度重下）→ 该来源的派生图作废，下次访问重新生成（别拿上一集的波形冒充）
+      invalidateDerived(derivedDirFor(mediaDir), row.id);
       // D19 判定留痕(Task 2 消费):集号变没变一眼可查(pushLog source 联合类型无 'ytdlp',与 finalize 其余日志同源用 'job')
       pushLog('info', 'job', `video 素材 entry_index: ${oldEntryIndex} → ${newEntryIndex} import=${row.id}`);
       // D19 服务端(2026-09-30):换集 → 清空该来源的剪辑工程(段 + 工程行);同集换清晰度重下 → 保留,用户的剪辑点不丢。
@@ -193,27 +225,49 @@ function createDownloadHandlers(deps: YtdlpDeps) {
       emit(jobId, { type: 'status', state: 'error', message: msg });
     }
   }
-  async function startDownload(jobId: number, payload: DownloadJobPayload): Promise<void> {
-    jobsRepo.update(jobId, { status: 'running' });
-    const opt = (payload.options ?? {}) as { entryIndices?: number[]; section?: { start: number; end: number }; format?: string; quality?: string; videoHeight?: unknown };
+  async function startDownload(jobId: number, payload: DownloadJobPayload, onSettled?: () => void): Promise<void> {
+    // produce / kind 提到最前:批次打点需要一个 kind 来判断「是不是下载类」。
+    // 与 POST /api/ytdlp/download 建 job 时的 kind 表达式逐字一致(produce 驱动 kind),不会漂移。
     // produce 分支(2026-09-29 spec m1c-video-clip):视频素材下完整视频(带音轨,后面要从它抽音频);音频走原有 -x 抽音轨
     const produce = payload.produce === 'video' ? 'video' : 'audio';
-    const videoHeight = (Number((opt as { videoHeight?: unknown }).videoHeight ?? 480) as 360 | 480 | 720 | 1080);
+    const kind = produce === 'video' ? 'ytdlp_video' : 'ytdlp_download';
+    jobsRepo.update(jobId, { status: 'running' });
+    // 修复轮 1（审查 Minor 5）：批次不再维护 running/queued（改由 GET /api/jobs 从 DB 现数），
+    // 故此处不再打「转运行」点——旧写法一旦某条终态出口漏打点，running 会永久漂移。
+    // kind 仍供下方 settle 的终态打点判定「是否下载类」用。
+    // 队列靠 onSettled 释放槽位：**任何终态都必须恰好调一次**（done/error/cancelled/提前 fail），
+    // 否则槽位泄漏 → 后面排队的任务永远起不来（D6）。settled 守卫保证幂等（防重复终态事件/异常兜底双重触发）。
+    let settled = false;
+    // 终态打点③(spec D16):入参是 done/error/cancelled 之一——完成数 +1 并从在途摘掉。
+    // 与 onSettled 共用 settled 守卫,保证「一个任务恰好打一次终态」(不重复计 done)。
+    const settle = (status: string): void => { if (!settled) { settled = true; batch?.note(kind, status); onSettled?.(); } };
+    const opt = (payload.options ?? {}) as { entryIndices?: number[]; section?: { start: number; end: number }; format?: string; quality?: string; videoHeight?: unknown };
+    // spec D10:档位来自前端实测,可能是 1440/2160 等任意整数 → 去掉窄断言(合法性由路由侧 validateVideoHeight 把关);
+    // 音频支(produce !== 'video')根本不读它,故这里照旧只做缺省兜底,不影响音频下载
+    const videoHeight = Number(opt.videoHeight ?? 480);
     const bin = await binProvider();
     if (!bin.path) {
       const msg = mapYtdlpError({ binPath: null }).message;
       jobsRepo.fail(jobId, msg);
       pushLog('error', 'job', `job ${jobId} error: ${msg}`); // 诊断日志:bin 缺失也要在面板可见
       emit(jobId, { type: 'status', state: 'error', message: msg }); // 补 SSE 终态,否则订阅连接悬挂
+      settle('error'); // 终态出口①:bin 拿不到 → 释放队列槽位并记 error 完成（D6/D16）
       return;
     }
     // Important 修复:每 job 独立子目录——DownloadManager 的 cleanJobOutputs/findLatest 假设"一 job 一 outDir",
     // 并发不同 URL 共享 tempDir 时,取消会误删别的 job 产物、close 会 findLatest 到对方文件(title/content 串库)
     const jobOutDir = join(tempDir, 'job' + jobId);
     mkdirSync(jobOutDir, { recursive: true });
+    // 风控节流(spec D15/D18,2026-09-30):每个任务启动时**现读**设置(改了设置,下一个任务即生效);
+    // 0/空一律不拼参数(sleep 缺省 '0'、limit 缺省 '')——默认设置下下载参数与改造前逐字一致。
+    const settings = createSettingsRepo(db);
+    const throttle = {
+      sleepSeconds: Number(settings.get(SETTINGS_KEYS.downloadSleepSeconds) ?? '0'),
+      limitRate: settings.get(SETTINGS_KEYS.downloadLimitRate) ?? '',
+    };
     const args = produce === 'video'
       // P2 方案A:options.entryIndices(路由已校验"长度 1 的正整数")透传给视频参数——单集下载与音频同口径
-      ? buildVideoDownloadArgs({ url: payload.url, outDir: jobOutDir, videoHeight, entryIndices: opt.entryIndices, cookiePath: resolveCookiePath(db, audioDir) })
+      ? buildVideoDownloadArgs({ url: payload.url, outDir: jobOutDir, videoHeight, entryIndices: opt.entryIndices, cookiePath: resolveCookiePath(db, audioDir), throttle })
       : buildDownloadArgs({
           url: payload.url,
           options: {
@@ -224,8 +278,10 @@ function createDownloadHandlers(deps: YtdlpDeps) {
           },
           outDir: jobOutDir,
           cookiePath: resolveCookiePath(db, audioDir), // B 站 Cookie:设置里有就注入 --cookies(未设置/物化失败 → undefined,照常下载)
+          throttle, // 节流只下载(spec D18):探测/解析路由不传它
         });
-    pushLog('info', 'job', `job ${jobId} spawn yt-dlp bin=${bin.path}`); // 诊断日志:记录实际用的二进制路径
+    // 诊断日志:记实际二进制路径 + 节流值(默认设置下显示 0s/(none),一眼可查"是否被节流")
+    pushLog('info', 'job', `job ${jobId} spawn yt-dlp bin=${bin.path} throttle=${throttle.sleepSeconds}s/${throttle.limitRate || '(none)'}`);
     downloadManager.start({
       jobId, binPath: bin.path, args, outDir: jobOutDir,
       // spec D5:本 job 的产物扩展名集合必填——音频组/视频组按 produce 切换(定位产物与取消清理都按它过滤)
@@ -246,13 +302,25 @@ function createDownloadHandlers(deps: YtdlpDeps) {
           pushLog('info', 'job', `job ${jid} 下载完成 → 进入入库`);
           emit(jid, { type: 'phase', phase: 'ingest' });
           // 视频支(2026-09-29 spec m1c-video-clip):落 media/ 记 source_videos,不进 audio_items
-          if (produce === 'video') void finalizeVideoDownload(jid, payload, ev.producedPath, videoHeight);
-          else void finalizeDownload(jid, payload, ev.producedPath);
+          // 终态出口②:入库完成才算本任务终态——finalize* 内部置 done/error,用 finally 兜底在两条路径(含 finalize 抛错)后 settle，
+          // 这样槽位一直占到入库结束，避免「下载进程刚退、另一个下载就挤进来」抢 ffprobe/磁盘 IO。
+          // 批次打点③的状态从库里读(finalize 已写好 done/error),不能写死——否则失败任务会被算成 done。
+          if (produce === 'video') void finalizeVideoDownload(jid, payload, ev.producedPath, videoHeight).finally(() => settle(jobsRepo.get(jid)?.status === 'done' ? 'done' : 'error'));
+          else void finalizeDownload(jid, payload, ev.producedPath).finally(() => settle(jobsRepo.get(jid)?.status === 'done' ? 'done' : 'error'));
         }
-        if (ev.type === 'status' && ev.state === 'error' && ev.message) {
-          jobsRepo.fail(jid, ev.message);
-          pushLog('error', 'job', `job ${jid} error: ${ev.message}`); // 诊断日志:下载进程报错留痕
-          emit(jid, { type: 'status', state: 'error', message: ev.message });
+        if (ev.type === 'status' && ev.state === 'error') {
+          // 既有语义:有 message 才落库/留痕/补发;无 message 时行为不变,但 settle 无条件(防槽位泄漏)。
+          if (ev.message) {
+            jobsRepo.fail(jid, ev.message);
+            pushLog('error', 'job', `job ${jid} error: ${ev.message}`); // 诊断日志:下载进程报错留痕
+            emit(jid, { type: 'status', state: 'error', message: ev.message });
+          }
+          settle('error'); // 终态出口③:下载进程报错 → 释放队列槽位并记 error 完成（D6/D16）
+        }
+        // 终态出口④:取消。download.ts 在 child close 时发 cancelled;cancel 路由自己已置 cancelled 并 emit，
+        // 这里只释放槽位、不补发事件(否则同一条 cancelled 会推两遍，D5)
+        if (ev.type === 'status' && ev.state === 'cancelled') {
+          settle('cancelled'); // 终态打点③:取消也算本批「完成」(spec D16),并从在途摘掉
         }
       },
     });
@@ -261,7 +329,7 @@ function createDownloadHandlers(deps: YtdlpDeps) {
 }
 
 export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void {
-  const { db, binProvider, token, downloadManager, audioDir, mediaDir } = deps;
+  const { db, binProvider, token, downloadManager, audioDir, mediaDir, queue } = deps;
   const audioRepo = createAudioItemsRepo(db);
   const importsRepo = createImportsRepo(db);
   // 封面目录:与音频同级(audioDir = <数据目录>/audio → <数据目录>/covers),沿用 D4「与 db 同数据目录」的约定
@@ -274,6 +342,10 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
     return writeCoverViaYtdlp({ ...o, binPath: bin.path, cookiePath: resolveCookiePath(db, audioDir) });
   });
   const { startDownload } = createDownloadHandlers(deps);
+  // 装配方(index.ts)接住下载处理器:队列的 start 需要「按 jobId 起任务并在终态 resolve」,
+  // 而 startDownload 只存在于上面这个闭包里——把引用交出去,由装配方接到 queue.start(spec Step 8)。
+  // 注册是同步的,HTTP 请求到来前一定已接上。
+  deps.onDownloadHandlers?.({ startDownload });
 
   app.post('/api/ytdlp/parse', async (req, reply) => {
     const body = (req.body ?? {}) as { url?: unknown };
@@ -361,10 +433,10 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
     }
     const produce: 'audio' | 'video' = rawProduce === 'video' ? 'video' : 'audio';
 
-    const videoHeightRaw = (opt as { videoHeight?: unknown }).videoHeight;
-    const videoHeight = Number(videoHeightRaw ?? 480);
-    if (produce === 'video' && ![360, 480, 720, 1080].includes(videoHeight)) {
-      return reply.code(400).send({ ok: false, error: { code: 'BAD_REQUEST', message: 'videoHeight 只能是 360|480|720|1080', next: '选择清晰度' } });
+    // spec D10(2026-09-30):档位改为按实测,任意整数 144..4320 都合法(不再只认 360/480/720/1080)。
+    // 校验只对视频支做——produce !== 'video'(音频)不使用 videoHeight,不能让音频下载因它被 400。
+    if (produce === 'video' && validateVideoHeight((opt as { videoHeight?: unknown }).videoHeight) === null) {
+      return reply.code(400).send({ ok: false, error: { code: 'BAD_REQUEST', message: '清晰度不合法', next: '在资料库重新选择清晰度' } });
     }
     // 判重(2026-09-29 用户拍板:条目也要判重,确认后可覆盖):
     // 历史上只对「单视频整条」按网址判重——因为合集里每集共用同一个番剧网址,按网址一刀切会把第 2 集起全拦死,
@@ -408,9 +480,14 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
       entryIndex, collectionTitle,
     };
     // kind 按支选(2026-09-29 spec m1c-video-clip):视频任务记 ytdlp_video,retry/并发检查都按 kind 区分
-    const jobId = jobsRepo.create(produce === 'video' ? 'ytdlp_video' : 'ytdlp_download', payload);
+    const kind = produce === 'video' ? 'ytdlp_video' : 'ytdlp_download';
+    const jobId = jobsRepo.create(kind, payload);
     pushLog('info', 'job', `job ${jobId} created url=${url} format=${String(opt.format)}${produce === 'video' ? ' produce=video' : ''}`); // 诊断日志:任务创建留痕
-    await startDownload(jobId, payload);
+    // 批次打点①(创建,pending=排队中,spec D16):这批的总数 +1。用与建 job 同一个 kind,口径一致。
+    deps.batch?.note(kind, 'pending');
+    // 不再直接 startDownload:交给并发受限队列(spec D1/D3)。提交即 pending(pending=排队中,零迁移);
+    // 有空槽时队列立刻转 running 并起进程。201 照旧先回,前端仍用单任务 SSE 订阅(D19 链路不变)。
+    queue.enqueue(jobId);
     return reply.code(201).send({ ok: true, jobId });
   });
 
@@ -593,6 +670,9 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
       createSourceVideosRepo(db).delete(id);
       pushLog('info', 'media', `来源 ${id} 删除 → 连带删素材 deleted=${r.deleted.length} failed=${r.failed.length}`);
     }
+    // R3-2：删来源连带删素材 → 派生图作废。无条件调用（v === null 也调）：防「素材行已删但派生图残留」。
+    // 删失败只记日志、不阻断（invalidateDerived 内部兜底），接口仍返回来源删除结果
+    invalidateDerived(derivedDirFor(mediaDir), id);
     // 修复轮 1(2026-09-30,spec §0.4):删来源还要显式级联清剪辑工程与段 —— 同因库没开外键,不清会留孤儿工程。
     // 排在删素材之后同一条链路里;clearByImportId 幂等(无工程删 0 行返 0 不抛),无条件调用即安全
     const clearedSegs = createClipProjectsRepo(db).clearByImportId(id);
@@ -663,6 +743,9 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
     const jobsRepo = createJobsRepo(db);
     const job = jobsRepo.get(id);
     if (!job) return reply.code(404).send({ ok: false, error: { code: 'NOT_FOUND', message: 'job 不存在', next: '' } });
+    // 排队中的任务还没起进程:从队列移除并置 cancelled 就够,**不要**走 taskkill(D5)——
+    // 否则会去杀一个根本不存在的 pid。命中即返回;未命中说明它在跑或已结束,落到既有 cancel 路径。
+    if (queue.cancelQueued(id)) return { ok: true };
     await downloadManager.cancel(id);
     jobsRepo.update(id, { status: 'cancelled', message: '用户取消' });
     pushLog('info', 'job', `job ${id} cancelled by user`); // 诊断日志:取消也要留痕(用户反馈"取消没反应"要能查日志)
@@ -688,19 +771,31 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
     }
     // 批4(2026-09-29 spec m1c-video-clip):重试按旧 job 的 kind 分支——
     // 视频任务沿用 ytdlp_video;剪辑任务交给剪辑启动器(Task 10 注入,素材没了要先拦);
-    // 其余(含老数据)一律按音频下载重试。剪辑分支必须在 url 校验**之前**:剪辑载荷没有 url 字段
-    const kind = old.kind === 'ytdlp_video' ? 'ytdlp_video' : old.kind === 'ffmpeg_clip' ? 'ffmpeg_clip' : 'ytdlp_download';
-    if (kind === 'ffmpeg_clip') {
-      const clipPayload = JSON.parse(old.payload) as { videoPath?: string };
-      if (typeof clipPayload.videoPath !== 'string' || !existsSync(clipPayload.videoPath)) {
+    // P4 导出任务(ffmpeg_export)同族:素材绝对路径校验一致,交给 exportStarter;
+    // 其余(含老数据)一律按音频下载重试。剪辑/导出分支必须在 url 校验**之前**:它们的载荷没有 url 字段
+    const kind = old.kind === 'ytdlp_video' ? 'ytdlp_video'
+      : old.kind === 'ffmpeg_clip' ? 'ffmpeg_clip'
+      : old.kind === 'ffmpeg_export' ? 'ffmpeg_export'
+      : 'ytdlp_download';
+    if (kind === 'ffmpeg_clip' || kind === 'ffmpeg_export') {
+      const p = JSON.parse(old.payload) as { videoPath?: string };
+      // 素材绝对路径已不在 → 明确失败(不静默:否则重试只会起一个注定失败的任务)
+      if (typeof p.videoPath !== 'string' || !existsSync(p.videoPath)) {
         return reply.code(409).send({ ok: false, error: { code: 'MEDIA_GONE', message: '素材已不存在，请重新下载视频', next: '回到资料库重新下视频' } });
       }
+      if (kind === 'ffmpeg_export') {
+        if (deps.exportStarter === undefined) return reply.code(500).send({ ok: false, error: { code: 'NOT_WIRED', message: '导出重试未接线', next: '' } });
+        const newId = jobsRepo.create('ffmpeg_export', p); // 原载荷整体复用(p 运行时是完整 payload,类型注解只是收窄)
+        pushLog('info', 'job', `export job ${newId} created by retry of ${id}`); // 诊断日志:重试也留痕
+        void deps.exportStarter(newId, p); // 不 await:201 先回,前端拿 jobId 建 SSE 订阅(同剪辑分支 R7)
+        return reply.code(201).send({ ok: true, jobId: newId });
+      }
       if (deps.clipStarter === undefined) return reply.code(500).send({ ok: false, error: { code: 'NOT_WIRED', message: '剪辑重试未接线', next: '' } });
-      const newId = jobsRepo.create('ffmpeg_clip', clipPayload);
+      const newId = jobsRepo.create('ffmpeg_clip', p);
       pushLog('info', 'clip', `job ${newId} created by retry of ${id}`); // 诊断日志:重试也留痕
       // 不 await(R7,2026-09-30):与 POST /api/media/:id/clip 同款 job 语义——201 立即返回,
       // 前端拿到 jobId 先建 SSE 订阅,异步剪辑完成后事件才有人收;await 会让 done 事件在无订阅者时发出即丢
-      void deps.clipStarter(newId, clipPayload);
+      void deps.clipStarter(newId, p);
       return reply.code(201).send({ ok: true, jobId: newId });
     }
     if (typeof payload.url !== 'string') {
@@ -713,18 +808,11 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
       return reply.code(409).send({ ok: false, error: { code: 'BUSY', message: '该 URL 正在下载中', next: '等待当前下载结束或先取消再重试' } });
     }
     const newId = jobsRepo.create(kind, payload);
-    jobsRepo.update(newId, { status: 'running' });
-    // 复用 Task 5 的 startDownload;原 title/durationSec/剧集字段一并透传(否则重试后标题回落"下载音频"、第几集丢失);
-    // 批4:produce 一并透传(视频任务重试必须仍走视频支,否则会退回音频支下成 mp3)
-    await startDownload(newId, {
-      url: payload.url,
-      options: (payload.options ?? {}) as Record<string, unknown>,
-      produce: payload.produce === 'video' ? 'video' : 'audio',
-      title: typeof payload.title === 'string' ? payload.title : undefined,
-      durationSec: typeof payload.durationSec === 'number' ? payload.durationSec : undefined,
-      entryIndex: typeof payload.entryIndex === 'number' ? payload.entryIndex : null,
-      collectionTitle: typeof payload.collectionTitle === 'string' ? payload.collectionTitle : null,
-    });
+    // 批次打点①(重试创建,同为待下载,spec D16):与 POST /api/ytdlp/download 同一口径——总数 +1。
+    deps.batch?.note(kind, 'pending');
+    // 不再手动置 running(spec Step 7):否则会出现「排队中却显示 running」。状态由 startDownload 自己置;
+    // 新 job 的 payload 就是上面 create 存进去的那份(含 url/options/produce/剧集字段),队列的 start 会按 jobId 读回它。
+    queue.enqueue(newId);
     return reply.code(201).send({ ok: true, jobId: newId });
   });
 

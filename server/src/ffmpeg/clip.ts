@@ -13,20 +13,26 @@ export interface RunClipOpts extends ClipArgsOpts {
   fileSize?: (p: string) => number | null;
 }
 
+/** 通用 runner 入参(P4 抽出):抽音轨与导出拼接共用同一套进程执行 + 成功判定,不再各写一份 */
+export interface RunFfmpegArgsOpts {
+  ffmpegPath: string; args: string[]; outPath: string;
+  timeoutMs?: number; doExec?: ExecLike; fileSize?: (p: string) => number | null;
+}
+
 /**
- * 跑一次抽音轨。
+ * 跑一次 ffmpeg(任意参数)。
  * 成功判定以"目标文件真出现且体积 > 0"为准 —— **不信退出码**
  * (同 covers.ts 的 writeCoverViaYtdlp:那边踩过"退出码 0 但没写出文件")。
  * 失败必须带 stderr(仓库铁律:永远不信 err.message 就够用 -> execFile 三参回调)。
- * 日志 source 用 'media'(logs.ts 批4 起已有 'clip';runClip 本身不带 job 上下文,失败详情由 clip-job.ts 以 'clip' 记账,这里保持 'media')。
+ * 日志 source 用 'media'(logs.ts 批4 起已有 'clip';这里不带 job 上下文,失败详情由 clip-job.ts / ffmpeg-export.ts 以各自 source 记账)。
  */
-export function runClip(o: RunClipOpts): Promise<{ ok: boolean; stderr: string }> {
+export function runFfmpegArgs(o: RunFfmpegArgsOpts): Promise<{ ok: boolean; stderr: string }> {
   const doExec = o.doExec ?? execFile;
   const sizeOf = o.fileSize ?? ((p: string) => {
     try { return statSync(p).size; } catch { return null; }
   });
   return new Promise((resolve) => {
-    doExec(o.ffmpegPath, buildClipArgs(o), {
+    doExec(o.ffmpegPath, o.args, {
       timeout: o.timeoutMs ?? 120_000, windowsHide: true, maxBuffer: 4 * 1024 * 1024,
     }, (err, _stdout, stderr) => {
       const out = stderr ?? '';
@@ -46,4 +52,9 @@ export function runClip(o: RunClipOpts): Promise<{ ok: boolean; stderr: string }
       resolve({ ok: true, stderr: out });
     });
   });
+}
+
+/** 跑一次抽音轨(委托 runFfmpegArgs,签名与行为与重构前一致 —— clip.test.ts 作回归保护) */
+export function runClip(o: RunClipOpts): Promise<{ ok: boolean; stderr: string }> {
+  return runFfmpegArgs({ ffmpegPath: o.ffmpegPath, args: buildClipArgs(o), outPath: o.outPath, timeoutMs: o.timeoutMs, doExec: o.doExec, fileSize: o.fileSize });
 }

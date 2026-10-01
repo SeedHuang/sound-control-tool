@@ -2,7 +2,7 @@
 
 > 本文是 P2 收口后**剩余工作的固化 spec**，供新 session 直接执行。
 > **权威与冲突裁决顺序**：P3/P4/P5 的详细契约以 `docs/superpowers/specs/m2-workspace.md`（§0.2 决定 D1–D20、§0.3 接口、§0.4 数据模型、§0.5 阶段、§0.6 实测、§0.8 验收）为权威；本文记录**其后的增补裁决**与**现状基线**，两者冲突时以本文（更新者）为准。
-> 状态：待执行（P3 计划已细化；P4 由执行 session 按 §2 细化任务）。
+> 状态：**P3/P4/P5 已落地**（代码完成，待用户目验与提交）。
 
 ## 0. 现状基线（2026-09-30 交接时实核）
 
@@ -10,7 +10,7 @@
 - 验证基线：typecheck 三包 0 错 + server 27 文件 242 用例全绿 + web build 成功（22:21 实跑）。
 - 已就位设施（P3/P4/P5 直接复用，勿重做）：
   - D7 表 `clip_projects/clip_segments`（空表）+ `createClipProjectsRepo`（`clearByImportId/countSegmentsByImportId`）
-  - `/api/imports`：`has_video/has_project/segment_count`（`material_entry_index` 待 P3-T1 增补）
+  - `/api/imports`：`has_video/has_project/segment_count/material_entry_index`（`material_entry_index` **P3-T1 已增补**）
   - 封面设施：`covers.ts`（解析时后台预热）+ `coverUrl(importId)` + `GET /api/imports/:id/cover`
   - `mediaFileUrl(importId)`（Range + `?token=`；追加参数用 `&`）
   - D19 服务端：换集清工程（NULL→已知集号也算变化）+ `DELETE /api/imports/:id` 级联

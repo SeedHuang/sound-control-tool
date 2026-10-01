@@ -1,12 +1,12 @@
 // server/src/ytdlp/ingest.test.ts
-import { mkdtempSync, writeFileSync, existsSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { openDatabase, type DB } from '../db/index.js';
 import { initSchema } from '../db/schema.js';
 import { createAudioItemsRepo } from '../db/repo/audio-items.js';
-import { ingestDownloadedFile } from './ingest.js';
+import { ingestDownloadedFile, moveIntoPlace } from './ingest.js';
 
 let dir: string; let db: DB;
 beforeEach(() => {
@@ -67,5 +67,68 @@ describe('ingestDownloadedFile', () => {
       sourceUrl: 'u', audioDir: dir, exists: existsSync, audioRepo,
     })).toThrow();
     expect(audioRepo.list()).toHaveLength(0);
+  });
+  // D8(T4)：sourceType 可选——剪辑/导出传 'edit'；不传保持 'download'(老路径回归保护)
+  it("sourceType:'edit' → 落库 source_type==='edit'(D8)", () => {
+    const audioRepo = createAudioItemsRepo(db);
+    const t = join(dir, 'edit.mp3'); writeFileSync(t, 'x');
+    const { audioId } = ingestDownloadedFile({
+      tmpPath: t, title: '剪辑产物', format: 'mp3', durationSec: null, fileSize: 1,
+      sourceUrl: '', audioDir: dir, exists: existsSync, audioRepo, sourceType: 'edit',
+    });
+    expect(audioRepo.get(audioId)!.source_type).toBe('edit');
+  });
+  it('不传 sourceType → 仍是 download(老下载路径回归)', () => {
+    const audioRepo = createAudioItemsRepo(db);
+    const t = join(dir, 'dl.mp3'); writeFileSync(t, 'x');
+    const { audioId } = ingestDownloadedFile({
+      tmpPath: t, title: '下载音频', format: 'mp3', durationSec: null, fileSize: 1,
+      sourceUrl: 'https://a', audioDir: dir, exists: existsSync, audioRepo,
+    });
+    expect(audioRepo.get(audioId)!.source_type).toBe('download');
+  });
+});
+
+describe('moveIntoPlace(跨盘兜底, spec D6)', () => {
+  it('同盘 rename 成功 → 只调 rename', () => {
+    const calls: string[] = [];
+    moveIntoPlace('a', 'b', {
+      rename: (() => { calls.push('rename'); }) as never,
+      copyFile: (() => { calls.push('copyFile'); }) as never,
+      unlink: (() => { calls.push('unlink'); }) as never,
+    });
+    expect(calls).toEqual(['rename']);
+  });
+  it('rename 抛 EXDEV → 退化为 copyFile + unlink', () => {
+    const calls: string[] = [];
+    moveIntoPlace('a', 'b', {
+      rename: (() => { const e = new Error('cross-device') as NodeJS.ErrnoException; e.code = 'EXDEV'; throw e; }) as never,
+      copyFile: (() => { calls.push('copyFile'); }) as never,
+      unlink: (() => { calls.push('unlink'); }) as never,
+    });
+    expect(calls).toEqual(['copyFile', 'unlink']);
+  });
+  it('rename 抛非 EXDEV（如 EBUSY）→ 原样抛出，不做复制', () => {
+    const calls: string[] = [];
+    expect(() => moveIntoPlace('a', 'b', {
+      rename: (() => { const e = new Error('busy') as NodeJS.ErrnoException; e.code = 'EBUSY'; throw e; }) as never,
+      copyFile: (() => { calls.push('copyFile'); }) as never,
+      unlink: (() => { calls.push('unlink'); }) as never,
+    })).toThrow('busy');
+    expect(calls).toEqual([]);
+  });
+  // spec §0.6 明确要求：EXDEV 分支**走真实复制**后，目标文件存在、源文件被清理。
+  // 上面两条只断言「被调了哪些桩、顺序如何」——即使把 copyFileSync(from, to) 写成 (to, from)
+  // 也照样绿（桩不校验实参）。而 renameSync(old,new) 与 copyFileSync(src,dest) 参数序相反，
+  // 正是最易写反的点。故本条**只注入会抛 EXDEV 的 rename**，copyFile/unlink 用真实现，
+  // 通过读回目标文件内容来锁死实参顺序（写反时目标不会被创建，readFileSync 直接抛 → 变红）。
+  it('EXDEV 分支走真实复制：目标文件存在、源文件被清理（spec §0.6）', () => {
+    const from = join(dir, 'src.bin');
+    const to = join(dir, 'dst.bin');
+    writeFileSync(from, 'HELLO');
+    const exdev = (() => { const e = new Error('cross-device') as NodeJS.ErrnoException; e.code = 'EXDEV'; throw e; }) as never;
+    moveIntoPlace(from, to, { rename: exdev }); // 只注入 rename，copyFile/unlink 走真实现
+    expect(readFileSync(to, 'utf8')).toBe('HELLO'); // 实参顺序写反的话这里必然失败
+    expect(existsSync(from)).toBe(false);           // 源被清理
   });
 });

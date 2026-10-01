@@ -6,6 +6,8 @@ import { createServer } from './index.js';
 import { openDatabase } from './db/index.js';
 import { initSchema } from './db/schema.js';
 import { createImportsRepo } from './db/repo/imports.js';
+import { createSettingsRepo } from './db/repo/settings.js';
+import { SETTINGS_KEYS } from './settings-keys.js';
 
 const cleanup: Array<() => void> = [];
 function tmp(): string {
@@ -196,6 +198,74 @@ describe('createServer(D12 API token)', () => {
     expect(await ok.text()).toBe('PNGDATA');
     const evil = await fetch(`http://127.0.0.1:${s.port}/api/imports/${importId}/cover`, { headers: { referer: 'https://evil.example/x' } });
     expect(evil.status).toBe(401);
+    await s.close();
+  });
+
+  // P4-T2 派生图：<img> 同款加不了 header，守卫必须豁免它，由路由内判定接管。
+  // 若守卫没豁免，这三种请求都会拿到「缺少或无效的 API token」这一守卫文案 —— 断言 code=UNAUTHORIZED 就证明是路由在答。
+  it('派生图:守卫豁免——?token=wrong 与无 token 均由路由返回 401 UNAUTHORIZED；豁免不扩散到 /api/media 列表', async () => {
+    const s = await createServer({ port: 7372, dbPath: ':memory:', tempDir: path.join(tmp(), 't21') });
+    for (const p of ['/api/media/1/waveform?token=wrong', '/api/media/1/filmstrip?token=wrong', '/api/media/1/waveform']) {
+      const res = await fetch(`http://127.0.0.1:${s.port}${p}`);
+      expect(res.status).toBe(401);
+      const body = (await res.json()) as { error?: { code?: string; message?: string } };
+      expect(body.error?.code).toBe('UNAUTHORIZED');
+      expect(body.error?.message).not.toBe('缺少或无效的 API token');
+    }
+    // 豁免不扩散：/api/media 列表无 token、无 Origin → 守卫 401（守卫文案，不是路由文案）
+    const listed = await fetch(`http://127.0.0.1:${s.port}/api/media`);
+    expect(listed.status).toBe(401);
+    expect(((await listed.json()) as { error?: string }).error).toBe('缺少或无效的 API token');
+    await s.close();
+  });
+});
+
+describe('createServer(下载队列兜底)', () => {
+  // 修复轮 1（审查 Important）：startDownload 在「进终态前」就 reject（binProvider / mkdirSync / buildArgs / spawn 同步抛错）时，
+  // 队列的 .catch 必须兜底——补日志 + 把 job 置 error。否则 job 永久停在 running，前端 subscribeJob 等不到终态、进度条永久转圈，
+  // 且事后无从排障。这里用「把 job1 的输出目录预置成文件」让 startDownload 里的 mkdirSync 抛 EEXIST，稳定复现这条 reject 路径。
+  it('startDownload 提前 reject → job 被兜底置 error（不停在 running）且留下 error 日志', async () => {
+    const dir = tmp();
+    const dbPath = path.join(dir, 'sct.db');
+    const tempDir = path.join(dir, 'tmp');
+    mkdirSync(tempDir, { recursive: true });
+    writeFileSync(path.join(tempDir, 'job1'), 'x'); // 占位文件 → mkdirSync(tempDir/job1) 必抛 EEXIST
+    const seed = openDatabase(dbPath);
+    initSchema(seed);
+    // 显式指定 yt-dlp 路径：probeBin 对显式路径不校验存在性、直接返回，路由才能越过「bin 缺失 → 409」建出 job
+    createSettingsRepo(seed).set(SETTINGS_KEYS.binYtdlp, 'C:/nope/yt-dlp.exe');
+    seed.close();
+
+    const s = await createServer({ port: 7373, dbPath, tempDir });
+    const res = await fetch(`http://127.0.0.1:${s.port}/api/ytdlp/download`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-sct-token': s.token },
+      body: JSON.stringify({ url: 'https://a', options: { format: 'mp3' } }),
+    });
+    expect(res.status).toBe(201);
+
+    // 队列在后台 settle，轮询等它落库（最多 1s）
+    let status = '';
+    for (let i = 0; i < 50; i++) {
+      const poll = openDatabase(dbPath);
+      status = ((poll.prepare('SELECT status FROM jobs WHERE id = 1').get() as { status?: string } | undefined)?.status) ?? '';
+      poll.close();
+      if (status === 'error') break;
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    expect(status).toBe('error'); // 关键：不是 running（否则前端永久转圈）
+
+    const logs = (await (await fetch(`http://127.0.0.1:${s.port}/api/logs`, { headers: { 'x-sct-token': s.token } })).json()) as {
+      logs: Array<{ source: string; message: string }>;
+    };
+    expect(logs.logs.some((l) => l.source === 'job' && l.message.includes('启动失败(队列层兜底)'))).toBe(true);
+
+    // 修复轮 1（审查 Critical 2）：队列层兜底置 error 必须补终态打点，否则 done 不涨、批次分数与实数对不上。
+    // 该 job 创建时已 note('pending')（total=1），兜底置 error 后应为 done=1；它已非在途 → running/queued 从 DB 现数得 0。
+    const jb = (await (await fetch(`http://127.0.0.1:${s.port}/api/jobs?active=1`, { headers: { 'x-sct-token': s.token } })).json()) as {
+      downloads: { total: number; done: number; running: number; queued: number };
+    };
+    expect(jb.downloads).toEqual({ total: 1, done: 1, running: 0, queued: 0 });
     await s.close();
   });
 });

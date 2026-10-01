@@ -4,8 +4,29 @@ export interface DownloadOptions {
   section?: { start: number; end: number };
   format: 'mp3' | 'm4a' | 'wav';
   quality?: string;
-  /** 视频素材的清晰度**上限档**(spec 待实测 A 定表达式;默认 480) */
-  videoHeight?: 360 | 480 | 720 | 1080;
+  // spec D10(2026-09-30):档位改为「按视频实测」,可能是 1440/2160 甚至 B 站那种 1056/704 的非规整值,
+  // 故从窄联合 360|480|720|1080 放宽为整数;合法性(整数且 144..4320)由路由侧 validateVideoHeight 校验
+  /** 视频素材的清晰度**上限档**(默认 480) */
+  videoHeight?: number;
+}
+/**
+ * 风控节流参数(spec D15/D18,2026-09-30 download-queue-tray)。
+ * 只作用于**下载**任务(剪辑/导出是本地进程,不该被网络参数影响);并且只在用户显式设了值时才拼——
+ * sleep=0/缺省、limit=''/缺省 → 一律不拼(= yt-dlp 默认「不限」,保持既有行为逐字不变)。
+ */
+export interface ThrottleOptions {
+  /** 合集批量请求间隔(秒);> 0 才拼 --sleep-requests */
+  sleepSeconds?: number;
+  /** 下载限速(形如 '500K');非空才拼 --limit-rate */
+  limitRate?: string;
+}
+/**
+ * 把节流设置拼进 yt-dlp 参数(两个下载 build 函数共用,避免两处各写一遍)。
+ * 0/空一律不拼 —— 这是回归保护:改造前没有节流参数,默认设置下必须与改造后逐字一致。
+ */
+function pushThrottle(args: string[], t?: ThrottleOptions): void {
+  if (t?.sleepSeconds !== undefined && t.sleepSeconds > 0) args.push('--sleep-requests', String(t.sleepSeconds));
+  if (t?.limitRate !== undefined && t.limitRate.trim() !== '') args.push('--limit-rate', t.limitRate.trim());
 }
 export function buildParseArgs(url: string, cookiePath?: string): string[] {
   const args: string[] = [];
@@ -25,8 +46,8 @@ export function buildWriteThumbnailArgs(url: string, outTemplate: string, cookie
   args.push('--skip-download', '--write-thumbnail', '--playlist-items', '1', '--no-warnings', '-o', outTemplate, url);
   return args;
 }
-export function buildDownloadArgs(opts: { url: string; options: DownloadOptions; outDir: string; cookiePath?: string }): string[] {
-  const { url, options, outDir, cookiePath } = opts;
+export function buildDownloadArgs(opts: { url: string; options: DownloadOptions; outDir: string; cookiePath?: string; throttle?: ThrottleOptions }): string[] {
+  const { url, options, outDir, cookiePath, throttle } = opts;
   const args: string[] = ['-x', '--newline', '--windows-filenames'];
   if (cookiePath) args.push('--cookies', cookiePath); // B 站 Cookie:同 parse,插在 url 之前
   args.push('--audio-format', options.format);
@@ -39,6 +60,8 @@ export function buildDownloadArgs(opts: { url: string; options: DownloadOptions;
   if (options.section) args.push('--download-sections', `*${options.section.start}-${options.section.end}`);
   // D6:结构化进度行 percent|downloaded|total
   args.push('--progress-template', '%(progress._percent_str)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s');
+  // 节流(spec D18/2026-09-30):只下载;放在 -o/url 收尾之前,与既有参数排布一致
+  pushThrottle(args, throttle);
   args.push('-o', join(outDir, '%(id)s.%(ext)s'), url);
   return args;
 }
@@ -51,7 +74,8 @@ export function buildDownloadArgs(opts: { url: string; options: DownloadOptions;
  *   (偏好名以 spec §0.1 实测 D 的结论为准;2026-09-30 实测:B 站加 -S vcodec:h264,acodec:aac 后落 h264+aac)
  */
 export function buildVideoDownloadArgs(opts: {
-  url: string; outDir: string; videoHeight: 360 | 480 | 720 | 1080; entryIndices?: number[]; cookiePath?: string;
+  // spec D10:档位放宽为整数(实测值可能是 1440/2160/1056…);表达式一字不动,只放宽类型
+  url: string; outDir: string; videoHeight: number; entryIndices?: number[]; cookiePath?: string; throttle?: ThrottleOptions;
 }): string[] {
   const args: string[] = ['--newline', '--windows-filenames'];
   if (opts.cookiePath) args.push('--cookies', opts.cookiePath);
@@ -68,7 +92,18 @@ export function buildVideoDownloadArgs(opts: {
     args.push('--no-playlist');
   }
   args.push('--progress-template', '%(progress._percent_str)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s');
+  // 节流(spec D18/2026-09-30):视频下载同样受节流保护(与音频支同款,只下载)
+  pushThrottle(args, opts.throttle);
   args.push('-o', join(opts.outDir, '%(id)s.%(ext)s'), opts.url);
   return args;
 }
 import { join } from 'node:path';
+/** 探测可用清晰度(spec D6):`-J` 拿完整 JSON(非 flat —— flat 没有 formats);合集只探指定的那一集 */
+export function buildProbeFormatsArgs(url: string, opts?: { entry?: number; cookiePath?: string }): string[] {
+  const args: string[] = [];
+  if (opts?.cookiePath) args.push('--cookies', opts.cookiePath); // B 站 Cookie:同 parse,插在 url 之前
+  args.push('-J', '--no-warnings');
+  if (opts?.entry !== undefined) args.push('--playlist-items', String(opts.entry));
+  args.push(url);
+  return args;
+}

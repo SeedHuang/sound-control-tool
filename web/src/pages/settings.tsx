@@ -1,6 +1,7 @@
-import { Alert, Button, Card, Descriptions, Input, Modal, Typography, message } from 'antd';
+import { Alert, Button, Card, Descriptions, Input, Modal, Space, Spin, Tooltip, Typography, message } from 'antd';
 import { useEffect, useState } from 'react';
-import { ApiError, apiGet, apiPort, clearServerLogs, getCookieStatus, logFe, saveCookie, type CookieStatus } from '@/api';
+import { ApiError, apiGet, apiPort, clearServerLogs, getCookieStatus, getSettings, logFe, putSettings, saveCookie, type CookieStatus } from '@/api';
+import { hasDesktopBridge, pickDirectory } from '@/desktop';
 
 interface BinProbe {
   path: string | null;
@@ -41,6 +42,42 @@ function BinCard({ title, bin, loading }: { title: string; bin: BinProbe | null;
           {bin.version ?? <Typography.Text type="danger">已找到但版本探测失败</Typography.Text>}
         </Descriptions.Item>
       </Descriptions>
+    </Card>
+  );
+}
+
+interface Health {
+  ok: boolean;
+  sqlite: string | null;
+  port: number;
+}
+
+/** 服务状态卡片(P5-T2,2026-09-30):从首页挪来 —— 首页改成仪表盘后「后端只剩一句 OK」无处安放,
+ *  挪到设置页更合理(服务是否可用属于诊断/设置场景)。同一个 GET /api/health,成功/失败两态都用 antd 呈现。 */
+function HealthCard() {
+  const [health, setHealth] = useState<Health | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    logFe('info', 'SettingsPage HealthCard → GET /api/health'); // 诊断日志:开页留痕
+    apiGet<Health>('/api/health').then(setHealth).catch((e: Error) => setError(e.message));
+  }, []);
+  // 按真实字段判定,而非拿到响应就无条件印成功
+  const ok = health !== null && health.ok === true && health.sqlite !== null;
+  return (
+    <Card title="服务状态" style={{ marginBottom: 16 }}>
+      {error !== null && <Alert type="error" showIcon message="无法连接本地服务" description={error} />}
+      {error === null && health === null && <Spin />}
+      {error === null && health !== null && ok && (
+        <Typography.Text>后端 OK · SQLite 读写成功 · API 端口 {health.port}</Typography.Text>
+      )}
+      {error === null && health !== null && !ok && (
+        <Alert
+          type="error"
+          showIcon
+          message="后端异常"
+          description={`health.ok=${String(health.ok)}, sqlite=${String(health.sqlite)}`}
+        />
+      )}
     </Card>
   );
 }
@@ -89,7 +126,9 @@ function CookieCard() {
         if (e instanceof ApiError && e.code === 'CONFLICT') {
           Modal.confirm({
             title: '已存在有效的登录信息',
-            content: `${e.message}。要用新粘贴的覆盖吗?`,
+            // 后端 error.next 已含操作指引(「点『仍然覆盖』」),apiPut 会把它拼进 e.message(spec §0.5)。
+            // 这里**不再自己追加问句**——否则弹窗里会出现两句"下一步怎么办"(重复指引)。
+            content: e.message,
             okText: '仍然覆盖',
             cancelText: '取消',
             onOk: () => doSave(true),
@@ -161,6 +200,117 @@ function LogsCard() {
   );
 }
 
+/** 导出目录卡片（spec D1/D2/D4/D5/D8）：留空 = 用应用数据目录（与改造前一致）。
+ *  两种"没 Electron"的情况都禁用「浏览…」并给提示，而不是点了没反应。 */
+function ExportDirCard() {
+  const [value, setValue] = useState('');
+  const [resolved, setResolved] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [picking, setPicking] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const bridge = hasDesktopBridge();
+
+  const load = (): Promise<void> => {
+    setLoading(true);
+    return getSettings()
+      .then((s) => { setValue(s.output_dir ?? ''); setResolved(s.output_dir_resolved ?? ''); setErr(null); })
+      .catch((e: Error) => setErr(e.message))
+      .finally(() => setLoading(false));
+  };
+  useEffect(() => { void load(); }, []);
+
+  // 「浏览…」只回填输入框，落库仍靠「保存」——避免"选一下就偷偷改了设置"。
+  const browse = async (): Promise<void> => {
+    setPicking(true);
+    try {
+      const p = await pickDirectory();
+      if (p !== null) setValue(p);
+    } finally { setPicking(false); }
+  };
+
+  const save = (): void => {
+    setSaving(true);
+    void putSettings({ output_dir: value.trim() })
+      .then(() => { message.success('已保存'); return load(); })
+      .catch((e: unknown) => message.error(e instanceof Error ? e.message : String(e)))
+      .finally(() => setSaving(false));
+  };
+
+  return (
+    <Card title="导出目录" style={{ marginBottom: 16 }} loading={loading}>
+      {err !== null && <Alert type="error" showIcon message="读取设置失败" description={err} style={{ marginBottom: 12 }} />}
+      <Space.Compact style={{ width: '100%' }}>
+        <Input
+          value={value}
+          placeholder="留空 = 用应用数据目录"
+          onChange={(e) => setValue(e.target.value)}
+        />
+        <Tooltip title={bridge ? '选择文件夹' : '仅桌面应用内可用'}>
+          <span><Button loading={picking} disabled={!bridge} onClick={() => void browse()}>浏览…</Button></span>
+        </Tooltip>
+        <Button type="primary" loading={saving} onClick={save}>保存</Button>
+      </Space.Compact>
+      <Typography.Paragraph type="secondary" style={{ marginTop: 8, marginBottom: 0 }}>
+        导出产物会直接写入这个目录（剪辑室里照样能看到、能试听）。留空时默认：{resolved || '（读取中）'}
+      </Typography.Paragraph>
+    </Card>
+  );
+}
+
+/** 下载保护设置(spec D17):并发数 / 请求间隔 / 限速。
+ *  三项都是"保护类",放同一张卡;只影响**下载**任务(剪辑/导出不受影响,spec D18)。
+ *  三项一起 PUT:同属一组设置,改完一次保存更省事——拆开会让用户改一个跑一次。 */
+function DownloadCard() {
+  const [limit, setLimit] = useState('1');
+  const [sleep, setSleep] = useState('0');
+  const [rate, setRate] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const load = (): Promise<void> => {
+    setLoading(true);
+    return getSettings()
+      .then((s) => {
+        setLimit(s.max_concurrent_downloads ?? '1');
+        setSleep(s.download_sleep_seconds ?? '0');
+        setRate(s.download_limit_rate ?? '');
+        setErr(null);
+      })
+      .catch((e: Error) => setErr(e.message))
+      .finally(() => setLoading(false));
+  };
+  useEffect(() => { void load(); }, []);
+  const save = (): void => {
+    setSaving(true);
+    void putSettings({ max_concurrent_downloads: limit, download_sleep_seconds: sleep, download_limit_rate: rate })
+      .then(() => { message.success('已保存'); return load(); })
+      // 后端 400 的 next(下一步指引)由 apiPut 拼进 e.message,这里直接展示即可
+      .catch((e: unknown) => message.error(e instanceof Error ? e.message : String(e)))
+      .finally(() => setSaving(false));
+  };
+  return (
+    <Card title="下载" style={{ marginBottom: 16 }} loading={loading}>
+      {err !== null && <Alert type="error" showIcon message="读取设置失败" description={err} style={{ marginBottom: 12 }} />}
+      <Space direction="vertical" style={{ width: '100%' }}>
+        <div>
+          <Typography.Text>同时下载数（1–5）</Typography.Text>
+          <Input value={limit} onChange={(e) => setLimit(e.target.value)} style={{ width: 120 }} />
+        </div>
+        <div>
+          <Typography.Text>请求间隔秒数（0–10，0 = 不间隔；对合集批量最有效）</Typography.Text>
+          <Input value={sleep} onChange={(e) => setSleep(e.target.value)} style={{ width: 120 }} />
+        </div>
+        <div>
+          <Typography.Text>限速（留空 = 不限；如 500K / 1.5M）</Typography.Text>
+          <Input value={rate} onChange={(e) => setRate(e.target.value)} style={{ width: 160 }} placeholder="留空 = 不限" />
+        </div>
+        <Button type="primary" loading={saving} onClick={save}>保存</Button>
+      </Space>
+    </Card>
+  );
+}
+
 export default function SettingsPage() {
   const [bins, setBins] = useState<BinsResult | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -202,6 +352,9 @@ export default function SettingsPage() {
           style={{ marginBottom: 16 }}
         />
       )}
+      <HealthCard />
+      <DownloadCard />
+      <ExportDirCard />
       <Card style={{ marginBottom: 16 }}>
         <Typography.Text>API 端口:{apiPort()}</Typography.Text>
         <Button style={{ float: 'right' }} loading={probing} onClick={() => void probe()}>

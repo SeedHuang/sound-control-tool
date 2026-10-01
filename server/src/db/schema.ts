@@ -108,4 +108,15 @@ export function initSchema(db: DB): void {
   ensureColumns(db, 'source_videos', [
     { name: 'entry_index', ddl: 'entry_index INTEGER' },
   ]);
+  // D8 历史纠偏(spec §0.4):早期 ingest 把剪辑产物硬编码记成 'download',但它们标题恒以 [mm:ss-mm:ss] 结尾。
+  // LIKE 里 [ ] 是普通字符、_ 是通配 —— 正好匹配「[两位:两位-两位:两位]」;两位分钟写死会漏掉 ≥100 分钟的三段分钟(如 [120:00-121:30]),
+  // 故补一段 GLOB 的纯数字字符类显式匹配。AND/OR 优先级与括号照 spec 原样。
+  // ⚠️ 偏离 spec 一处:spec §0.4 的 GLOB 模式漏了收尾的 `]`(标题恒以 `]` 结尾),照抄实测(node:sqlite)三位分钟**不命中**;
+  //    在模式末尾补上字面量 `]` 后命中(见 task-p4-4-report.md「偏离 1」)。幂等:条件锁定 source_type='download',已是 'edit' 的不会再改。
+  db.exec(
+    "UPDATE audio_items SET source_type='edit' " +
+    "WHERE source_type='download' " +
+    "AND title LIKE '%[__:__-__:__]' " +                       // 形如 [05:12-06:03]
+    "OR (source_type='download' AND title GLOB '*[0-9][0-9][0-9]:[0-9][0-9]-[0-9][0-9][0-9]:[0-9][0-9]]');", // 三位分钟:形如 [120:00-121:30]
+  );
 }

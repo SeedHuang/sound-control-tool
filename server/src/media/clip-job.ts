@@ -82,6 +82,9 @@ export async function startClipJob(
       fileSize: statSync(tmpOut).size,
       sourceUrl: payload.sourceUrl !== undefined && payload.sourceUrl !== '' ? payload.sourceUrl : '',
       entryIndex: null, collectionTitle: null,
+      // D8:剪辑产物记 'edit' 而非缺省 'download'——否则会混进首页「最近下载」(GET /api/home 的 recent 只排除 'edit'),
+      // 直到下次启动 initSchema 的历史纠偏 SQL 才被改过来。导出路径(ffmpeg-export.ts)已接,这里补齐。
+      sourceType: 'edit',
       audioDir: deps.audioDir, exists: existsSync, audioRepo,
     });
     jobsRepo.finish(jobId);

@@ -59,7 +59,8 @@ M1 前半使命：**贴一个网页 URL（B 站课程/YouTube/播客等）→ �
 - 失败 4xx/5xx `{ ok:false, error:{...} }`（D9 映射）
 
 **POST `/api/ytdlp/download`**（body: `{ url, options: { entryIndices?: number[], section?: { start:number, end:number }, format:'mp3'|'m4a'|'wav', quality?: string, force?: boolean }, title?: string, durationSec?: number, entryIndex?: number, collectionTitle?: string }`）
-> **2026-09-30 增补（m1c-video-clip）**：body 另接受 `produce?: 'audio'|'video'`（缺省/空串按 `audio`）与 `options.videoHeight?: 360|480|720|1080`（仅 `produce='video'` 有意义，缺省 480）。`produce='video'` 时 job kind 为 `ytdlp_video`、跳过音频判重、产物落 `<数据目录>/media/`（不进 audio_items）；`done` 事件视频支形状见 m1c spec §0.3。
+> **2026-09-30 增补（m1c-video-clip）**：body 另接受 `produce?: 'audio'|'video'`（缺省/空串按 `audio`）与 `options.videoHeight?: number`（仅 `produce='video'` 有意义，缺省 480）。`produce='video'` 时 job kind 为 `ytdlp_video`、跳过音频判重、产物落 `<数据目录>/media/`（不进 audio_items）；`done` 事件视频支形状见 m1c spec §0.3。
+> **2026-09-30 再变更（library-ui-polish D10）**：`options.videoHeight` 类型由窄联合 `360|480|720|1080` 放宽为整数（档位改为按视频实测），服务端校验「整数且 144..4320」，越界/非整数 → 400；详见 `2026-09-30-library-ui-polish.md` §0.3。
 - `title?`：前端从 parse 结果带入的显示名，作入库 title 与文件名 slug（D5c）。缺省时 finalize 用 `'下载音频'`
 - `entryIndex?` / `collectionTitle?`（**2026-09-29 增补**，用户拍板：音频库要显示「第几集 / 该集自己的名字」）：前端下载合集某集时带入 `entryIndex=条目 index`、`collectionTitle=合集 title`，随 job payload 一起存（retry 复用），入库时写进 `audio_items.entry_index / collection_title`。非法或缺省 → 落 NULL（视为单视频），**不因它拦下载**
 - `durationSec?`：前端从 parse 结果带入（D10），作入库 duration；**`section` 存在时忽略此值，强制 ffprobe 实测**（P1-3 修复：片段产物时长 ≠ 整条时长）；缺省则 ffprobe 兜底

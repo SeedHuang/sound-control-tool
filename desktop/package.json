@@ -9,7 +9,7 @@
   "scripts": {
     "dev": "tsc -p tsconfig.json && electron .",
     "start:file": "pnpm run build && electron . --load=file",
-    "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.build.json",
+    "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.build.json && node -e \"const f=require('node:fs');f.existsSync('assets')?f.cpSync('assets','dist/assets',{recursive:true}):console.warn('[build] assets/ 不存在,跳过拷贝(托盘图标将由源码内嵌副本兜底)')\"",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "probe:sqlite": "pnpm --filter @sct/server build && pnpm run build && electron dist/probes/sqlite.js"

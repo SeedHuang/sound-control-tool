@@ -15,6 +15,7 @@ import { createJobsRepo } from '../db/repo/jobs.js';
 import { createSourceVideosRepo } from '../db/repo/source-videos.js';
 import { getLogs } from '../logs.js';
 import { formatClipTitle, registerMediaRoutes } from './media-routes.js';
+import { invalidateDerived } from './derived-images.js';
 
 // ffmpeg 路径桩:R2-d 返回桩路径;R2-e 置 null 验证「拿不到 ffmpeg 不得静默」(spec D16/D10)
 const ffmpegStub = vi.hoisted(() => ({ path: 'C:/stub/ffmpeg.exe' as string | null }));
@@ -34,6 +35,19 @@ vi.mock('../ffmpeg/clip.js', async () => {
 });
 // ffprobe 桩:时长固定 10 秒
 vi.mock('../ytdlp/ffprobe.js', () => ({ probeDuration: vi.fn(async () => 10) }));
+// 派生图桩（P4-T2）：路由只关心「拿到 path 后裸流回传」，这里把 PNG 真写进测试临时目录（与 ffmpegStub 同法）
+const derivedStub = vi.hoisted(() => ({ dir: '' }));
+vi.mock('./derived-images.js', () => ({
+  derivedDirFor: (mediaDir: string) => mediaDir, // 测试里图写哪都行，路由只读回 path
+  invalidateDerived: vi.fn(),
+  ensureDerivedImage: vi.fn(async (o: { kind: string; importId: number }) => {
+    const { writeFileSync } = await import('node:fs');
+    const { join } = await import('node:path');
+    const p = join(derivedStub.dir, `${o.kind}-${o.importId}.png`);
+    writeFileSync(p, 'PNG');
+    return { ok: true, path: p, cached: false };
+  }),
+}));
 
 let app: FastifyInstance;
 let db: DB;
@@ -45,6 +59,8 @@ beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), 'sct-mr-'));
   audioDir = join(root, 'audio'); mediaDir = join(root, 'media'); tempDir = join(root, 'tmp');
   mkdirSync(audioDir, { recursive: true }); mkdirSync(mediaDir, { recursive: true }); mkdirSync(tempDir, { recursive: true });
+  derivedStub.dir = join(root, 'derived'); mkdirSync(derivedStub.dir, { recursive: true }); // 派生图桩写这
+  vi.mocked(invalidateDerived).mockClear();
   db = openDatabase(':memory:');
   initSchema(db);
   app = Fastify({ logger: false });
@@ -194,5 +210,45 @@ describe('媒体素材路由', () => {
     expect(createJobsRepo(db).get(jobId)!.status).toBe('cancelled');
     expect(tmpOutPath).toBeDefined();
     expect(existsSync(tmpOutPath!)).toBe(false); // temp 无残留
+  });
+
+  // —— P4-T2 派生图路由（spec D6/D14/§0.3）——
+  it('GET /api/media/:id/waveform|filmstrip:有素材 + 文件在 → 200 image/png、no-store', async () => {
+    const importId = createImportsRepo(db).upsertByUrl({ url: 'https://a/pl', title: 't', site: 'bilibili', kind: 'single', duration_sec: null, entries: null });
+    const p = join(mediaDir, `media-${importId}.mp4`);
+    writeFileSync(p, 'V');
+    createSourceVideosRepo(db).upsert({ importId, filePath: p, height: 480, fileSize: 1 });
+    for (const kind of ['waveform', 'filmstrip']) {
+      const res = await app.inject({ method: 'GET', url: `/api/media/${importId}/${kind}?token=tok` });
+      expect(res.statusCode).toBe(200);
+      expect(res.headers['content-type']).toBe('image/png');
+      expect(res.headers['cache-control']).toBe('no-store'); // C-1：URL 不变，靠 no-store + 前端 rev 双保险
+      expect(res.body).toBe('PNG');
+    }
+  });
+  it('派生图:有素材行但文件被外部删 → 404 FILE_MISSING', async () => {
+    const importId = createImportsRepo(db).upsertByUrl({ url: 'https://a/pl', title: 't', site: 'bilibili', kind: 'single', duration_sec: null, entries: null });
+    createSourceVideosRepo(db).upsert({ importId, filePath: join(mediaDir, 'nope.mp4'), height: 480, fileSize: 1 });
+    const res = await app.inject({ method: 'GET', url: `/api/media/${importId}/waveform?token=tok` });
+    expect(res.statusCode).toBe(404);
+    expect((res.json() as { error: { code: string } }).error.code).toBe('FILE_MISSING');
+  });
+  it('派生图:无素材行 → 404 NOT_FOUND', async () => {
+    const res = await app.inject({ method: 'GET', url: '/api/media/999/waveform?token=tok' });
+    expect(res.statusCode).toBe(404);
+    expect((res.json() as { error: { code: string } }).error.code).toBe('NOT_FOUND');
+  });
+  it('派生图:token 错（无 Origin/Referer）→ 401 UNAUTHORIZED（路由内返回）', async () => {
+    const res = await app.inject({ method: 'GET', url: '/api/media/1/waveform?token=wrong' });
+    expect(res.statusCode).toBe(401);
+    expect((res.json() as { error: { code: string } }).error.code).toBe('UNAUTHORIZED');
+  });
+  it('DELETE /api/media/:id → 作废派生图（invalidateDerived 调一次）', async () => {
+    const importId = createImportsRepo(db).upsertByUrl({ url: 'https://a/pl', title: 't', site: 'bilibili', kind: 'single', duration_sec: null, entries: null });
+    writeFileSync(join(mediaDir, `media-${importId}.mp4`), 'V');
+    createSourceVideosRepo(db).upsert({ importId, filePath: join(mediaDir, `media-${importId}.mp4`), height: 480, fileSize: 1 });
+    expect((await app.inject({ method: 'DELETE', url: `/api/media/${importId}?token=tok` })).statusCode).toBe(200);
+    expect(vi.mocked(invalidateDerived)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(invalidateDerived)).toHaveBeenCalledWith(mediaDir, importId);
   });
 });
