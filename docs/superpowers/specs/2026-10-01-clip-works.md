@@ -78,6 +78,7 @@
 **⓪ 迁移前自动备份（只在"真要重建"时做一次）**
 
 - **判据**：仅当检测到需要重建 `clip_projects` 时，把 `<数据目录>/sct.db` 复制为 `sct.db.bak-<时间戳>`（时间戳取**紧凑格式**：`YYYYMMDDHHMMSS`，秒级即可——实现期评审发现原稿写成带 `-` 的 `YYYYMMDD-HHMMSS` 与实现不符，以本行为准）。
+- **备份必须挂在真正执行迁移的那次 `initSchema` 调用上**：真实启动路径是 `bootstrap()` **先**调 `initSchema`（重建恰好发生在那一次），之后 `createServer` 再调一次（那时表已无 UNIQUE、什么也不做）。所以那次调用的 `dbPath` 必须由 `bootstrap` 传进来——否则备份恒走"路径未知，跳过"分支，**一次都不会生成**，形同虚设。
 - **为什么**：重建与清理**都不可逆**，而这是用户唯一的数据库；这份副本是唯一退路。
 - **备份失败**：**继续迁移**，但打 error 日志（不能因为备份失败把用户挡在门外）。
 - ⚠️ **不可回退到旧版本**：重建后 `clip_projects` 上不再有 UNIQUE，而旧代码的 `upsert` 用的是 `ON CONFLICT(import_id)` → **旧版服务端在新库上会直接报错**。要回退只能用上面那个 `.bak`（并丢掉它之后的改动）。
@@ -105,7 +106,8 @@ UPDATE sqlite_sequence SET seq = (SELECT COALESCE(MAX(id), 0) FROM clip_projects
 COMMIT;
 ```
 
-- **检测方式**：`SELECT sql FROM sqlite_master WHERE type='table' AND name='clip_projects'` 里是否还含 `UNIQUE` → 含则重建，不含则跳过（**幂等**：跑第二次不再动）。
+- **检测方式**：`clip_projects` 上是否存在**覆盖单列 `import_id` 的唯一索引** —— 用 `PRAGMA index_list('clip_projects')` 取所有索引，筛 `unique=1` 的，再用 `PRAGMA index_info('<索引名>')` 看它的列是不是恰好只有 `import_id`（老库的列级 `UNIQUE` 会生成这样一个 autoindex）。有 → 老库形态，重建；表不存在或没有这样的唯一索引 → 跳过（**幂等**：跑第二次不再动）。⚠️ 原稿写的"建表 SQL 里含 `UNIQUE` 字样"太粗——它门控着**破坏性清理**（删 `audio_items` 行 + 删文件），将来任何含该词的约束/默认值都会误触发一次不可逆清理。
+- **重建后要补回 `idx_clip_projects_import`**：`CREATE INDEX IF NOT EXISTS idx_clip_projects_import ON clip_projects(import_id);` —— 这是"**还原被 `import_id UNIQUE` 顺带提供的索引**"，不是新增优化（去掉约束是 1:N 的需要，但索引不该丢；否则 `countByImportId` / `clearSegmentsByImportId` / `countSegmentsByImportId` / `nextName` / `imports.ts` 的 `LEFT JOIN ... ON p.import_id = s.id` 全退化成全表扫）。`SCHEMA_SQL` 的建表处也要有同一条（全新库走它）。
 - **不写 REFERENCES**（与全库一致，库没开外键）。
 - **段的 `project_id` 不受影响**：因为 id 原样搬。
 
@@ -152,7 +154,7 @@ DELETE FROM audio_items
 ```
 - 顺序：先取 `file_path` 清单 → 删 DB 行（**在重建那个事务内**）→ 提交后**再**删磁盘文件（顺序反了就读不到路径）。
 - **删文件失败一律不阻断启动**：单个文件删不掉（被占用/权限/已不存在）→ 记日志继续；**整个迁移块包 try/catch，任何异常都不许从 `initSchema` 抛出去**——启动路径上的 IO 失败会直接变成"应用打不开"。
-- **必须落盘留痕**：`旧成品清理:删除 N 行,文件删除 M/共 K 个`，且**逐个文件路径按 `info` 级打印**（info 会落进 `logs/<天>/<小时>.log`；debug 只进内存环形缓冲、会被滚掉）。删掉的是用户的文件，事后必须查得到。
+- **必须落盘留痕**：`旧成品清理:删除 N 行,文件删除 M/共 K 个`（**提交并删完文件之后**才发这条聚合行——否则事后只能逐行翻才知道文件到底删没删），且**逐个文件路径按 `info` 级打印**（info 会落进 `logs/<天>/<小时>.log`；debug 只进内存环形缓冲、会被滚掉）。删掉的是用户的文件，事后必须查得到。
 - dev 库预期删 **8 行**（老库形态确实会触发重建）。
 - 为什么敢自动删：用户明确裁决"8 条老数据直接删掉，没问题"；且这些行在新模型里没有任何入口能看到（不可见 = 不可管理）。
 
@@ -275,6 +277,7 @@ DELETE FROM audio_items
 | 虚拟滚动（`react-window` 或手写 windowing） | 作品数 > 300 张，或滚动明显掉帧 |
 | 服务端分页（limit/offset） | 作品列表接口明显变慢（个人工具预计不会） |
 | 删作品保留成品（勾选框） | 用户改口；届时 `source_import_id` 正好兜底 |
+| M2 批次 OCR 审查留下的 high 项：① 取消"排队中"的下载任务不补发 SSE 终态（`ytdlp-routes.ts` 的 cancelQueued 分支只改 DB，页面会永久转圈）② 导出任务不注册取消、也不重查 `cancelled`，取消被静默覆盖回 done（`ffmpeg-export.ts`）③ 作业 payload 的 `JSON.parse` 未兜底（一处把异常吞进 Promise executor → job 卡 pending；一处会 500 拖垮抽屉/托盘） | **用户已指定"记住这件事"——Spec C 落地后立即单独开一个小切片修** |
 | 作品复制 / 另存为 / 模板 | 用户提出 |
 | 唤醒休眠路由 `POST /api/media/:id/clip` | 有人真要用它；启用前先定它的作品归属（D20） |
 | 素材 / 录制类音频的可见性归属 | 库里真出现了 `download` / `recording` 行（dev 库当前 0 行，新流程也不会产生） |

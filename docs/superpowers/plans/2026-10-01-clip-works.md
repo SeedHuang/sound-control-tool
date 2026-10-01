@@ -904,6 +904,10 @@ export default function StudioPage() {
 - 空态：`Empty`「还没有剪辑作品」；**主按钮「新建作品」由 T8 接入**（本任务先只渲染 Empty 文案，不要放一个点了没反应的按钮）。
 - 静音开关按钮：`<Button icon={muted ? <MutedOutlined/> : <SoundOutlined/>} onClick={() => void onToggleMute()} />` + Tooltip「预览声音：开/关」。
 
+**验收要点（T6 重写时必须满足，替代本轮不修的另两条 OCR 问题；⚠️ T6 之后这一层会被整段重写成作品墙，所以这两条是"重写时不许再犯"的约束，不是要修现有代码）**：
+- ① 卡内分组的**标题计数取全量**、不受分页/分批影响 —— 分组标题上的数字要来自**全部**成员，而不是"当前这一批/这一页"。
+- ② `已下 N 集` 这类计数**只数素材（非 `edit` 行）**，不把成品算进去。
+
 - [ ] **Step 3: 验证**
 
 Run: `pnpm typecheck`（web 仍会因 Task 7/8 的组件未建而红——把清单抄进报告）

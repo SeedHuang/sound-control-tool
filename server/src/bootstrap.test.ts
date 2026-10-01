@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -48,5 +48,19 @@ describe('bootstrap(启动恢复 + 孤儿清理)', () => {
     const nested = path.join(data, 'deep', 'sct.db'); // 父目录不存在
     await bootstrap({ dbPath: nested, tempDir });
     expect(existsSync(nested)).toBe(true);
+  });
+
+  it('F1:真实启动路径也会备份 —— 老库形态下 bootstrap 触发的重建必须生成 .bak', async () => {
+    const data = tmpDir();
+    const dbPath = path.join(data, 'sct.db');
+    // 造成"老库形态":clip_projects 带 import_id UNIQUE(autoindex → 触发重建)
+    const db = openDatabase(dbPath);
+    db.exec("CREATE TABLE clip_projects (id INTEGER PRIMARY KEY AUTOINCREMENT, import_id INTEGER NOT NULL UNIQUE, name TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT NOT NULL DEFAULT (datetime('now')))");
+    db.close();
+
+    await bootstrap({ dbPath, tempDir: path.join(data, 'tmp') }); // 真实启动路径:bootstrap 先调 initSchema
+
+    const baks = readdirSync(data).filter((f) => f.startsWith('sct.db.bak-'));
+    expect(baks).toHaveLength(1);
   });
 });

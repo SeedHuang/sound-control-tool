@@ -34,7 +34,10 @@ export async function bootstrap(opts: { dbPath: string; tempDir: string }): Prom
   mkdirSync(opts.tempDir, { recursive: true });
   const db = openDatabase(opts.dbPath);
   try {
-    initSchema(db);
+    // ★ 必须带上 dbPath(2026-10-01 OCR 审查 F1):真实启动路径是 bootstrap → createServer,
+    //   而"重建作品表"恰好发生在**这一次**调用里。若不传 dbPath,备份会打"路径未知,跳过"——
+    //   等于**一次备份都不会生成**,而同一时刻却在执行不可回滚的建表重建 + 删用户成品文件。
+    initSchema(db, { dbPath: opts.dbPath });
     // 必须在 markAllInterrupted 之前取活跃临时文件:该调用会把 pending/running 全部改为 error,
     // 之后再查 status IN ('pending','running') 恒为空集(S2 起 payload.tempFiles 会被 S1 的空集顺序误删)
     const keep = listActiveTempFiles(db);

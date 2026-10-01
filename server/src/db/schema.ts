@@ -3,6 +3,16 @@ import type { DB } from './index.js';
 import { pushLog } from '../logs.js';
 import { inTransaction } from './tx.js';
 
+/** clip_projects 的列定义(**唯一真相**,2026-10-01 OCR 审查 F4)：
+ *  SCHEMA_SQL 的建表与迁移里的 `CREATE TABLE clip_projects_new (...)` 共用这一份。
+ *  ⚠️ **新增列必须只改这一处** —— 若两份各写各的,老库升级时重建会用旧列定义搬数据,新列的数据被静默丢掉。 */
+const CLIP_PROJECTS_COLUMNS =
+  'id INTEGER PRIMARY KEY AUTOINCREMENT, ' +
+  'import_id INTEGER NOT NULL, ' +
+  'name TEXT, ' +
+  "created_at TEXT NOT NULL DEFAULT (datetime('now')), " +
+  "updated_at TEXT NOT NULL DEFAULT (datetime('now'))";
+
 const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS audio_items (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -70,12 +80,13 @@ CREATE TABLE IF NOT EXISTS source_videos (
 -- import_id **不再 UNIQUE**:同一个资料可以有多个作品(1:N)。老库靠 initSchema 里的重建迁移去掉旧约束。
 -- 不写 REFERENCES:库没开外键,级联不生效(与 source_videos 同款处理)
 CREATE TABLE IF NOT EXISTS clip_projects (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  import_id INTEGER NOT NULL,
-  name TEXT,
-  created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  ${CLIP_PROJECTS_COLUMNS}
 );
+-- 还原被 import_id UNIQUE 顺带提供的索引(2026-10-01 OCR 审查 F3):
+-- 老库的列级 UNIQUE 会隐式建一个索引,按 import_id 的查询(countByImportId / clearSegmentsByImportId /
+-- countSegmentsByImportId / nextName / imports.ts 的 LEFT JOIN ... ON p.import_id = s.id)都靠它。
+-- 去掉约束是 1:N 的需要,但索引不该丢 —— 这是"还原",不是新增优化。
+CREATE INDEX IF NOT EXISTS idx_clip_projects_import ON clip_projects(import_id);
 CREATE TABLE IF NOT EXISTS clip_segments (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   project_id INTEGER NOT NULL,
@@ -99,13 +110,19 @@ function ensureColumns(db: DB, table: string, columns: Array<{ name: string; ddl
 
 /** 备份数据库文件(2026-10-01 spec clip-works §0.3⓪)。
  *  只在"确实要重建"时调用一次;失败**继续迁移**,只记 error —— 不能因为备份失败把用户挡在门外。
- *  内存库/路径未知 → 记一行 info 跳过(测试大量用 :memory:)。 */
+ *  内存库/路径未知 → 记一行 info 跳过(测试大量用 :memory:)。
+ *
+ *  ⚠️ 真实启动路径是 `bootstrap()` **先**调 `initSchema`(而重建恰好发生在这一次调用里),之后 `createServer` 再调一次
+ *  (那时表已无 UNIQUE,什么也不做)。所以**必须由 bootstrap 那次调用传入 dbPath**(见 bootstrap.ts),
+ *  否则这里恒走"路径未知,跳过"分支 → **一次备份都不会生成**,而同一时刻却在执行不可回滚的重建 + 删用户成品文件。 */
 function backupDbFile(dbPath: string | undefined): void {
   if (dbPath === undefined || dbPath === ':memory:' || !existsSync(dbPath)) {
     pushLog('info', 'server', '迁移备份:非磁盘库(内存库或路径未知),跳过');
     return;
   }
-  const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 15); // YYYYMMDDHHMMSS 级
+  // slice(0,14) 取纯数字 YYYYMMDDHHMMSS(F5):原 slice(0,15) 会在末尾多留一个点 ISO 的 `.`(如 20261001212800.),
+  // Windows 落盘时吞掉那个点 → 日志打印的名字与真实文件名不一致,事后拿日志根本对不上文件。
+  const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
   const target = `${dbPath}.bak-${stamp}`;
   try {
     copyFileSync(dbPath, target);
@@ -115,14 +132,23 @@ function backupDbFile(dbPath: string | undefined): void {
   }
 }
 
-/** 判据:老库形态(clip_projects 还带 import_id UNIQUE)才需要重建。
+/** 判据:老库形态(clip_projects 上存在"覆盖单列 import_id 的唯一索引")才需要重建。
  *  表不存在(全新库)→ false:SCHEMA_SQL 已按新结构建好,无事可做。
- *  ③ 挂回 / ④ 清理 都以此为准——它们只在"本次真的重建了表"时执行(见 runLegacyProductMigration 注释)。 */
+ *  ③ 挂回 / ④ 清理 都以此为准——它们只在"本次真的重建了表"时执行(见 runLegacyProductMigration 注释)。
+ *
+ *  为什么不用"建表 SQL 里含 UNIQUE 字样"(2026-10-01 OCR 审查 F2):这个判据门控着**破坏性清理**
+ *  (删 audio_items 行 + 删磁盘文件)。文本 grep 太粗——将来任何含该词的约束/默认值都会误触发一次不可逆清理。
+ *  改成精确判断:老库的列级 `import_id UNIQUE` 会被 SQLite 建成一个 autoindex(index_list 里 unique=1、
+ *  index_info 恰好一列且列名 import_id);重建后我们不再有它,所以**这个判据在新库上恒为 false**。 */
 function needsWorkTableRebuild(db: DB): boolean {
-  const row = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'clip_projects'").get() as
-    | { sql: string | null } | undefined;
-  if (row === undefined || row.sql === null) return false; // 表不存在:全新库,无需重建
-  return /UNIQUE/i.test(row.sql);                          // SQLite 删不掉列上的 UNIQUE,只在老库形态下动手
+  // 表不存在 → PRAGMA 返回空集 → 循环不命中 → false(全新库)
+  const indexes = db.prepare("PRAGMA index_list('clip_projects')").all() as Array<{ name: string; unique: number }>;
+  for (const idx of indexes) {
+    if (Number(idx.unique) !== 1) continue; // 只关心唯一索引
+    const cols = db.prepare(`PRAGMA index_info('${idx.name}')`).all() as Array<{ name: string }>;
+    if (cols.length === 1 && cols[0]!.name === 'import_id') return true; // 恰好单列 import_id → 老库形态
+  }
+  return false;
 }
 
 /** 重建作品表(去掉 UNIQUE)。**不含事务**——由调用方保证原子性(与挂回/清行同进同出,见 runLegacyProductMigration)。
@@ -130,14 +156,15 @@ function needsWorkTableRebuild(db: DB): boolean {
  *  开头先 DROP TABLE IF EXISTS clip_projects_new:收拾上次崩溃可能留下的残表(幂等前提)。 */
 function rebuildWorkTable(db: DB): void {
   db.exec('DROP TABLE IF EXISTS clip_projects_new'); // 收拾上次崩溃可能留下的残表(幂等前提)
-  db.exec(
-    'CREATE TABLE clip_projects_new (id INTEGER PRIMARY KEY AUTOINCREMENT, import_id INTEGER NOT NULL, name TEXT, ' +
-    "created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT NOT NULL DEFAULT (datetime('now')))",
-  );
+  // 列定义与 SCHEMA_SQL 共用同一常量(F4):新增列只改 CLIP_PROJECTS_COLUMNS 一处,避免老库升级静默丢列
+  db.exec(`CREATE TABLE clip_projects_new (${CLIP_PROJECTS_COLUMNS})`);
   // 显式带 id:clip_segments.project_id 必须继续指得对
   db.exec('INSERT INTO clip_projects_new (id, import_id, name, created_at, updated_at) SELECT id, import_id, name, created_at, updated_at FROM clip_projects');
   db.exec('DROP TABLE clip_projects');
   db.exec('ALTER TABLE clip_projects_new RENAME TO clip_projects');
+  // 补回按 import_id 的索引(F3):原 UNIQUE 顺带提供过它,而重建把旧表连同其索引一起 DROP 掉了 → 必须重建,
+  // 否则 countByImportId / clearSegmentsByImportId / countSegmentsByImportId / nextName / imports.ts 的 JOIN 全退化成全表扫
+  db.exec('CREATE INDEX IF NOT EXISTS idx_clip_projects_import ON clip_projects(import_id)');
   // AUTOINCREMENT 序号对齐(RENAME 已把 sqlite_sequence.name 改成新名)
   db.exec("UPDATE sqlite_sequence SET seq = (SELECT COALESCE(MAX(id), 0) FROM clip_projects) WHERE name = 'clip_projects'");
   pushLog('info', 'server', '作品表重建:clip_projects 去掉 import_id UNIQUE(1:1 → 1:N)');
@@ -158,17 +185,19 @@ function attachLegacyProductsToWorks(db: DB): number {
   return n;
 }
 
-/** 逐个删文件:失败只记日志绝不抛。
+/** 逐个删文件:失败只记日志绝不抛。返回 { ok, total }(成功数 / 总数,供聚合留痕,F6)。
  *  逐个路径按 info 级打印(删的是用户的文件,事后要能查;info 会落盘,debug 只进内存环形缓冲)。 */
-function deleteFilesBestEffort(paths: string[]): void {
+function deleteFilesBestEffort(paths: string[]): { ok: number; total: number } {
+  let ok = 0;
   for (const p of paths) {
     pushLog('info', 'server', `旧成品清理:删除文件 ${p}`);
-    try { rmSync(p, { force: true }); }
+    try { rmSync(p, { force: true }); ok++; }
     catch (e) { pushLog('error', 'server', `旧成品清理:文件删除失败 ${p}: ${e instanceof Error ? e.message : String(e)}`); }
   }
+  return { ok, total: paths.length };
 }
 
-/** 老库一次性作品迁移:重建 → 挂回 → 清行,三件事**同一个事务**(原子);返回待删文件路径清单。文件删除在提交之后。
+/** 老库一次性作品迁移:重建 → 挂回 → 清行,三件事**同一个事务**(原子)。文件删除在提交之后。
  *
  *  为什么"③ 挂回 + ④ 清理 只在本次真重建时执行"(由 initSchema 用 needsWorkTableRebuild 守卫):
  *   1. 它们是**老库一次性数据整理**,与重建同生命周期 —— 行删除与重建放同一个事务(原子,任一失败整体回滚);
@@ -176,9 +205,10 @@ function deleteFilesBestEffort(paths: string[]): void {
  *   2. 更重要的是:**新库里出现"无归属成品"是 bug 信号,不该被自动删** —— 那些行交给剪辑室的「无作品」安全网
  *      展示给用户看(可见 = 可管理)。若每次启动都清,形态相同的合法数据(如空串 url 的 edit 行)会被静默误删。
  *
- *  清理条件刻意收窄:只有"edit + 无作品 + 无来源 + source_url 空"才清 —— 有网址线索的一律保留。 */
-function runLegacyProductMigration(db: DB): string[] {
-  const files = inTransaction(db, (): string[] => {
+ *  清理条件刻意收窄:只有"edit + 无作品 + 无来源 + source_url 空"才清 —— 有网址线索的一律保留。
+ *  返回 void(F6):唯一调用方 initSchema 不接收返回值,原来的 string[] 是死代码。 */
+function runLegacyProductMigration(db: DB): void {
+  const { deleted, files } = inTransaction(db, (): { deleted: number; files: string[] } => {
     rebuildWorkTable(db);
     attachLegacyProductsToWorks(db);
     const rows = db.prepare(
@@ -188,11 +218,12 @@ function runLegacyProductMigration(db: DB): string[] {
     const del = db.prepare('DELETE FROM audio_items WHERE id = ?');
     for (const r of rows) del.run(r.id);
     if (rows.length > 0) pushLog('info', 'server', `旧成品清理:删除 ${rows.length} 行`);
-    return rows.map((r) => r.file_path);
+    return { deleted: rows.length, files: rows.map((r) => r.file_path) };
   });
   // 文件删除在提交之后:IO 不可回滚,失败只记日志(见 deleteFilesBestEffort)
-  deleteFilesBestEffort(files);
-  return files;
+  const { ok, total } = deleteFilesBestEffort(files);
+  // 聚合留痕(spec §0.3④,F6):**提交并删完文件之后**才发这条 —— 否则事后只能逐行翻才知道文件到底删没删
+  pushLog('info', 'server', `旧成品清理:删除 ${deleted} 行,文件删除 ${ok}/共 ${total} 个`);
 }
 
 /** 幂等:IF NOT EXISTS,重复调用安全 */
@@ -255,6 +286,8 @@ export function initSchema(db: DB, opts?: { dbPath?: string }): void {
     { name: 'source_work_id', ddl: 'source_work_id INTEGER' }, // 指向 clip_projects.id;成品才有
   ]);
   if (needsWorkTableRebuild(db)) {
+    // ⚠️ backupDbFile 依赖调用方传进来的 opts.dbPath(F1):真实启动路径由 bootstrap() 先调本函数(且重建就发生在这里),
+    //    若 bootstrap 不传 dbPath,这次调用恒走"路径未知,跳过" → 备份形同虚设。见 bootstrap.ts。
     backupDbFile(opts?.dbPath);            // 备份失败也继续(失败策略不变:只记日志,不阻断启动)
     try { runLegacyProductMigration(db); } // 重建+挂回+清行同一事务;文件删除在提交后
     catch (e) { pushLog('error', 'server', `作品迁移失败(不阻断启动): ${e instanceof Error ? e.message : String(e)}`); }

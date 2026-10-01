@@ -182,3 +182,32 @@ describe('initSchema 作品表迁移（spec clip-works §0.3）', () => {
     rmSync(dir, { recursive: true, force: true });
   });
 });
+
+// 2026-10-01 OCR 审查 F2/F3:重建判据精确化(唯一索引覆盖单列 import_id) + 补回被 UNIQUE 顺带提供的索引
+describe('initSchema 迁移判据与索引（F2/F3）', () => {
+  const indexNames = (t: string): string[] =>
+    (db.prepare(`PRAGMA index_list('${t}')`).all() as Array<{ name: string }>).map((r) => r.name);
+
+  it('全新库:按 import_id 建的是非唯一索引,不会被误判为老库(再跑一次不重建)', () => {
+    expect(indexNames('clip_projects')).toContain('idx_clip_projects_import');
+    const sql1 = tableSql('clip_projects');
+    initSchema(db); // 若判据把"非唯一索引"误当老库,这里会重建掉
+    expect(tableSql('clip_projects')).toBe(sql1);
+  });
+
+  it('F2:其它列上的 UNIQUE 不触发破坏性重建(不是文本 grep「含 UNIQUE」)', () => {
+    db.exec('DROP TABLE IF EXISTS clip_projects');
+    db.exec("CREATE TABLE clip_projects (id INTEGER PRIMARY KEY AUTOINCREMENT, import_id INTEGER NOT NULL, name TEXT UNIQUE, created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT NOT NULL DEFAULT (datetime('now')))");
+    initSchema(db);
+    // name 上有唯一索引、但 import_id 上没有单列唯一索引 → 不重建 → 表 SQL 仍带 UNIQUE
+    expect(tableSql('clip_projects')!.toUpperCase()).toContain('UNIQUE');
+  });
+
+  it('F3:老库(import_id UNIQUE)升级后,按 import_id 的索引被补回', () => {
+    db.exec('DROP TABLE IF EXISTS clip_projects');
+    db.exec("CREATE TABLE clip_projects (id INTEGER PRIMARY KEY AUTOINCREMENT, import_id INTEGER NOT NULL UNIQUE, name TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT NOT NULL DEFAULT (datetime('now')))");
+    initSchema(db); // 触发重建
+    expect(tableSql('clip_projects')!.toUpperCase()).not.toContain('UNIQUE'); // 约束已去掉
+    expect(indexNames('clip_projects')).toContain('idx_clip_projects_import'); // 索引补回
+  });
+});

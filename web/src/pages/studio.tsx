@@ -187,6 +187,11 @@ export default function StudioPage() {
   // 而失败只是"这一次没问到",下一次 load 成功就自愈(布尔方案在 .finally 里成功失败都置真,正是把失败压成假的"可信")。
   // loading=请求还没回来 / ok=拿到了、可信 / failed=请求失败、不可信
   const [importsState, setImportsState] = useState<'loading' | 'ok' | 'failed'>('loading');
+  // 音频请求是否已 settle(2026-10-01 OCR 审查 F7):音频与来源是两个分开发的请求。
+  // 若**来源先到、音频后到**(或音频请求失败),items 还是 [] → D13 那条分组日志会先打一行错的
+  // "源已删除 0 张、无来源 0 条" —— 而这行正是用户验收时要照抄核对的,属于"日志不诚实"。
+  // 与 importsState 同款三态:loading=还没回来 / ok=拿到 / failed=失败(失败也算 settle,但那时数据不可信)。
+  const [audioState, setAudioState] = useState<'loading' | 'ok' | 'failed'>('loading');
   const [error, setError] = useState<string | null>(null);
   const [query, setQuery] = useState('');
   // 默认「剧集分组」(D12 要求;Ruling P3-2):媒体卡墙是这一页的主体,平铺作为可选项保留
@@ -208,9 +213,9 @@ export default function StudioPage() {
       // 取封面,它失败不该把已经拿到的主列表一起丢掉(整页只剩错误文字)。
       apiGet<AudioRow[]>('/api/audio')
         // 成功必须清 error:否则一次瞬时失败(切回窗口那一下超时之类)会把整页**永久**钉在错误文字上,
-        // 后面的自动刷新即使成功也照样白屏(2026-09-29 评审修)
-        .then((rows) => { setItems(rows); setError(null); })
-        .catch((e: Error) => setError(e.message));
+        // 后面的自动刷新即使成功也照样白屏(2026-09-29 评审修)。同时置 audioState(F7):settle 才允许打分组日志
+        .then((rows) => { setItems(rows); setError(null); setAudioState('ok'); })
+        .catch((e: Error) => { setError(e.message); setAudioState('failed'); });
       void listImports()
         .then((rows) => { setImports(rows); setImportsState('ok'); })
         // 保留原有错误日志;并置 failed —— 失败时来源列表**不可信**,分组不得据此判"源已删除"
@@ -236,6 +241,9 @@ export default function StudioPage() {
     // 来源列表未到齐**或请求失败**都不打这一行(2026-10-01 终审 I-1):否则会先打一行错的分组结果
     // (来源卡 0 张、源已删除 N 张),而验收正让用户照这行日志核对——错的那行会被当成"本该如此"
     if (importsState !== 'ok') return;
+    // 音频请求也必须 settle(F7):否则"来源先到、音频后到"时会先打一行 "源已删除 0 张、无来源 0 条"(错的)。
+    // 失败也算 settle(不再 loading),但那时 items 不可信 —— 这一行只是诊断留痕,不据此做任何破坏性判断。
+    if (audioState === 'loading') return;
     if (items.length === 0 && imports.length === 0) return;
     const live = new Set(imports.map((i) => i.id));
     // 用 == null 而不是 !== null(2026-10-01 终审 I-4):字段缺失(undefined)不算悬空 id,免得并进"源已删除"
@@ -243,7 +251,7 @@ export default function StudioPage() {
     // 同理用 == null:undefined 也要算「无来源」,不被漏掉
     const noSource = items.filter((i) => i.source_import_id == null).length;
     logFe('info', `剪辑室分组:来源卡 ${imports.length} 张、源已删除 ${dangling.size} 张、无来源 ${noSource} 条`);
-  }, [items, imports, importsState]);
+  }, [items, imports, importsState, audioState]);
 
   // 2026-09-29:删除按钮 → antd Modal.confirm 弹窗(用户拍板);
   // 先把对应行的 <audio> 暂停并清 src,避免删除瞬间 audio 还在请求 /api/audio/:id/file(range 请求 404 噪声)
