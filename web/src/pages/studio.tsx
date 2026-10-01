@@ -211,6 +211,10 @@ export default function StudioPage() {
     const load = (): void => {
       // 两个请求分开发(2026-09-29 评审修):原来用 Promise.all 绑死 —— 导入来源只是用来算「共 N 集」和
       // 取封面,它失败不该把已经拿到的主列表一起丢掉(整页只剩错误文字)。
+      // 2026-10-01 F7 二轮:每轮 load 启动时先把两个 state 打回 loading —— 否则上一轮残留的 ok/failed
+      //   会让分组日志守卫「提前放行」:本轮请求还在途中,就用上一轮的旧数据打了统计。与三态初值语义一致。
+      setAudioState('loading');
+      setImportsState('loading');
       apiGet<AudioRow[]>('/api/audio')
         // 成功必须清 error:否则一次瞬时失败(切回窗口那一下超时之类)会把整页**永久**钉在错误文字上,
         // 后面的自动刷新即使成功也照样白屏(2026-09-29 评审修)。同时置 audioState(F7):settle 才允许打分组日志
@@ -240,10 +244,17 @@ export default function StudioPage() {
   useEffect(() => {
     // 来源列表未到齐**或请求失败**都不打这一行(2026-10-01 终审 I-1):否则会先打一行错的分组结果
     // (来源卡 0 张、源已删除 N 张),而验收正让用户照这行日志核对——错的那行会被当成"本该如此"
-    if (importsState !== 'ok') return;
-    // 音频请求也必须 settle(F7):否则"来源先到、音频后到"时会先打一行 "源已删除 0 张、无来源 0 条"(错的)。
-    // 失败也算 settle(不再 loading),但那时 items 不可信 —— 这一行只是诊断留痕,不据此做任何破坏性判断。
-    if (audioState === 'loading') return;
+    // ---- F7 二轮(2026-10-01)收严:只有**两个请求都成功**才允许打统计 ----
+    // 任何一方没成功(失败/还在途),此刻 items 或 imports 就不可信,打出来的计数是假事实
+    //   (例如"无来源 0 条"其实是音频列表没拿到)——而这一行正是验收要照抄的。
+    //   故本轮改为打一行诚实的替代说明,不打统计。保留既有语义:来源列表未成功时**绝不**判"源已删除"。
+    if (importsState !== 'ok' || audioState !== 'ok') {
+      // 仍在途(loading)→ 静默等下一轮,不刷屏;确实失败了才落一行替代说明,让日志页看得到"本轮为何没统计"
+      if (importsState === 'failed' || audioState === 'failed') {
+        logFe('info', `剪辑室分组:导入或音频请求未成功(imports=${importsState} audio=${audioState}),本轮不打分组统计`);
+      }
+      return;
+    }
     if (items.length === 0 && imports.length === 0) return;
     const live = new Set(imports.map((i) => i.id));
     // 用 == null 而不是 !== null(2026-10-01 终审 I-4):字段缺失(undefined)不算悬空 id,免得并进"源已删除"

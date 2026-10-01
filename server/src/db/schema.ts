@@ -4,8 +4,9 @@ import { pushLog } from '../logs.js';
 import { inTransaction } from './tx.js';
 
 /** clip_projects 的列定义(**唯一真相**,2026-10-01 OCR 审查 F4)：
- *  SCHEMA_SQL 的建表与迁移里的 `CREATE TABLE clip_projects_new (...)` 共用这一份。
- *  ⚠️ **新增列必须只改这一处** —— 若两份各写各的,老库升级时重建会用旧列定义搬数据,新列的数据被静默丢掉。 */
+ *  SCHEMA_SQL 的建表与迁移里的 `CREATE TABLE clip_projects_new (...)` 共用这一份 —— 两处建表语句不再各写各的。
+ *  ⚠️ 边界(2026-10-01 F7 二轮):`rebuildWorkTable` 里的 `INSERT INTO clip_projects_new (列清单) SELECT ...`
+ *  仍是手写列清单;新增列若不写进那句 INSERT,老库迁移时该列只会**取默认值**(NULL),不是"改完这一处就完事"。 */
 const CLIP_PROJECTS_COLUMNS =
   'id INTEGER PRIMARY KEY AUTOINCREMENT, ' +
   'import_id INTEGER NOT NULL, ' +
@@ -156,7 +157,9 @@ function needsWorkTableRebuild(db: DB): boolean {
  *  开头先 DROP TABLE IF EXISTS clip_projects_new:收拾上次崩溃可能留下的残表(幂等前提)。 */
 function rebuildWorkTable(db: DB): void {
   db.exec('DROP TABLE IF EXISTS clip_projects_new'); // 收拾上次崩溃可能留下的残表(幂等前提)
-  // 列定义与 SCHEMA_SQL 共用同一常量(F4):新增列只改 CLIP_PROJECTS_COLUMNS 一处,避免老库升级静默丢列
+  // 列定义与 SCHEMA_SQL 共用同一常量(F4):建表 SQL 与这里都引用它,新增列**不必**去改两处建表语句。
+  //   边界:下面那条 `INSERT INTO clip_projects_new (列清单) SELECT ...`(见下方 INSERT)仍是**手写列清单** ——
+  //   新增列若不写进它,老库迁移时该列只会取默认值(NULL)。所以"改这一处"指的是"建表列定义只此一份",不是全部。
   db.exec(`CREATE TABLE clip_projects_new (${CLIP_PROJECTS_COLUMNS})`);
   // 显式带 id:clip_segments.project_id 必须继续指得对
   db.exec('INSERT INTO clip_projects_new (id, import_id, name, created_at, updated_at) SELECT id, import_id, name, created_at, updated_at FROM clip_projects');
@@ -217,7 +220,8 @@ function runLegacyProductMigration(db: DB): void {
     ).all() as Array<{ id: number; file_path: string }>;
     const del = db.prepare('DELETE FROM audio_items WHERE id = ?');
     for (const r of rows) del.run(r.id);
-    if (rows.length > 0) pushLog('info', 'server', `旧成品清理:删除 ${rows.length} 行`);
+    // 不再单独打"删除 N 行"(2026-10-01 OCR 审查 F7 二轮):它与提交后那条聚合行(删除 N 行,文件删除 M/共 K 个)
+    //   重复;只保留**聚合行 + 逐文件路径行**(spec §0.3④ 要的就是这两类)。
     return { deleted: rows.length, files: rows.map((r) => r.file_path) };
   });
   // 文件删除在提交之后:IO 不可回滚,失败只记日志(见 deleteFilesBestEffort)

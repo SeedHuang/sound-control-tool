@@ -60,7 +60,7 @@ node --experimental-sqlite -e 'const {DatabaseSync}=require("node:sqlite");const
 | D10 | **`parent_id` 保留原样：不写、不删、不迁移**。 | 上一 session 裁决（开放问题 3）。它留给未来的"从音频剪音频"（那时才有"源音频"这个对象）；现在没有这个对象，`parent_id` 指不动。 |
 | D11 | **首页 `GET /api/home` 不动**（`recent` 继续按 URL 关联 `source_type='download'`）。 | 结果与"按外键关联"**等价**（回填后每种情况都命中同一行），却要动一条已被 8 个用例固化的 SQL。零收益、有回归风险——不做。 |
 | D12 | **不顺手给导出产物补 `source_url`**（保持 `''`）。行内的"原视频"链接在来源卡内**回退用该卡的 `importRow.url`**。 | 外键已经表达了来源；再往 `source_url` 写一份等于两个事实源，将来必然漂移。 |
-| D13 | **日志（仓库铁律）**：三条写入点各记一行（含解析出的 `source_import_id`）、回填记一行（**改了几行**）、前端分组结果记一行（几个来源卡 / 几张孤儿卡；**音频与来源两个请求都 settle 后才打**——否则来源先到时 `items` 还是 `[]`，会先打一行错的"源已删除 0 张、无来源 0 条"，而这行正是用户验收时要照抄核对的）。均走 `pushLog`，前端在日志抽屉可见。 | `d:\Seed\sound-control-tool\.trae\rules\electron-dev-must-log.md` 铁律；尤其是"回填改了几行"——不记就永远不知道迁移有没有生效。 |
+| D13 | **日志（仓库铁律）**：三条写入点各记一行（含解析出的 `source_import_id`）、回填记一行（**改了几行**）、前端分组结果记一行（几个来源卡 / 几张孤儿卡；**音频与来源两个请求都成功后才打**——任一未成功（失败 / 仍在途）则改打一行诚实的替代说明、不打统计；否则请求没齐时 `items` 可能是 `[]`，会先打一行错的"源已删除 0 张、无来源 0 条"，而这行正是用户验收时要照抄核对的）。均走 `pushLog`，前端在日志抽屉可见。 | `d:\Seed\sound-control-tool\.trae\rules\electron-dev-must-log.md` 铁律；尤其是"回填改了几行"——不记就永远不知道迁移有没有生效。 |
 | D14 | **不新增依赖、不动技术栈**（Electron + Fastify 5 + `node:sqlite` + UmiJS Max 4 + antd 5）。 | 全局约束。 |
 
 ## 0.3 接口契约
