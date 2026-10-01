@@ -42,6 +42,7 @@
 在**新 session 产出两份 spec**（本 session 已讨论完两者的**决策与依据**，但**未落任何 spec 文件**）：
 
 - **Spec A · 音频血缘 + 来源/成品信息架构**：落地 PRD FR-3.7 的剪辑血缘 —— `audio_items` 增 `source_import_id`，**下载与剪辑产物两条路径都写**；剪辑室的归并键从 `source_url` 字符串**改为该外键**；来源卡内分「素材 / 成品」两组；无来源的（录制 + 历史遗留）收成**一张**「无来源」卡。
+  > **注记（2026-10-01，已实现）**：本节描述的 Spec A 已由 Task 1–5 落地，实现见 `docs/superpowers/specs/2026-10-01-audio-lineage.md`（裁决 D1–D13）与 `docs/superpowers/plans/2026-10-01-audio-lineage.md`。本交接为过程记录，正文不改写。
 - **Spec B · 时间轴缩略图/波形的专业重构**：把「一条 12 格合成 PNG + 固定 1600px 波形」换成「**分级 + 分段雪碧图** + **多级波形峰值**」，支持**可缩放且随缩放变密**、**视口优先 + 空闲预取**。**第一步必须先跑一轮 ffmpeg 实测**（抽帧耗时/粗层级铺满耗时/波形峰值数据量）再定参数。
 
 流程：spec → 用户过目 → `writing-plans` 出实施计划 → `subagent-driven-development` 逐任务实现 + 独立审查 + 台账记账（**禁止 commit**）
@@ -58,6 +59,7 @@
   - `server/src/media/clip-job.ts` **行 85-87**（剪辑路径同为 `'edit'`）
   - `server/src/media/project-routes.ts` **行 88**（导出路由注释）
   - `web/src/pages/studio.tsx` **行 223-240**（现有"按 `source_url` 归并、空串各自成卡"的逻辑与注释——正是要改的地方）
+    > **注记（2026-10-01，已改）**：该处归并键已由 `source_url` 字符串换为外键 `source_import_id`（spec `docs/superpowers/specs/2026-10-01-audio-lineage.md` D6）。本交接为过程记录，正文结论不改写。
   - `server/src/media/home-routes.test.ts` **行 123**（首页排除 `edit`/`recording` 的固化用例）
 - Spec B（缩略图/波形）：
   - `server/src/ffmpeg/derived-args.ts` **行 1-29**：`DERIVED_FILM_TILES = 12`（行 6）；`buildFilmstripArgs` 的 **`fps` 下限 `0.05`（行 27）＝"只覆盖开头 4 分钟"的根因**；波形 `showwavespic` 固定 1600×120（行 12-19）

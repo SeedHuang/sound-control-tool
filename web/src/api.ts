@@ -269,6 +269,7 @@ export interface AudioRow {
   site: string;                   // 平台标识(bilibili/youtube/other,后端由 source_url 反查)→ 剪辑室显示 logo
   entry_index: number | null;     // 合集第几集;单视频/录制 → null
   collection_title: string | null; // 所属合集标题;非合集 → null
+  source_import_id: number | null; // 2026-10-01 spec audio-lineage D1:来源 id(无来源 → null);剪辑室按它归并
 }
 
 export function audioFileUrl(id: number): string {

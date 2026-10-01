@@ -85,10 +85,12 @@ export async function startClipJob(
       // D8:剪辑产物记 'edit' 而非缺省 'download'——否则会混进首页「最近下载」(GET /api/home 的 recent 只排除 'edit'),
       // 直到下次启动 initSchema 的历史纠偏 SQL 才被改过来。导出路径(ffmpeg-export.ts)已接,这里补齐。
       sourceType: 'edit',
+      // 2026-10-01 spec audio-lineage D3:血缘 —— payload 里本来就有 importId,原样写(不做存在性检查:D4)
+      sourceImportId: payload.importId,
       audioDir: deps.audioDir, exists: existsSync, audioRepo,
     });
     jobsRepo.finish(jobId);
-    pushLog('info', 'clip', `job ${jobId} done → audio ${result.audioId} @ ${result.finalPath}`);
+    pushLog('info', 'clip', `job ${jobId} done → audio ${result.audioId} @ ${result.finalPath} source_import_id=${payload.importId}`);
     emit(jobId, { type: 'done', kind: 'audio', audioId: result.audioId, title: finalTitle, format: payload.format, filePath: result.finalPath, replaced: false });
   } catch (err) {
     fail(err instanceof Error ? err.message : String(err));

@@ -65,4 +65,13 @@ describe('audio-items repo', () => {
     expect(repo.get(id)!.collection_title).toBe('旧库合集');
     old.close();
   });
+  // 2026-10-01 spec audio-lineage D1：剪辑血缘列落库/回读，不传即 null
+  it('source_import_id 落库并回读;不传 → null', () => {
+    const repo = createAudioItemsRepo(db);
+    const a = repo.create({ title: '带血缘', source_type: 'edit', source_url: '', source_import_id: 12, file_path: 'C:/tmp/blood.mp3', format: 'mp3', duration_sec: null, file_size: 1 });
+    expect(repo.get(a)!.source_import_id).toBe(12);
+    expect(repo.list()[0]!.source_import_id).toBe(12);
+    const b = repo.create({ title: '无血缘', source_type: 'recording', source_url: null, file_path: 'C:/tmp/nb.wav', format: 'wav', duration_sec: null, file_size: 1 });
+    expect(repo.get(b)!.source_import_id).toBeNull();
+  });
 });

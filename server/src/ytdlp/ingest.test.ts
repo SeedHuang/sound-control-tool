@@ -87,6 +87,22 @@ describe('ingestDownloadedFile', () => {
     });
     expect(audioRepo.get(audioId)!.source_type).toBe('download');
   });
+  // 2026-10-01 spec audio-lineage D3：sourceImportId 透传到 source_import_id
+  it('sourceImportId 透传进 source_import_id(缺省 → null)', () => {
+    const audioRepo = createAudioItemsRepo(db);
+    const t1 = join(dir, 'blood.mp3'); writeFileSync(t1, 'x');
+    const { audioId } = ingestDownloadedFile({
+      tmpPath: t1, title: '带血缘', format: 'mp3', durationSec: null, fileSize: 1,
+      sourceUrl: 'https://a/pl', sourceImportId: 7, audioDir: dir, exists: existsSync, audioRepo,
+    });
+    expect(audioRepo.get(audioId)!.source_import_id).toBe(7);
+    const t2 = join(dir, 'noblood.mp3'); writeFileSync(t2, 'y');
+    const { audioId: nid } = ingestDownloadedFile({
+      tmpPath: t2, title: '无血缘', format: 'mp3', durationSec: null, fileSize: 1,
+      sourceUrl: '', audioDir: dir, exists: existsSync, audioRepo,
+    });
+    expect(audioRepo.get(nid)!.source_import_id).toBeNull();
+  });
 });
 
 describe('moveIntoPlace(跨盘兜底, spec D6)', () => {

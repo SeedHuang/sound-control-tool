@@ -58,6 +58,9 @@ describe('startExportJob', () => {
     const titles = items.map((i) => i.title).sort();
     expect(titles).toEqual([formatClipTitle('凡人', 0, 10), formatClipTitle('凡人', 20, 30)].sort());
     expect(items.every((i) => i.source_type === 'edit')).toBe(true); // D8
+    // 2026-10-01 spec audio-lineage D3:导出产物带血缘(payload.importId=1)——改造前这里恒为 NULL,
+    // 正是 dev 库那 8 条导出片段在剪辑室散成 8 张碎卡的根因
+    expect(items.every((i) => i.source_import_id === 1)).toBe(true);
     expect(items.every((i) => i.duration_sec === 10)).toBe(true);    // ffprobe 实测（桩）
     expect(items.every((i) => existsSync(i.file_path) && i.file_path.startsWith(audioDir))).toBe(true);
     expect(createJobsRepo(db).get(jobId)!.status).toBe('done');
@@ -69,6 +72,7 @@ describe('startExportJob', () => {
     expect(items).toHaveLength(1);
     expect(items[0]!.title).toBe(formatMergeTitle('凡人', 2));
     expect(items[0]!.source_type).toBe('edit');
+    expect(items[0]!.source_import_id).toBe(1);
     expect(createJobsRepo(db).get(jobId)!.status).toBe('done');
   });
   it('素材路径不存在 → job error（message 含「素材已不存在」），audio_items 无行', async () => {

@@ -35,7 +35,7 @@
 3. **封面已是现成设施**：`covers.ts` 按来源 id 落盘 `covers/cover-<importId>.<ext>`，`GET /api/imports/:id/cover` 已通；剪辑室卡片与首页都能直接复用，不用新建。
 4. **一个来源一份视频素材**：`source_videos.import_id` 与 `imported_sources.id` **一对一**（`schema.ts:55-61`），素材文件名恒为 `media-<importId>.<ext>`（m1c §0.4 第 5 条）→ **同一来源下多集视频会互相覆盖，只会剩下最后一集**。这条直接决定了 §0.2「已裁决」的"一次只选一集"。
 5. **剪辑产物和下载音频现在无法区分**：`ingest.ts:14` 把 `source_type` **硬编码成 `'download'`**；`clip-job.ts:78` 也走它 → 库里"剪出来的音频"和"下载的原音频"长得一模一样。首页要分"最近下载"和"正在编辑"，**必须先修这个**。（对应需求 9）
-6. **`audio_items` 有 `parent_id` 列但从未被写入**（`schema.ts:11`；`audio-items.ts` 的 create 不带它）。PRD FR-3.7 的血缘设计尚未落地。
+6. **`audio_items` 的血缘设计已落地（2026-10-01，spec `2026-10-01-audio-lineage.md`）**：血缘走新增列 `source_import_id`（指向 `imported_sources.id`），下载/剪辑/导出三条入库路径都写它。`parent_id` 仍未使用（保留给未来"从音频剪音频"）。
 7. **PRD 已定波形库是 wavesurfer.js v7（ADR-6）**，且 `EditSpec` 已经是"多段数组"结构（PRD §4.2）。本切片沿用"多段"语义，但**波形/画轨改为服务端 ffmpeg 出图**，理由见 D6。
 8. **ffmpeg 是硬前置**（m1c D16）：剪辑类功能没有 ffmpeg 整体不可用。本切片只加更多 ffmpeg 依赖，不改变这条。
 9. **SQLite 的列默认值只在 INSERT 生效**：`updated_at TEXT DEFAULT (datetime('now'))` 这类写法，UPDATE 时**不会**自动刷新——任何"按更新时间排序"的字段都必须在代码里显式写。（对应 D13，评审发现）
@@ -297,7 +297,7 @@ CREATE INDEX IF NOT EXISTS idx_clip_segments_project ON clip_segments(project_id
 | B1 | segments 拖动不够顺手时引入 `@xzdarcy/react-timeline-editor` / `dnd-timeline` | 用户抱怨自定义拖拽卡顿或行为怪异 ≥ 2 次 |
 | B2 | 波形需要缩放/精细 scrub 时引入 wavesurfer.js（PRD ADR-6 复活） | 出现"看不清波形细节"的反馈 |
 | B3 | 派生图目录的容量清理 | 用户反馈磁盘占用 |
-| B4 | `parent_id` 血缘落地（PRD FR-3.7） | 需要"从剪辑产物反查源音频"时 |
+| B4 | ✅ **已落地**（2026-10-01，spec `2026-10-01-audio-lineage.md`）：血缘走 `source_import_id → imported_sources.id`——**指向"来源"而非"源音频"**，与原设想的 `parent_id` 不同 | 触发条件"需要从剪辑产物反查源音频时"已达成 |
 | B5 | 剪辑室"平铺"视图是否保留 | 用户反馈从不用平铺 |
 | B6 | 视频**多集批量**下载（= §0.2「已裁决」里未采用的方案 B） | 用户明确要求一次下多集视频 |
 | B7 | 历史纠偏的 `LIKE` 模式可能误伤"手动取名恰好像时间段"的音频 | 真的误伤 ≥ 1 次 |

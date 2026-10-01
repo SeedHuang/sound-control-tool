@@ -52,6 +52,8 @@ describe('startClipJob', () => {
     // D8:剪辑是真"剪辑"不是"下载" —— 缺这行断言时,产物 source_type 会落成 'download',首页「最近下载」会误列
     expect(items[0]!.source_type).toBe('edit');
     expect(items[0]!.source_url).toBe('https://a/pl');
+    // 2026-10-01 spec audio-lineage D3:剪辑产物必须记住"从哪个来源剪的"(payload.importId=1)
+    expect(items[0]!.source_import_id).toBe(1);
     expect(items[0]!.file_path.startsWith(audioDir)).toBe(true);
     expect(existsSync(items[0]!.file_path)).toBe(true);
     expect(createJobsRepo(db).get(jobId)!.status).toBe('done');

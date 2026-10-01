@@ -145,10 +145,18 @@ function createDownloadHandlers(deps: YtdlpDeps) {
       const needProbe = Boolean(section) || payload.durationSec === undefined;
       const duration = needProbe && (await getFfprobe()) ? await probeDuration((await getFfprobe())!, producedPath) : payload.durationSec ?? null;
       const size = statSync(producedPath).size;
+      // 2026-10-01 spec audio-lineage D3/D4:音频的血缘 —— 按 URL 反查来源 id。
+      // 反查不到(理论不可达:parse 必先 upsert 来源)不阻断入库,只记 null + 一行日志:
+      // 入库是用户等很久的产物,辅助字段查不到不该毁掉主流程
+      const sourceImport = createImportsRepo(db).getByUrl(payload.url);
+      if (sourceImport === null) {
+        pushLog('error', 'job', `job ${jobId} 血缘反查失败:url=${payload.url} → source_import_id 记 null`);
+      }
       const result = ingestDownloadedFile({
         tmpPath: producedPath, title: payload.title ?? '下载音频', format,
         durationSec: duration, fileSize: size, sourceUrl: payload.url,
         entryIndex: payload.entryIndex ?? null, collectionTitle: payload.collectionTitle ?? null,
+        sourceImportId: sourceImport?.id ?? null,
         audioDir, exists: existsSync, audioRepo,
       });
       audioId = result.audioId;
@@ -160,7 +168,7 @@ function createDownloadHandlers(deps: YtdlpDeps) {
           })
         : 0;
       jobsRepo.finish(jobId);
-      pushLog('info', 'job', `job ${jobId} done → audio ${result.audioId} @ ${result.finalPath}${replaced > 0 ? `(覆盖并删掉旧条目 ${replaced} 条)` : ''}`); // 诊断日志:入库成败都要可见
+      pushLog('info', 'job', `job ${jobId} done → audio ${result.audioId} @ ${result.finalPath}${replaced > 0 ? `(覆盖并删掉旧条目 ${replaced} 条)` : ''} source_import_id=${sourceImport?.id ?? null}`); // 诊断日志:入库成败都要可见
       emit(jobId, { type: 'done', audioId: result.audioId, filePath: result.finalPath, title: payload.title ?? '下载音频', format, replaced: replaced > 0 });
       // spec §0.3 列了 status done,但 emit('done') 已断开连接并删除订阅表,紧随的 status done 无人可达——
       // 前端 subscribeJob 只监听 progress/done/status(error/cancelled),不消费 status done,故不再单独发(由 done 隐含)

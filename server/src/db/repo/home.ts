@@ -42,8 +42,10 @@ export function createHomeRepo(db: DB) {
     }));
 
   /** 最近下载 Top3,**按来源去重**。为什么去重:一个合集刚下了 193 集,不去重的话 Top3 会全是同一部作品的三集,首页等于没信息。
-   *  关联来源:audio_items 没有 import_id 列 → 只能靠 imported_sources.url = audio_items.source_url 反查(INNER JOIN:
-   *  匹配不上的音频自然被排除,等价于 spec 的「排除 import_id 为 null」——录制/无来源音频不算媒体作品)。
+   *  关联来源:audio_items 的 source_import_id 列**已存在**(2026-10-01 spec audio-lineage),但本查询**刻意仍按
+   *  imported_sources.url = audio_items.source_url 关联**:对 source_type='download' 的旧行两者等价,换过来零收益、
+   *  却要动一条已被 8 个用例固化的 SQL(spec audio-lineage D11)。
+   *  INNER JOIN 匹配不上的音频自然被排除,等价于 spec 的「排除 import_id 为 null」——录制/无来源音频不算媒体作品)。
    *  WHERE source_type='download' 再排除剪辑产物('edit')与录制('recording'),这些不是「下载的作品」。
    *
    *  ⚠️ 这条 SQL 的正确性靠 SQLite 的一个特性(务必理解,否则会误以为裸列是「随便一行」):

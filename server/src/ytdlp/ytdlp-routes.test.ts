@@ -177,6 +177,32 @@ describe('POST /api/ytdlp/download', () => {
     expect(rows[0]!.entry_index).toBe(1);
     expect(existsSync(oldPath)).toBe(false); // 旧文件真的删了
   });
+  // 2026-10-01 spec audio-lineage D3:音频下载入库也要写血缘(按 URL 反查来源 id)
+  it('下载音频入库 → source_import_id = 该 URL 对应来源', async () => {
+    const audioRepo = createAudioItemsRepo(db);
+    const importId = createImportsRepo(db).upsertByUrl({
+      url: 'https://a/pl', title: '条目 1', site: 'bilibili', kind: 'single', duration_sec: null, entries: null,
+    });
+    const producedPath = join(tempDir, 'blood-1.mp3'); writeFileSync(producedPath, 'new');
+    let fire: (() => void) | undefined;
+    const dm = {
+      start: vi.fn((opts: { jobId: number; onEvent: (jid: number, ev: unknown) => void }) => {
+        fire = () => opts.onEvent(opts.jobId, { type: 'status', state: 'done', producedPath });
+      }),
+      cancel: vi.fn(async () => {}),
+      dispose: vi.fn(async () => {}),
+    };
+    makeApp('yt-dlp', 'tok2', dm as unknown as ReturnType<typeof createDownloadManager>);
+    const res = await app.inject({ method: 'POST', url: '/api/ytdlp/download', payload: { url: 'https://a/pl', title: '条目 1', options: { format: 'mp3', entryIndices: [1] } } });
+    expect(res.statusCode).toBe(201);
+    const jobId = res.json().jobId as number;
+    fire!();
+    const deadline = Date.now() + 2000;
+    while (Date.now() < deadline && createJobsRepo(db).get(jobId)!.status !== 'done') await new Promise((r) => setTimeout(r, 20));
+    const rows = audioRepo.list();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.source_import_id).toBe(importId);
+  });
   it('同网址不同集(第 1 集已入库,请求第 2 集)→ 201,不误伤其它集', async () => {
     // 判重按「网址 + 第几集」:库里第 1 集(老记录,entry_index 落 NULL,标题「第1集已入库」),
     // 请求第 2 集(entryIndices [2] + 标题「第2集」)→ 集数与标题都对不上 → 必须放行,否则批量永远只能下出第 1 集。
@@ -471,12 +497,22 @@ describe('GET /api/audio 与 GET /api/audio/:id/file', () => {
   // 2026-09-29 用户拍板:剪辑室要显示平台 logo / 第几集 / 所属合集 → 列表附带 site + 剧集两列
   it('audio 列表带 site(由 source_url 反查平台)与剧集字段', async () => {
     const audioRepo = createAudioItemsRepo(db);
-    audioRepo.create({ title: '第 3 集', source_type: 'download', source_url: 'https://www.bilibili.com/list/1', file_path: 'C:/x/3.mp3', format: 'mp3', duration_sec: null, file_size: 1, entry_index: 3, collection_title: '某合集' });
+    audioRepo.create({ title: '第 3 集', source_type: 'download', source_url: 'https://www.bilibili.com/list/1', file_path: 'C:/x/3.mp3', format: 'mp3', duration_sec: null, file_size: 1, entry_index: 3, collection_title: '某合集', source_import_id: 42 });
     makeApp('yt-dlp', 'tok2');
-    const row = (await app.inject({ method: 'GET', url: '/api/audio' })).json()[0] as { site: string; entry_index: number; collection_title: string };
+    const row = (await app.inject({ method: 'GET', url: '/api/audio' })).json()[0] as { site: string; entry_index: number; collection_title: string; source_import_id: number | null };
     expect(row.site).toBe('bilibili');
     expect(row.entry_index).toBe(3);
     expect(row.collection_title).toBe('某合集');
+    // 2026-10-01 spec audio-lineage D3/验收 6:列表回读必须带 source_import_id —— 此前只靠路由里 `...row` 展开这个
+    // 实现细节保证,将来重构路由可能静默丢字段,故在此对它下契约断言(有值原样带回)。
+    expect(row.source_import_id).toBe(42);
+  });
+  // 2026-10-01 spec audio-lineage 验收 6 的另一半:没写血源的条目,列表回读该字段必须是 null(不是缺失/undefined)
+  it('audio 列表:未写血源的条目 source_import_id 为 null', async () => {
+    createAudioItemsRepo(db).create({ title: '无血缘', source_type: 'recording', source_url: null, file_path: 'C:/x/rec.wav', format: 'wav', duration_sec: null, file_size: 1 });
+    makeApp('yt-dlp', 'tok2');
+    const row = (await app.inject({ method: 'GET', url: '/api/audio' })).json()[0] as { source_import_id: number | null };
+    expect(row.source_import_id).toBeNull();
   });
   // 2026-09-29 补:<audio> 由浏览器自己发,既没有 Origin 也加不了 header → 额外认「Referer 是本机页面」。
   // 实测日志里 /api/audio/:id/file 大量 401 就是这个坑(本地开发裸开浏览器时播放器拿不到文件)。

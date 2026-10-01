@@ -1,4 +1,5 @@
 import type { DB } from './index.js';
+import { pushLog } from '../logs.js';
 
 const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS audio_items (
@@ -8,7 +9,11 @@ CREATE TABLE IF NOT EXISTS audio_items (
   source_url TEXT,
   entry_index INTEGER,
   collection_title TEXT,
-  parent_id INTEGER,
+  parent_id INTEGER, -- PRD FR-3.7 的原方案(关联"源音频"):今天的剪辑输入是视频、系统里没有"源音频"对象,实际血缘走 source_import_id;本列保留未用(spec audio-lineage D10)
+  -- 2026-10-01 spec audio-lineage D1:剪辑血缘 —— 指向 imported_sources.id。
+  -- 不用 parent_id:PRD FR-3.7 原话是"关联源音频",但今天的剪辑输入是视频(source_videos),
+  -- 系统里没有"源音频"这个对象,parent_id 指不动;它留给未来"从音频剪音频"(列本就在,非新增,D10)
+  source_import_id INTEGER,
   file_path TEXT NOT NULL UNIQUE,
   format TEXT NOT NULL,
   duration_sec REAL,
@@ -99,6 +104,7 @@ export function initSchema(db: DB): void {
   ensureColumns(db, 'audio_items', [
     { name: 'entry_index', ddl: 'entry_index INTEGER' },
     { name: 'collection_title', ddl: 'collection_title TEXT' },
+    { name: 'source_import_id', ddl: 'source_import_id INTEGER' }, // 2026-10-01 spec audio-lineage D1
   ]);
   // 2026-09-29 用户拍板:分组视图要作品封面 → imported_sources 存封面原始地址(图片本体落盘在 covers/)
   ensureColumns(db, 'imported_sources', [
@@ -119,4 +125,24 @@ export function initSchema(db: DB): void {
     "AND title LIKE '%[__:__-__:__]' " +                       // 形如 [05:12-06:03]
     "OR (source_type='download' AND title GLOB '*[0-9][0-9][0-9]:[0-9][0-9]-[0-9][0-9][0-9]:[0-9][0-9]]');", // 三位分钟:形如 [120:00-121:30]
   );
+  // 2026-10-01 spec audio-lineage D5:血缘回填(幂等)。
+  // 不做这一步的后果:老的下载音频(有 url、无外键)与新导出的音频(有外键)会各建一张卡——同一个来源两张卡,
+  // 比改造前还差。回填让前端只需认外键一条口径。
+  // 只认"精确等于"导不进来的行(空串/NULL/来源早已删除)保持 NULL,由前端收进「无来源」卡(D7)。
+  // 计数口径(2026-10-01 终审 I-2):SQLite 的 changes 是"WHERE 命中行数",不是"值真的变了的行数"——
+  // 匹配不到来源的行(子查询给 NULL=实际没变)会被计入,导致"补 K 行"虚高,还盖住了"非空但查不到来源"这个有诊断价值的信号。
+  // 故自己数"回填前候选"与"回填后残留"的差,并把这个残留量单独暴露出来。
+  const countUnresolved = (): number => {
+    const row = db.prepare(
+      "SELECT COUNT(*) AS c FROM audio_items WHERE source_import_id IS NULL AND source_url IS NOT NULL AND source_url <> ''",
+    ).get() as { c: number | bigint };
+    return Number(row.c);
+  };
+  const before = countUnresolved();
+  db.prepare(
+    'UPDATE audio_items SET source_import_id = (SELECT id FROM imported_sources WHERE url = audio_items.source_url) ' +
+    "WHERE source_import_id IS NULL AND source_url IS NOT NULL AND source_url <> ''",
+  ).run();
+  const residual = countUnresolved();
+  pushLog('info', 'server', `血缘回填:补上 source_import_id ${before - residual} 行;仍有 ${residual} 行 source_url 非空但查不到来源(进「无来源」卡)`);
 }

@@ -51,13 +51,17 @@ export async function startExportJob(jobId: number, payload: ExportJobPayload, d
     pushLog('info', 'job', `export job ${jobId} 目标目录 ${outputDir}`);
     const audioRepo = createAudioItemsRepo(deps.db);
     // 统一的入库入口:sourceType='edit'(D8)——导出产物是「剪辑」而非「下载」
-    const ingest = (tmp: string, title: string, durationSec: number | null): number =>
-      ingestDownloadedFile({
+    const ingest = (tmp: string, title: string, durationSec: number | null): number => {
+      const audioId = ingestDownloadedFile({
         tmpPath: tmp, title, format: payload.format, durationSec,
         fileSize: statSync(tmp).size, sourceUrl: '', entryIndex: null, collectionTitle: null,
         sourceType: 'edit',
+        sourceImportId: payload.importId, // 2026-10-01 spec audio-lineage D3:导出产物同样记血缘(改造前恒为 NULL)
         audioDir: outputDir, exists: existsSync, audioRepo,
       }).audioId;
+      pushLog('info', 'job', `export job ${jobId} 入库 audio=${audioId} source_import_id=${payload.importId}`);
+      return audioId;
+    };
 
     if (payload.mode === 'separate') {
       const produced: number[] = [];

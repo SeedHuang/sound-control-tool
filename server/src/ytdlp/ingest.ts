@@ -24,6 +24,8 @@ export function moveIntoPlace(
 export function ingestDownloadedFile(opts: {
   tmpPath: string; title: string; format: string; durationSec: number | null;
   fileSize: number; sourceUrl: string; audioDir: string;
+  /** 2026-10-01 spec audio-lineage D3:剪辑血缘(来源 id);不传/无来源 → NULL */
+  sourceImportId?: number | null;
   entryIndex?: number | null; collectionTitle?: string | null; // 剧集信息:第几集 / 所属合集(单视频不传)
   /** D8：剪辑/导出产物传 'edit'；缺省 'download'（老下载路径不变——回归保护） */
   sourceType?: 'download' | 'edit';
@@ -32,6 +34,7 @@ export function ingestDownloadedFile(opts: {
   const audioId = opts.audioRepo.create({
     title: opts.title, source_type: opts.sourceType ?? 'download', source_url: opts.sourceUrl,
     entry_index: opts.entryIndex ?? null, collection_title: opts.collectionTitle ?? null,
+    source_import_id: opts.sourceImportId ?? null,
     file_path: opts.tmpPath, format: opts.format, duration_sec: opts.durationSec, file_size: opts.fileSize,
   });
   const id8 = String(audioId).padStart(8, '0').slice(-8);

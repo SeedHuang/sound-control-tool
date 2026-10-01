@@ -256,6 +256,7 @@ CREATE TABLE IF NOT EXISTS source_videos (
 
 - §2.1 FR-1.2（片段下载 `--download-sections`）——本切片的"时间区间"概念来源
 - §2.3 FR-3.2 / FR-3.5 / FR-3.7（裁剪、格式导出、`parent_id` 血缘）——本切片只做前两项的最小版，血缘留到 S5
+  > **注记（2026-10-01，spec `2026-10-01-audio-lineage.md`）**：血缘已于 2026-10-01 落地，实际用 `source_import_id → imported_sources.id`（指向**来源**，非 `parent_id`）。本行正文不改写（历史文档）。
 - §3.4 错误处理原则（stderr 捕获、临时名原子改名）
 - §3.5 文件命名与唯一性策略（slug、冲突序号）
 - §6.1 S2 / S5（本切片在路线图中的前后关系）
