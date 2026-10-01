@@ -44,7 +44,8 @@ export async function createServer(opts: CreateServerOpts): Promise<{
   let listening = false;
   let closed = false;
   try {
-    initSchema(db);
+    // 传 dbPath:迁移要在"真要重建"时先备份(备份的是同一文件);:memory: 会自行跳过
+    initSchema(db, { dbPath: opts.dbPath });
 
     // health 写副作用收口:启动时一次性写入内部键 health_stamp(不进 SETTINGS_KEYS 白名单,不暴露给 PUT /api/settings),
     // 请求时只读——避免每请求建表/写入(产生第六张表、无界增长)与存活判定耦合 DB 写(SQLITE_BUSY 会误判 server 未启动)

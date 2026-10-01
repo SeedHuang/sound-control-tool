@@ -289,10 +289,60 @@ function cleanOrphanProducts(db: DB): void {
     return row?.sql != null && /UNIQUE/i.test(row.sql);
   })();
   if (needRebuild) backupDbFile(opts?.dbPath);           // 备份失败也继续
-  try { rebuildClipProjectsForOneToMany(db); } catch (e) { pushLog('error', 'server', `作品表重建失败(不阻断启动): ${e instanceof Error ? e.message : String(e)}`); }
-  try { attachLegacyProductsToWorks(db); } catch (e) { pushLog('error', 'server', `老成品挂回失败(不阻断启动): ${e instanceof Error ? e.message : String(e)}`); }
-  cleanOrphanProducts(db);
+  if (needRebuild) {
+    // ★ ③④ 只在"本次真的重建了表"时执行(2026-10-01 实现期裁决,见 spec §0.3):
+    //   它们是老库一次性整理;更关键的是——新库里出现"无归属成品"是 bug 信号,不该被自动删
+    //   (那些行交给剪辑室的「无作品」安全网展示)。且既有测试(D8 纠偏 / Spec A 空串)造出的行
+    //   与"该删的老数据"形态完全相同,每次启动都清会误删它们。
+    try { runLegacyProductMigration(db); }
+    catch (e) { pushLog('error', 'server', `作品迁移失败(不阻断启动): ${e instanceof Error ? e.message : String(e)}`); }
+  }
 ```
+
+配套的三个函数（**行删除与重建同事务；文件删除在提交之后**）：
+
+```ts
+/** 判据：老库形态(clip_projects 还带 import_id UNIQUE)才需要重建。表不存在(全新库)→ false */
+function needsWorkTableRebuild(db: DB): boolean {
+  const row = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'clip_projects'").get() as
+    | { sql: string | null } | undefined;
+  return row?.sql != null && /UNIQUE/i.test(row.sql);
+}
+
+/** 重建作品表(去掉 import_id 的 UNIQUE)。**不含事务**——由调用方保证原子性。
+ *  保留 id:clip_segments.project_id 必须继续指得对。开头 DROP IF EXISTS 收拾上次崩溃的残表。 */
+function rebuildWorkTable(db: DB): void { /* Step 5 里那段 SQL，去掉 BEGIN/COMMIT */ }
+
+/** 老库一次性作品迁移:重建 → 挂回 → 清行,三件事**同一个事务**;返回待删的文件路径清单。
+ *  磁盘文件删除**不在这里**——IO 不可回滚,必须等提交之后单独做(失败只记日志)。 */
+function runLegacyProductMigration(db: DB): string[] {
+  const doomedFiles = inTransaction(db, () => {
+    rebuildWorkTable(db);
+    attachLegacyProductsToWorks(db);
+    const rows = db.prepare(
+      "SELECT id, file_path FROM audio_items WHERE source_type = 'edit' AND source_work_id IS NULL " +
+      "AND source_import_id IS NULL AND (source_url IS NULL OR source_url = '')",
+    ).all() as Array<{ id: number; file_path: string }>;
+    const del = db.prepare('DELETE FROM audio_items WHERE id = ?');
+    for (const r of rows) del.run(r.id);
+    return rows.map((r) => r.file_path);
+  });
+  deleteFilesBestEffort(doomedFiles);   // 提交之后
+  pushLog('info', 'server', `旧成品清理:删除 ${doomedFiles.length} 行,文件 ${doomedFiles.length} 个(逐个路径见下方 info 行)`);
+  return doomedFiles;
+}
+
+/** 逐个删文件:失败只记日志,绝不抛。**逐个路径按 info 级打印**(删的是用户的文件,事后要能查) */
+function deleteFilesBestEffort(paths: string[]): void {
+  for (const p of paths) {
+    pushLog('info', 'server', `旧成品清理:删除文件 ${p}`);
+    try { rmSync(p, { force: true }); }
+    catch (e) { pushLog('error', 'server', `旧成品清理:文件删除失败 ${p}: ${e instanceof Error ? e.message : String(e)}`); }
+  }
+}
+```
+
+⚠️ **两条测试必须按新规则重写**（实现期已实测会红）：`清理：只清…` 与 `老成品挂回…` 这两条用例，**必须先调用 `makeLegacy()` 造出"带 UNIQUE 的老表"**（否则不会触发重建 → ③④ 不执行 → 断言全落空）。`彻底无归属` 那条也必须插在 `makeLegacy()` 之后。
 
 - [ ] **Step 7: 实现 —— `index.ts` 传 dbPath**
 
@@ -459,8 +509,10 @@ Run: `pnpm --filter @sct/server test` → 把实际数字写进报告（预期�
 
 **Files:**
 - Modify: `server/src/media/project-routes.ts`（路由参数语义换成作品 id；新增 POST；DELETE 连带删成品；export 的 payload 与校验）
+- Modify: `server/src/db/repo/audio-items.ts`（**`AudioItemCreate` 加 `source_work_id?: number | null`、INSERT 的列清单与参数位同步**——成品仓库现在还不支持这一列，不补上这条链就走不通）
+- Modify: `server/src/ytdlp/ingest.ts`（`ingestDownloadedFile` 加 `sourceWorkId?: number | null` 入参并透传）
 - Modify: `server/src/media/ffmpeg-export.ts`（payload 加 `projectId`/`workName`；入库写 `source_work_id`；**入库前校验作品是否还在 = D22**）
-- Test: `server/src/media/project-routes.test.ts`、`server/src/media/ffmpeg-export.test.ts`
+- Test: `server/src/media/project-routes.test.ts`、`server/src/db/repo/audio-items.test.ts`、`server/src/ytdlp/ingest.test.ts`、`server/src/media/ffmpeg-export.test.ts`
 
 **Interfaces:**
 - Consumes: Task 2 的 repo 全部方法；`audio_items.source_work_id`（Task 1）；`deleteAudioFile`（既有 `server/src/audio-files.ts`）。

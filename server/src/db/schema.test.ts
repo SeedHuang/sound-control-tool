@@ -2,6 +2,9 @@
 // P4 T4：D8 历史纠偏（spec §0.4）。老库里错标成 'download' 的剪辑产物，在下次 initSchema 时被改成 'edit'。
 // 手法：先建库并插入"老数据"，再跑一次 initSchema（模拟升级启动）触发纠偏，然后断言四例。
 import { beforeEach, afterEach, describe, expect, it } from 'vitest';
+import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { openDatabase, type DB } from './index.js';
 import { initSchema } from './schema.js';
 import { createImportsRepo } from './repo/imports.js';
@@ -78,5 +81,104 @@ describe('initSchema 血缘回填（spec audio-lineage D5）', () => {
     initSchema(db);
     initSchema(db); // 再跑一次，仍不应变
     expect(importIdOf('已填')).toBe(999);
+  });
+});
+
+// 2026-10-01 spec clip-works §0.3：clip_projects 从 1:1 重建成 1:N（作品表），并把老成品挂回作品、清掉彻底无归属的
+type PInfo = { id: number; import_id: number; name: string | null };
+const tableSql = (t: string): string | null =>
+  (db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name = ?").get(t) as { sql: string | null } | undefined)?.sql ?? null;
+const workOf = (title: string): number | null =>
+  (db.prepare('SELECT source_work_id FROM audio_items WHERE title = ?').get(title) as { source_work_id: number | null }).source_work_id;
+
+describe('initSchema 作品表迁移（spec clip-works §0.3）', () => {
+  /** 造"老库"：先按旧结构建表（带 UNIQUE）插数据，再跑 initSchema —— 真正的升级路径 */
+  const makeLegacy = (): void => {
+    db.exec("DROP TABLE IF EXISTS clip_projects");
+    db.exec("CREATE TABLE clip_projects (id INTEGER PRIMARY KEY AUTOINCREMENT, import_id INTEGER NOT NULL UNIQUE, name TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT NOT NULL DEFAULT (datetime('now')))");
+    db.exec('CREATE TABLE IF NOT EXISTS clip_segments (id INTEGER PRIMARY KEY AUTOINCREMENT, project_id INTEGER NOT NULL, start_sec REAL NOT NULL, end_sec REAL NOT NULL, label TEXT, sort_order INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL DEFAULT (datetime(\'now\')))');
+  };
+  const addImport = (url: string, title: string): number =>
+    createImportsRepo(db).upsertByUrl({ url, title, site: 'bilibili', kind: 'single', duration_sec: null, entries: null });
+
+  it('老库(带 UNIQUE)升级 → 表不再有 UNIQUE，作品 id 与段数都不变', () => {
+    const imp = addImport('https://a/old', '老资料');
+    makeLegacy();
+    db.prepare('INSERT INTO clip_projects (id, import_id, name) VALUES (?, ?, ?)').run(77, imp, '老作品');
+    db.prepare('INSERT INTO clip_segments (project_id, start_sec, end_sec, sort_order) VALUES (?, ?, ?, ?)').run(77, 1, 2, 0);
+    db.prepare('INSERT INTO clip_segments (project_id, start_sec, end_sec, sort_order) VALUES (?, ?, ?, ?)').run(77, 3, 4, 1);
+
+    initSchema(db); // 升级启动
+
+    expect(tableSql('clip_projects')!.toUpperCase()).not.toContain('UNIQUE');
+    const row = db.prepare('SELECT id, import_id, name FROM clip_projects WHERE id = 77').get() as PInfo;
+    expect(row).toEqual({ id: 77, import_id: imp, name: '老作品' });
+    expect((db.prepare('SELECT COUNT(*) AS c FROM clip_segments WHERE project_id = 77').get() as { c: number }).c).toBe(2);
+    // 新建第二个作品不再被约束挡住
+    expect(() => db.prepare('INSERT INTO clip_projects (import_id, name) VALUES (?, ?)').run(imp, '第二个')).not.toThrow();
+  });
+
+  it('同一个资料能建两个作品（旧结构会被 UNIQUE 挡下）', () => {
+    const imp = addImport('https://a/two', '资料二');
+    expect(() => {
+      db.prepare('INSERT INTO clip_projects (import_id, name) VALUES (?, ?)').run(imp, '作品甲');
+      db.prepare('INSERT INTO clip_projects (import_id, name) VALUES (?, ?)').run(imp, '作品乙');
+    }).not.toThrow();
+    expect((db.prepare('SELECT COUNT(*) AS c FROM clip_projects WHERE import_id = ?').get(imp) as { c: number }).c).toBe(2);
+  });
+
+  it('老成品挂回它所属的唯一作品（避免"有来源却无作品"→ 在新作品墙里看不见）', () => {
+    const imp = addImport('https://a/back', '待挂回资料');
+    makeLegacy(); // 必须先造成老库(带 UNIQUE):③④ 只在"本次真的重建了表"时执行,否则挂回不会跑、断言落空
+    db.prepare('INSERT INTO clip_projects (import_id, name) VALUES (?, ?)').run(imp, '唯一作品');
+    const wid = (db.prepare('SELECT id FROM clip_projects WHERE import_id = ?').get(imp) as { id: number }).id;
+    db.prepare('INSERT INTO audio_items (title, source_type, source_url, file_path, format) VALUES (?, ?, ?, ?, ?)')
+      .run('老剪辑产物', 'edit', 'https://a/back', 'bk-1.mp3', 'mp3'); // source_url 命中 → Spec A 回填会给 source_import_id
+
+    initSchema(db);
+
+    expect(workOf('老剪辑产物')).toBe(wid);
+  });
+
+  it('清理：只清"edit + 无作品 + 无来源 + source_url 空"的行；有来源线索的一律保留', () => {
+    makeLegacy(); // 必须先造成老库(带 UNIQUE):③④ 只在"本次真的重建了表"时执行,否则清理不会跑、断言落空
+    db.prepare('INSERT INTO audio_items (title, source_type, source_url, file_path, format) VALUES (?, ?, ?, ?, ?)')
+      .run('彻底无归属', 'edit', '', 'bk-2.mp3', 'mp3');
+    db.prepare('INSERT INTO audio_items (title, source_type, source_url, file_path, format) VALUES (?, ?, ?, ?, ?)')
+      .run('有网址但来源已删', 'edit', 'https://nowhere/x', 'bk-3.mp3', 'mp3');
+    db.prepare('INSERT INTO audio_items (title, source_type, source_url, file_path, format) VALUES (?, ?, ?, ?, ?)')
+      .run('老下载音频', 'download', 'https://a/back', 'bk-4.mp3', 'mp3');
+
+    initSchema(db);
+
+    const left = (db.prepare('SELECT title FROM audio_items').all() as Array<{ title: string }>).map((r) => r.title);
+    expect(left).not.toContain('彻底无归属');   // 被清
+    expect(left).toContain('有网址但来源已删'); // 不在授权范围内 → 保留
+    expect(left).toContain('老下载音频');       // 不是 edit → 保留
+  });
+
+  it('幂等 + 备份只做一次：连跑两次 initSchema，表结构不再变、不重复建 .bak', () => {
+    const imp = addImport('https://a/idem', '幂等资料');
+    db.prepare('INSERT INTO clip_projects (import_id, name) VALUES (?, ?)').run(imp, '作品');
+    initSchema(db);
+    const sql1 = tableSql('clip_projects');
+    initSchema(db);
+    expect(tableSql('clip_projects')).toBe(sql1);
+  });
+
+  it('真要重建时生成 .bak；第二次启动不再生成（幂等）', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'sct-mig-'));
+    const dbPath = join(dir, 'sct.db');
+    const d1 = openDatabase(dbPath);
+    initSchema(d1);                       // 首次建库（新结构，不需要重建）
+    d1.exec("DROP TABLE IF EXISTS clip_projects");
+    d1.exec("CREATE TABLE clip_projects (id INTEGER PRIMARY KEY AUTOINCREMENT, import_id INTEGER NOT NULL UNIQUE, name TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT NOT NULL DEFAULT (datetime('now')))");
+    initSchema(d1, { dbPath });            // 触发重建 → 备份
+    const baks1 = readdirSync(dir).filter((f) => f.startsWith('sct.db.bak-'));
+    expect(baks1).toHaveLength(1);
+    initSchema(d1, { dbPath });            // 已重建 → 不再备份
+    expect(readdirSync(dir).filter((f) => f.startsWith('sct.db.bak-'))).toHaveLength(1);
+    d1.close();
+    rmSync(dir, { recursive: true, force: true });
   });
 });
