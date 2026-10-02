@@ -14,6 +14,8 @@ export interface WorkSummaryRow {
   first_segment: { start_sec: number; end_sec: number } | null;
   /** 最新一条成品的 id(hover 预览"只有音频的卡"要播它);没有成品 → null */
   latest_product_id: number | null;
+  /** 2026-10-02 spec video-export(N1 T4):最新一条成品的类型(前端按它分流 <audio>/<video> 预览);没有成品 → null */
+  latest_product_kind: 'audio' | 'video' | null;
   source: { title: string; site: string; kind: string; has_video: boolean } | null; // null = 资料已删
 }
 export interface WorkDetailRow { id: number; import_id: number; name: string | null; updated_at: string; segments: ClipSegmentRow[] }
@@ -78,7 +80,10 @@ export function createClipProjectsRepo(db: DB) {
       '(SELECT COUNT(*) FROM clip_segments s WHERE s.project_id = p.id) AS segment_count, ' +
       "(SELECT COALESCE(SUM(s.end_sec - s.start_sec), 0) FROM clip_segments s WHERE s.project_id = p.id) AS total_sec, " +
       '(SELECT COUNT(*) FROM audio_items a WHERE a.source_work_id = p.id) AS product_count, ' +
-      '(SELECT a.id FROM audio_items a WHERE a.source_work_id = p.id ORDER BY a.created_at DESC, a.id DESC LIMIT 1) AS latest_product_id ' +
+      '(SELECT a.id FROM audio_items a WHERE a.source_work_id = p.id ORDER BY a.created_at DESC, a.id DESC LIMIT 1) AS latest_product_id, ' +
+      // N1 T4(spec video-export):最新成品的 media_kind。与上一子查询同形状——排序键含唯一的 id,二者必命中同一行;
+      // 仍在同一条 SQL 里补一列,不多跑查询(本 repo 注释约定:可读优先,不拼难读的大 JOIN)
+      '(SELECT a.media_kind FROM audio_items a WHERE a.source_work_id = p.id ORDER BY a.created_at DESC, a.id DESC LIMIT 1) AS latest_product_kind ' +
       'FROM clip_projects p ORDER BY p.updated_at DESC, p.id DESC',
     ).all() as Array<Record<string, unknown>>;
     const firstSeg = db.prepare(
@@ -98,6 +103,8 @@ export function createClipProjectsRepo(db: DB) {
         total_sec: Number(r.total_sec ?? 0),
         first_segment: fs === undefined ? null : { start_sec: Number(fs.start_sec), end_sec: Number(fs.end_sec) },
         latest_product_id: r.latest_product_id === null || r.latest_product_id === undefined ? null : Number(r.latest_product_id),
+        // media_kind 列有 CHECK('audio','video')+NOT NULL DEFAULT 'audio',值域封闭;无成品时子查询落 NULL → null(与 id 的 null 同步)
+        latest_product_kind: r.latest_product_kind === 'video' ? 'video' : r.latest_product_kind === 'audio' ? 'audio' : null,
         source: src === null ? null : { title: src.title, site: src.site, kind: src.kind, has_video: src.has_video },
       };
     });

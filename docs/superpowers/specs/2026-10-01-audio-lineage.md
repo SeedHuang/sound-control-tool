@@ -2,6 +2,7 @@
 
 > 来源：2026-10-01 上一 session 讨论定稿；本 session 四个开放问题由用户逐条裁决（1 采纳 / 2 先 A 后 B / 3 指向来源 / 4 归一不做）
 > 关系：**改既有链路**——`audio_items` 加一列、三条入库路径写它、剪辑室（`/studio`）归并键从 URL 字符串换成它
+> **被 2026-10-01 Spec C（clip-works）部分取代**：剪辑室卡片单元从「资料」改成「作品」、成品加挂 `source_work_id`（挂作品 + 仍写资料）、「源已删除」卡被作品卡「资料已删除」标签取代、`source_import_id` 不再是剪辑室归并键（列与三条写入路径仍有效）——见 `docs/superpowers/specs/2026-10-01-clip-works.md` §0.9（落地计划见 `docs/superpowers/plans/2026-10-01-clip-works.md`）
 > 状态：**待用户过目** → 过目后进入 writing-plans
 
 ---

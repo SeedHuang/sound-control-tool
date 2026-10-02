@@ -22,6 +22,22 @@ export class ApiError extends Error {
   constructor(message: string, public code?: string, public status?: number) { super(message); }
 }
 
+/** 失败响应 → ApiError(apiPost / apiPut 共用,2026-10-02 从两处逐字相同的块里抽出来)。
+ *  做三件事,顺序不能换:① 解析后端 `{ error: { code, message, next } }`(非 JSON/HTML 错误页也要兜住,不能抛裸 SyntaxError)
+ *  ② 把 `error.next`——「下一步怎么办」的指引(spec §0.5)——拼进展示消息;③ 记一条前端日志后抛。
+ *  为什么要抽:两处原本各自用 `??` 短路(只在 message 缺失时才拼 next),而 POST/PUT 的每一条业务错误都恒带 message
+ *  → next 一次都到不了用户(2026-10-02 修)。同一段拼接过一次错就该只留一份,不然下次改一处忘了另一处。
+ *  !base.includes 防同一句被拼两遍;空 next 不加「（）」尾巴;code 传给调用方按业务分支(CONFLICT → 覆盖确认弹窗)。 */
+async function throwApiError(res: Response, path: string): Promise<never> {
+  const j = (await res.json().catch(() => null)) as { error?: { code?: string; message?: string; next?: string } } | null;
+  const errBody = j?.error;
+  const base = errBody?.message ?? `请求失败 ${res.status}:${path}`;
+  const next = typeof errBody?.next === 'string' && errBody.next.trim() !== '' && !base.includes(errBody.next) ? errBody.next : '';
+  const msg = next === '' ? base : `${base}（${next}）`;
+  logFe('error', `请求失败 ${path}: ${msg}`); // 诊断日志:业务错误(400/409)也进前端面板
+  throw new ApiError(msg, errBody?.code, res.status); // 追加真实状态码(纯加字段,调用方可不看)
+}
+
 // ---- 诊断日志(2026-09-29 用户反馈:一个按钮看前后端日志) ----
 // 前端环形缓冲(容量 200,丢最旧):api.ts 是唯一埋点点位,页面组件不感知。
 export interface LogRow { ts: string; level: 'debug' | 'info' | 'error'; source: string; message: string }
@@ -108,20 +124,8 @@ export async function apiPost<T>(path: string, body: unknown): Promise<T> {
   const timer = setTimeout(() => ctl.abort(), 10_000);
   try {
     const res = await fetch(`${API_BASE}${path}`, { method: 'POST', headers, body: JSON.stringify(body), signal: ctl.signal });
-    if (!res.ok) {
-      const j = (await res.json().catch(() => null)) as { error?: { code?: string; message?: string; next?: string } } | null;
-      // 后端 error.next 是「下一步怎么办」的指引(spec §0.5)。原实现用 `??` 短路——只在 message 缺失时才拼 next,
-      // 但 POST 的每一条业务错误都恒带 message(如 POST /api/projects 的三条前置校验)→ next 一次都到不了用户。
-      // 与 apiPut 同一套写法(message 非空也追加 next;!base.includes 防同一句拼两遍;空 next 不加尾巴)。
-      // 影响面:apiPost 是共享层,所有 POST 调用点的失败消息都会多出这个「（…）」尾巴——这是有意改善(多给一步指引)。
-      const errBody = j?.error;
-      const base = errBody?.message ?? `请求失败 ${res.status}:${path}`;
-      const next = typeof errBody?.next === 'string' && errBody.next.trim() !== '' && !base.includes(errBody.next) ? errBody.next : '';
-      const msg = next === '' ? base : `${base}（${next}）`;
-      logFe('error', `请求失败 ${path}: ${msg}`); // 诊断日志:业务错误(400/409)也进前端面板
-      // code 要带上:调用方按 code 分支(如 DUPLICATE → 弹「重新下载并替换」确认,2026-09-29)
-      throw new ApiError(msg, errBody?.code, res.status); // 追加真实状态码(纯加字段,调用方可不看)
-    }
+    // 业务错误(400/409)的解析、next 拼接、logFe、抛 ApiError 全在 throwApiError 里(与 apiPut 共用一份)
+    if (!res.ok) await throwApiError(res, path);
     return (await res.json()) as T;
   } finally { clearTimeout(timer); }
 }
@@ -216,6 +220,7 @@ export interface WorkSummaryDTO {
   first_segment: { start_sec: number; end_sec: number } | null;
   source: { title: string; site: string; kind: string; has_video: boolean } | null; // null = 资料已删
   latest_product_id: number | null; // 最新一条成品的 id(hover 预览"只有音频的卡"要播它);没有成品 → null
+  latest_product_kind: 'audio' | 'video' | null; // 最新一条成品的类型(逐字对齐 server WorkSummaryRow,2026-10-02 N1 T4):hover 预览按它分流 <audio>/<video>;没有成品 → null
 }
 export interface WorkDetailDTO { id: number; import_id: number; name: string | null; updated_at: string; segments: ClipSegmentDTO[] }
 
@@ -253,9 +258,11 @@ export function deleteWork(projectId: number): Promise<{ ok: boolean; deleted: n
   logFe('info', `deleteWork project=${projectId}`);
   return apiDelete<{ ok: boolean; deleted: number; deleted_products: number }>(`/api/projects/${projectId}`);
 }
-/** 导出：segments 必传（D15，以请求体为准，不读 DB 作品、不自动保存）；起 job + 走 SSE 订阅进度 */
-export function exportWork(projectId: number, body: { mode: 'separate' | 'merge'; format: 'mp3' | 'm4a' | 'wav'; quality?: string; segments: { start_sec: number; end_sec: number; label?: string | null }[] }): Promise<{ ok: boolean; jobId: number }> {
-  logFe('info', `exportWork project=${projectId} mode=${body.mode} 段数=${body.segments.length}`);
+/** 导出：segments 必传（D15，以请求体为准，不读 DB 作品、不自动保存）；起 job + 走 SSE 订阅进度。
+ *  2026-10-02 N1(spec video-export):导出内容三选 → mediaKind('audio' 缺省/'video')+ videoAn(纯视频,仅 video 有意义);
+ *  format 联合随之加 'mp4'(video 分支固定传,服务端校验 video 必为 mp4)。老调用不传 mediaKind → 服务端按 audio,零回归。 */
+export function exportWork(projectId: number, body: { mode: 'separate' | 'merge'; format: 'mp3' | 'm4a' | 'wav' | 'mp4'; mediaKind?: 'audio' | 'video'; videoAn?: boolean; quality?: string; segments: { start_sec: number; end_sec: number; label?: string | null }[] }): Promise<{ ok: boolean; jobId: number }> {
+  logFe('info', `exportWork project=${projectId} mode=${body.mode} format=${body.format} mediaKind=${body.mediaKind ?? 'audio'}${body.mediaKind === 'video' ? ` videoAn=${body.videoAn === true}` : ''} 段数=${body.segments.length}`);
   return apiPost<{ ok: boolean; jobId: number }>(`/api/projects/${projectId}/export`, body);
 }
 /** 某作品的成品列表（spec D17：GET /api/audio?project=<作品id> → 裸数组；过滤落在服务端）。
@@ -275,8 +282,9 @@ export async function setPreviewMuted(muted: boolean): Promise<void> {
 }
 
 // ---- 首页仪表盘(P5-T2,spec §0.3「其它」):GET /api/home → 两块 Top3 ----
-// 形状逐字对齐后端 server/src/db/repo/home.ts 的 HomeEditingRow / HomeRecentRow(editing 复用作品列表形状)
-export interface HomeEditingRow { import_id: number; name: string | null; site: string; updated_at: string; segment_count: number }
+// 形状逐字对齐后端 server/src/db/repo/home.ts 的 HomeEditingRow / HomeRecentRow。
+// 注意:editing 的作品 id 字段叫 project_id(渲染子集),与 /api/projects 的 WorkSummaryRow 用 `id` 不同名——别混用。
+export interface HomeEditingRow { import_id: number; project_id: number; name: string | null; site: string; updated_at: string; segment_count: number }
 export interface HomeRecentRow { import_id: number; title: string; site: string; latest_audio_id: number; created_at: string }
 export interface HomeData { editing: HomeEditingRow[]; recent: HomeRecentRow[] }
 
@@ -319,8 +327,12 @@ export interface AudioRow {
   site: string;                   // 平台标识(bilibili/youtube/other,后端由 source_url 反查)→ 剪辑室显示 logo
   entry_index: number | null;     // 合集第几集;单视频/录制 → null
   collection_title: string | null; // 所属合集标题;非合集 → null
-  source_import_id: number | null; // 2026-10-01 spec audio-lineage D1:来源 id(无来源 → null);剪辑室按它归并
+  source_import_id: number | null; // 2026-10-01 spec audio-lineage D1:来源 id(无来源 → null);血缘/展示字段(剪辑室已按作品分卡,不再按它归并 —— spec clip-works)
   source_work_id: number | null;   // 2026-10-01 spec clip-works D4:成品归属的作品 id(指向 clip_projects.id);非成品 → null
+  // 2026-10-02 N1(spec video-export):成品类型与分辨率。**可选** = 老服务端混跑兜底(字段缺失时使用处按 (p.media_kind ?? 'audio') 兜,spec D5.5)
+  media_kind?: 'audio' | 'video';  // 展示层分流 <audio>/<video> 的唯一依据
+  width?: number | null;           // 视频宽(像素);音频/未知 → null
+  height?: number | null;          // 视频高(像素) → 成品行分辨率徽标(如 2160p)
 }
 
 export function audioFileUrl(id: number): string {
@@ -341,17 +353,20 @@ export function coverUrl(importId: number): string {
   return `${API_BASE}/api/imports/${importId}/cover?token=${encodeURIComponent(token ?? '')}`;
 }
 
-/** done 事件联合类型(spec m1c-video-clip):audio=进剪辑室(下载与剪辑共用;旧下载事件无 kind 字段 → 按缺省 audio 读);
- *  video=视频素材就位(importId 即来源 id,拿它拼 /api/media/:id/file 流地址;fileSize 为素材字节数) */
+/** done 事件联合类型(spec m1c-video-clip + 2026-10-02 N1):audio=音频成品就位(下载/剪辑/导出共用;旧事件无 kind 字段 → 按缺省 audio 读);
+ *  video 有**两个来源**,字段不重叠 → 合并一个变体,除 kind/title 外全部可选:
+ *   · 素材下载完成(m1c):importId 即来源 id,拿它拼 /api/media/:id/file 流地址;fileSize 为素材字节数
+ *   · 视频**导出**完成(N1 T3,服务端 ffmpeg-export.ts):audioId 字段名刻意沿用 = 成品行 id(不破坏读法),format 恒 'mp4',
+ *     count 语义同音频(separate=段数,merge=1)→ studio-detail 的文案判据 `typeof d.count === 'number'` 在整个 union 上可直接取 */
 export type DoneEvent =
   // count:P4 一次导出多条（separate 模式）时的条数（plan C-2）;单条导出/下载不返回该字段
   | { kind?: 'audio'; audioId: number; title: string; format: string; replaced?: boolean; count?: number }
-  | { kind: 'video'; importId: number; title: string; filePath: string; height: number | null; fileSize: number };
+  | { kind: 'video'; title: string; importId?: number; filePath?: string; height?: number | null; fileSize?: number; audioId?: number; format?: string; replaced?: boolean; count?: number };
 
 export function subscribeJob(jobId: number, handlers: {
   onProgress?: (p: { percent: number }) => void;
   onPhase?: (p: { phase: 'ingest' }) => void; // 阶段信号(2026-09-29):下载进程结束、开始入库 → 进度条切第二段
-  onDone?: (d: DoneEvent) => void; // replaced:本次是覆盖下载(旧的那份已删);kind==='video' 为视频素材分支
+  onDone?: (d: DoneEvent) => void; // replaced:本次是覆盖下载(旧的那份已删);kind==='video' = 素材下载完成(importId)或视频导出完成(audioId,N1)
   onStatus?: (s: { state: string; message?: string }) => void;
   onError?: (msg: string) => void;
 }): () => void {
@@ -390,20 +405,9 @@ export async function apiPut<T>(path: string, body: unknown): Promise<T> {
   const token = apiToken();
   if (token) headers['x-sct-token'] = token;
   const res = await fetch(`${API_BASE}${path}`, { method: 'PUT', headers, body: JSON.stringify(body) });
-  if (!res.ok) {
-    const j = (await res.json().catch(() => null)) as { error?: { code?: string; message?: string; next?: string } } | null;
-    // 后端 error.next 是「下一步怎么办」的指引(spec §0.5)。原实现只在 message 缺失时才拼 next,
-    // 但 PUT /api/settings 的 400 恒带 message → next 永远到不了用户(只看到前半句)。
-    // 改为 message 非空时也把 next 追加进展示消息;!base.includes 防同一句被拼两遍。
-    // 注意:apiPut 是共享代码(saveCookie / putWork 也走它),它们的失败消息也会多出这个「（…）」尾巴——
-    // 这是有意改善(多给一步指引),不要去改那两处调用逻辑。code 参数保持原样不动。
-    const body = j?.error;
-    const base = body?.message ?? `请求失败 ${res.status}:${path}`;
-    const next = typeof body?.next === 'string' && body.next.trim() !== '' && !base.includes(body.next) ? body.next : '';
-    const msg = next === '' ? base : `${base}（${next}）`;
-    logFe('error', `请求失败 ${path}: ${msg}`); // 诊断日志:业务错误(400/409)也进前端面板
-    throw new ApiError(msg, j?.error?.code, res.status); // 追加真实状态码(纯加字段,调用方可不看)
-  }
+  // 业务错误的解析、next 拼接、logFe、抛 ApiError 全在 throwApiError 里(与 apiPost 共用一份)。
+  // 注意:apiPut 无超时控制(没有 AbortController),apiPost 有——这是既有差异,本次不动。
+  if (!res.ok) await throwApiError(res, path);
   return (await res.json()) as T;
 }
 
@@ -434,7 +438,8 @@ export async function saveCookie(content: string, force = false): Promise<Cookie
 }
 
 // ---- 音频删除(2026-09-29 用户拍板):audio list 每行删除按钮 → DELETE /api/audio/:id ----
-/** DELETE 语义:无 body(与 apiPut/apiPost 共用 ApiError + logFe) */
+/** DELETE 语义:无 body;错误处理与 apiPost/apiPut 同款(throwApiError:解析 error.next 拼进展示消息、code/状态码上抛)。
+ *  注意:apiDelete 保留自己的 10s AbortController 超时,apiPut 没有——既有差异,不动(T8,2026-10-02 统一错误块)。 */
 export async function apiDelete<T>(path: string): Promise<T> {
   const headers: Record<string, string> = {};
   const token = apiToken();
@@ -443,12 +448,8 @@ export async function apiDelete<T>(path: string): Promise<T> {
   const timer = setTimeout(() => ctl.abort(), 10_000);
   try {
     const res = await fetch(`${API_BASE}${path}`, { method: 'DELETE', headers, signal: ctl.signal });
-    if (!res.ok) {
-      const j = (await res.json().catch(() => null)) as { error?: { message?: string; next?: string } } | null;
-      const msg = j?.error?.message ?? `请求失败 ${res.status}:${path}${j?.error?.next ? `。${j.error.next}` : ''}`;
-      logFe('error', `请求失败 ${path}: ${msg}`);
-      throw new ApiError(msg, undefined, res.status); // 追加真实状态码(纯加字段,调用方可不看)
-    }
+    // 业务错误的解析、next 拼接、logFe、抛 ApiError 全在 throwApiError 里(与 apiPost/apiPut 共用一份)
+    if (!res.ok) await throwApiError(res, path);
     return (await res.json()) as T;
   } finally { clearTimeout(timer); }
 }

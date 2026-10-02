@@ -132,8 +132,9 @@ export async function createServer(opts: CreateServerOpts): Promise<{
             });
         }),
       markCancelled: (jobId) => {
-        // 取消排队中的任务:置 cancelled 即可(它没起进程,无需清产物)
-        jobsRepoForQueue.update(jobId, { status: 'cancelled' });
+        // 取消排队中的任务:置 cancelled 即可(它没起进程,无需清产物);message 与运行中取消同款——
+        // 补发分支和历史列表里的取消原因保持一致,不该是空(H1,2026-10-01)
+        jobsRepoForQueue.update(jobId, { status: 'cancelled', message: '用户取消' });
         // 修复轮 1（审查 Critical 1）：该 job 创建时已 note('pending')（total+1），取消是它的终态——
         // 必须补终态打点，否则 done 永不 +1；旧内部计数器还会让 queued 永不回落 → 后续再也不开新批、托盘分数永久冻结。
         const job = jobsRepoForQueue.get(jobId);
@@ -169,7 +170,7 @@ export async function createServer(opts: CreateServerOpts): Promise<{
       db, audioDir, binProvider: ytdlpBinProvider,
       cookiePath: () => resolveCookiePath(db, audioDir),
     });
-    // 剪辑工程 CRUD（P4，spec §0.3）：放在媒体路由之后，onRequest 守卫统一保护（无豁免——它只被 fetch 调用，能带 header）
+    // 剪辑作品 CRUD（P4，spec §0.3；旧称"剪辑工程"，2026-10-01 spec clip-works D3 统一叫作品）：放在媒体路由之后，onRequest 守卫统一保护（无豁免——它只被 fetch 调用，能带 header）
     registerProjectRoutes(app, { db, audioDir, tempDir: opts.tempDir, token });
     // 首页仪表盘(P5-T1,spec §0.3「其它」):GET /api/home 两块 Top3(正在编辑 / 最近下载)。
     // 放 project 路由之后;走普通 fetch(带 header)→ 无守卫豁免。HTTP 摘要由 onResponse 钩子自动落。

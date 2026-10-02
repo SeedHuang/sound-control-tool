@@ -32,8 +32,11 @@ import { hasDesktopBridge } from '@/desktop';
 import { openExportDir } from '@/export-dir';
 
 const IMG_W = 1600;   // 派生图固定宽（D14，服务端按 1600 生成）；此处只当 ResizeObserver 还没量到宽时的兜底
-const WAVE_H = 120;   // 波形图高（D14）
-const FILM_H = 90;    // 胶片条高（D14）
+// ⚠️ 下面两个是**原图像素高**（服务端固定 1600×120 / 1600×90，见 server/src/ffmpeg/derived-args.ts），
+//   **不再直接当显示高用**。页面上的显示高按容器宽等比算（见 filmH / waveH），否则宽高比会被强行改变。
+const WAVE_H = 120;   // 波形原图高（D14）
+const FILM_H = 90;    // 胶片条原图高（D14）
+const RULER_H = 20;   // 时间尺行高（段区块与播放头都要给它让位）
 const MAX_SEGMENTS = 50; // 段数上限（与服务端校验一致，D18）；超了就不给打点，免得保存时才被拒
 
 /** 编辑期段（未保存）：只有起止与标签，无 id / sort_order —— 保存时按数组顺序定 sort_order（T6） */
@@ -72,6 +75,9 @@ export default function StudioDetailPage() {
   const [saveMsg, setSaveMsg] = useState<string | null>(null);
   const [exportMode, setExportMode] = useState<'separate' | 'merge'>('separate');
   const [exportFormat, setExportFormat] = useState<'mp3' | 'm4a' | 'wav'>('mp3');
+  // 导出内容三选(2026-10-02 N1 spec D5.1):audio=现状音频;video=视频带音轨;videoAn=视频纯视频。缺省 audio = 音频老路径零回归。
+  // exportFormat 刻意是独立 state:切到视频时格式 Radio 隐藏(服务端固定 mp4),切回音频恢复且**保留上次选中值**(不重置)
+  const [exportKind, setExportKind] = useState<'audio' | 'video' | 'videoAn'>('audio');
   const [exportPercent, setExportPercent] = useState(0); // job 的 progress 百分比（导出进度条）
   const [exportMsg, setExportMsg] = useState<string | null>(null);
   const [exporting, setExporting] = useState(false);
@@ -90,6 +96,14 @@ export default function StudioDetailPage() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const trackRef = useRef<HTMLDivElement | null>(null);
   const [trackW, setTrackW] = useState(IMG_W);
+  // —— 派生图(胶片条/波形)加载态(W3/N0 复核遗留,2026-10-02 deferred 批)——
+  // 服务端对大素材(如 2.1GB)现生成派生图要 ~50s,期间两张 <img> 是空轨道,用户不知道在等什么。
+  // 各一个布尔:onLoad 置 true;onError 也置 true(失败 = 有结论,提示消失,错误走既有 logFe,不造第二套错误 UI)。
+  // 不做骨架屏:轨道高度已由等比布局预留,只补一行小字。
+  // 选「各自一个布尔再合成 derivedLoading」而非对象 state:两张图独立加载、各写各的,少一层整体替换写法。
+  const [filmReady, setFilmReady] = useState(false);
+  const [waveReady, setWaveReady] = useState(false);
+  const derivedLoading = !filmReady || !waveReady; // 任一没结论就提示
   // 过期响应丢弃（修复轮 1，Important 3）：换作品 id 时组件**不会**重挂载，effect 只是带着新 id 重跑，
   // 旧请求还在飞。若不丢弃，「作品 1 慢、作品 2 快」时作品 1 的响应后到，会把作品 1 的段与名字盖到作品 2 的页面上
   // （标题还是 作品 #2，肉眼看不出异常），用户一保存就把作品 1 的内容写进了作品 2 —— 静默写错数据。
@@ -228,19 +242,27 @@ export default function StudioDetailPage() {
   };
 
   // 导出 = 以**当前界面上的段**为准（D15：不读 DB 作品、不自动保存）；进度走 SSE，终态只发一次 done（C-2）。
+  // N1(spec D5.2):导出内容按 exportKind 透传——音频走既有 mp3/m4a/wav;视频恒 mp4(mediaKind='video',videoAn 标记纯视频)
   const doExport = async (): Promise<void> => {
     if (segments.length === 0) { setExportMsg('先添加至少一个剪辑段'); return; }
     setExporting(true); setExportPercent(0); setExportMsg(null);
     try {
-      const { jobId } = await exportWork(projectId, { mode: exportMode, format: exportFormat, segments });
+      const { jobId } = await exportWork(projectId, {
+        mode: exportMode,
+        format: exportKind === 'audio' ? exportFormat : 'mp4',
+        mediaKind: exportKind === 'audio' ? 'audio' : 'video',
+        videoAn: exportKind === 'videoAn',
+        segments,
+      });
       // subscribeJob 在 status=error/cancelled 时也会回调 onError 兜底，故 onStatus 与 onError 都可能触发；
       //   两处都 off() 关流——重复 close 一个 EventSource 是幂等的，无害。
       const off = subscribeJob(jobId, {
         onProgress: (p) => setExportPercent(Math.round(p.percent)),
         onDone: (d) => {
           off(); setExporting(false);
-          // C-2：separate 多段时终态只发一次 done，带 count → 提示「N 段」，否则笼统提示
-          const n = d.kind === 'audio' && typeof d.count === 'number' ? d.count : null;
+          // C-2：separate 多段时终态只发一次 done，带 count → 提示「N 段」，否则笼统提示。
+          // N1(spec D5.2):视频导出的 done 也带 count(字段名 audioId 保留 = 成品行 id)→ 判据只看 count,kind 无关
+          const n = typeof d.count === 'number' ? d.count : null;
           // D13：主文案只说段数，不提「剪辑室」——那是下面那句固定说明的措辞，主文案若也提会与之重复、拗口
           setExportMsg(n !== null ? `已导出 ${n} 段` : '已导出');
           // 成品明细是**这一页**的产出，出口在这里（作品墙不再承担试听/单条删除，D14/D16）→ 导出完立刻重拉，
@@ -344,6 +366,17 @@ export default function StudioDetailPage() {
   }, [importId, projectId]);
 
   // 时间轴容器宽度：图被 CSS 拉伸到容器宽，点击换算要用**容器**像素宽（写死 1600 在窄窗会失准）
+  // ⚠️ 依赖里必须有 videoErrCode（2026-10-02 审查 Important）：轨道这整块的渲染条件是
+  //   `info !== null && info.has_video && videoErrCode === null && importId !== null`（见下方时间轴 JSX）。
+  //   视频加载失败 → 整块**卸载**（trackRef 变 null）；点「重试加载」→ videoErrCode 归 null → 整块**重新挂载**（新 DOM 节点）。
+  //   依赖只有 [info] 时这条路上 effect 不会重跑，ro 从头到尾没挂到新节点上 → trackW 冻结在兜底的 IMG_W(1600)
+  //   → filmH/waveH 退回 round(1600×90/1600)=90 与 120，**正好是 N2-b 修复前那两个旧常量**：
+  //   宽高比修复静默失效、图上重新冒黑边，而且此后拖窗口宽度也不再更新。
+  // 为什么不必再加别的（推演过轨道的每一个挂载/卸载条件）：
+  //   · info —— 已覆盖 has_video 的来源（两者来自同一份 info 对象）。
+  //   · importId / work —— 变了只是换掉两张图的 URL，React 按位置**复用同一个 DOM 节点**，
+  //     被 ResizeObserver 观察的元素没变、它的宽度也没变，量宽器不需要重挂（早退分支 el===null 也不会因它们触发）。
+  //   · duration —— 轨道外壳与它无关（只影响刻度/段区块/播放头，不影响挂不挂）。
   useEffect(() => {
     const el = trackRef.current;
     if (el === null) return undefined;
@@ -351,7 +384,7 @@ export default function StudioDetailPage() {
     ro.observe(el);
     setTrackW(el.clientWidth || IMG_W);
     return () => ro.disconnect();
-  }, [info]);
+  }, [info, videoErrCode]);
 
   const seek = (t: number): void => {
     const v = videoRef.current;
@@ -419,6 +452,80 @@ export default function StudioDetailPage() {
     window.addEventListener('pointerup', up);
   };
 
+  // —— 拖动定位（2026-10-02 N2-c）：时间轴上**三块区域各归谁**，实现时必须分区清楚、互不抢事件 ——
+  //   ① 段区块左右各 8px 拖柄 → **拖边微调**（dragEdge）。它在 pointerdown 里已 stopPropagation，
+  //      事件压根不冒到轨道层 → 拖边时永远不会误触发定位。
+  //   ② 其余全部（时间尺 / 画轨 / 音轨 / 段区块**中部**）→ **拖动定位**：按下即 seek，拖动过程持续 seek（跟手）。
+  //   ③ 段区块中部的 click → **选中该段**（既有行为，保留不动）。
+  // ②③ 能共存：定位走 pointerdown、选中走 click，是两个不同的事件，一个手势同时满足两条，互不干扰。
+  // 为什么不再挂在"点击定位层"的 onClick 上（旧实现，用户反馈的「滑动不顺」就出在这）：
+  //   onClick 只在**松手时**触发一次 —— 拖动过程零反馈；而且按住拖完松手还会**再补跳一次**到松手处（误跳）。
+  // 现在定位只发生在 pointerdown/pointermove，松手不再触发任何 seek → 误跳从根上不存在了。
+  // ⚠️ 这里**故意不调** e.preventDefault()。**理由不是「它会抑制 click」** —— 2026-10-02 审查 Minor 6 核过规范：
+  //   Pointer Events Level 2 §10.1 只保证被取消的 pointerdown 会抑制 mousedown/mouseover/mousemove/mouseup
+  //   这一类**兼容鼠标事件**，click / auxclick / contextmenu 并不在其列（Level 3 还专门有一节澄清三者的关系），
+  //   所以真调了它，③「点段选中」大概率照样点得出来。真正的理由是：**这一层不需要靠 preventDefault 做事** ——
+  //   拖动时的防选中已分别由轨道层的 userSelect:'none'（别选中刻度文字）和定位层的整层遮挡（别把原生图片拖走）解决，
+  //   不依赖 preventDefault 的副作用。少一个副作用就少一处跨浏览器行为不一致的隐患。
+  // rAF 节流：pointermove 在高采样率鼠标上可达每秒数百次，每次都写 video.currentTime 会把媒体管线打满。
+  //   合并成「每帧最多 seek 一次」，播放头仍跟手（最多晚一帧 ≈16ms，人眼察觉不到）。
+  const scrubTargetRef = useRef(0);
+  const scrubRafRef = useRef<number | null>(null);
+  // 本次拖动挂在 window 上的收尾函数（审查 Minor 1/2）：pointerup **不一定会来** ——
+  //   触屏纵向滑动被浏览器接管时来的是 pointercancel，鼠标在窗口外松手时根本不来。只靠 up 拆监听就会残留到下一次手势。
+  const scrubStopRef = useRef<(() => void) | null>(null);
+  const seekThrottled = (t: number): void => {
+    scrubTargetRef.current = t;
+    if (scrubRafRef.current !== null) return; // 本帧已排期 → 只更新目标位置，等下一帧统一 seek
+    scrubRafRef.current = window.requestAnimationFrame(() => {
+      scrubRafRef.current = null;
+      seek(scrubTargetRef.current);
+    });
+  };
+  // 卸载兜底（审查 Minor 1）：把在途的 window 监听拆掉。stop() 里含 removeEventListener×3 + cancelAnimationFrame，
+  //   即「监听器」与「那一帧 rAF」两样都收干净（写法与 studio.tsx 卸载时清 400ms 定时器同一套）。
+  // 不做也没有功能性危害（seek 里有 videoRef.current 判空、卸载后不会再 setState），但它是真泄漏，且触屏那条路彻底走不通。
+  useEffect(() => () => { scrubStopRef.current?.(); }, []);
+  const startScrub = (e: ReactPointerEvent<HTMLDivElement>): void => {
+    if (e.button !== 0 || duration <= 0) return; // 只认左键（右键是上下文菜单，不抢）；没有 duration 谈不上定位
+    scrubStopRef.current?.(); // 上一次若没被 up 收掉（窗口外松手那种），先拆干净再挂这一次的
+    scrubTargetRef.current = xToTime(e.clientX);
+    seek(scrubTargetRef.current); // 按下即 seek，不等移动
+    // 日志降噪（审查 Minor 4）：**纯点击（按下→松手，一次都没移动）不记任何日志**。
+    //   logFe 不只往本地环形缓冲塞一条（web/src/api.ts 的 FE_LOG_CAP 只有 200 条），还同步 POST /api/logs；
+    //   用户在时间轴上点几十下，真出问题时想看的那条 error 就被冲掉了 —— 与下方 productSrcs 那条既有教训同源。
+    //   「真的拖动了」仍然两条齐全：开始那条在**第一次真正移动**时补记，结束那条在 pointerup 记。
+    let moved = false;
+    // 监听挂 window（与 dragEdge 同一套做法）：指针划出轨道后事件仍继续跟手，挂在元素上会中途"掉手"
+    const move = (ev: PointerEvent): void => {
+      if (ev.buttons === 0) return; // 丢键（拖出窗口）后 pointermove 仍会来，别再乱 seek
+      const t = xToTime(ev.clientX);
+      if (!moved) { moved = true; logFe('info', `时间轴拖动定位开始 project=${projectId} t=${t.toFixed(2)}s`); }
+      seekThrottled(t);
+    };
+    const stop = (): void => { // 收尾 = 拆三个监听 + 取消在排期的那一帧。写成幂等的，pointerup / pointercancel / 卸载共用
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', onUp);
+      window.removeEventListener('pointercancel', onCancel);
+      if (scrubRafRef.current !== null) { window.cancelAnimationFrame(scrubRafRef.current); scrubRafRef.current = null; }
+      scrubStopRef.current = null;
+    };
+    const onUp = (ev: PointerEvent): void => {
+      // 补最后一帧：rAF 可能还没跑就被 pointerup 打断 → 播放头会停在松手前一帧的位置（尾巴差十几像素）
+      scrubTargetRef.current = xToTime(ev.clientX);
+      stop(); // 先收尾再 seek：本次手势到此结束，不受后续事件影响
+      seek(scrubTargetRef.current);
+      if (moved) logFe('info', `时间轴拖动定位结束 project=${projectId} t=${scrubTargetRef.current.toFixed(2)}s`);
+    };
+    // pointercancel（审查 Minor 2）：手势被系统接管（触屏纵向滑动被浏览器拿去滚动、窗口失焦等）时**只收尾**，
+    //   不再补那一次 seek —— 手势都被取消了还把播放头猛挪一下是纯打扰。缺了它监听器会一直挂到下一次 pointerup。
+    const onCancel = (): void => { stop(); };
+    scrubStopRef.current = stop;
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onCancel);
+  };
+
   // 「清空所有剪辑点」二次确认（仓库规则：破坏性操作必须确认；只删本作品的剪辑点，不动已导出的音频）
   const clearAll = (): void => {
     if (segments.length === 0) return;
@@ -458,13 +565,25 @@ export default function StudioDetailPage() {
     [products],
   );
 
-  // 顶栏「预览音频」（D16）：播**最新一条成品**。listProducts 的排序是 created_at DESC, id DESC（服务端 SQL），
-  //   故数组第一条就是最新。没有成品 → 禁用 + Tooltip 说清原因（静默无反应会被当成坏了）。
-  const latestProduct = products[0] ?? null;
+  // 派生图加载态复位(N0 复核点名的坑):换素材(importId 变化)或版本串变化(素材被替换,fileSize 变)→
+  // 两张 <img> 的 src 都换成了新 URL,必须重新等 onLoad/onError;不复位的话上一份素材的「已就绪」
+  // 会让「生成中」提示永远不再出现,换素材后用户又对着空轨道发呆。
+  useEffect(() => {
+    setFilmReady(false);
+    setWaveReady(false);
+  }, [importId, version]);
+
+  // 顶栏「预览音频」（D16）：播**最新一条音频成品**。listProducts 的排序是 created_at DESC, id DESC（服务端 SQL），
+  //   故过滤后第一条就是最新。没有成品 → 禁用 + Tooltip 说清原因（静默无反应会被当成坏了）。
+  // N1(spec D5.3):按钮语义就是"听" → 只数**音频**成品(视频成品不参与);作品只导出过视频时禁用并指向下方列表(视频行可直接播)
+  const audioProducts = products.filter((p) => (p.media_kind ?? 'audio') === 'audio');
+  const latestProduct = audioProducts[0] ?? null;
   const previewing = previewingId === null ? null : (products.find((p) => p.id === previewingId) ?? null);
   const previewTip = productsErr !== null
     ? '成品列表读取失败，暂时无法试听'
-    : (latestProduct === null ? '这个作品还没有导出过成品' : '试听最新一条成品');
+    : (latestProduct !== null
+      ? '试听最新一条成品'
+      : (products.length > 0 ? '这个作品只导出过视频，可在下方成品列表直接播放' : '这个作品还没有导出过成品'));
   const stopPreview = (): void => {
     const el = previewAudioRef.current;
     if (el !== null) el.pause();
@@ -544,6 +663,17 @@ export default function StudioDetailPage() {
 
   const pct = duration > 0 ? (current / duration) * 100 : 0;
   const ticks = duration > 0 ? Array.from({ length: 11 }, (_v, i) => (duration * i) / 10) : [];
+  // —— N2-b（2026-10-02）：两张派生图**按原图比例**铺满轨道，不再被拉变形 ——
+  // 旧写法是 `width:100% + height:固定 90/120 + objectFit:'fill'`，fill 会强行改宽高比：
+  // 容器 1400px 宽时横向缩到 0.875、纵向仍是 1.0 → 画面被纵向拉长约 14%（窗口越宽越扁）。
+  // 现在显示高 = 容器实测宽 × (原图高 / 原图宽)，图按自己的比例铺满，**既不变形也不裁**。
+  // 为什么不用 objectFit:'cover' + 固定高（方案 A，已否决）：固定高比下 cover 会按高对齐去裁两侧 ——
+  // 1400px 容器配 90px 高，cover 要按 1600:90 缩放后左右各裁掉 100px（12 格胶片条少掉 1.5 格），
+  // 那样"图上某点 ↔ 某个时间"就对不上了，等于毁掉 N0 刚修好的「覆盖整段」语义。**保持比例且不裁**才是对的。
+  // 代价（已知、接受）：轨道总高随窗口宽变化（1400px 宽 → 胶片条 79px + 波形 105px = 184px）。
+  // 高度只跟宽度走，横向映射（xToTime / 段区块的 left、width 百分比）**完全不受影响**。
+  const filmH = Math.round((trackW * FILM_H) / IMG_W);
+  const waveH = Math.round((trackW * WAVE_H) / IMG_W);
   // 集号只在素材登记了合集集号时显示；用 Number.isInteger 判定（字段缺失时为 undefined，
   // 用 !== null 会渲染出「第 undefined 集」——剪辑室页踩过同款坑）
   const epText = info !== null && Number.isInteger(info.material_entry_index) ? `第 ${info.material_entry_index} 集` : undefined;
@@ -575,13 +705,16 @@ export default function StudioDetailPage() {
                 <Button type="primary" icon={<SaveOutlined />} loading={saving} disabled={readOnly} onClick={() => void doSave()} />
               </span>
             </Tooltip>
-            <Tooltip title={readOnlyMsg ?? '导出音频（以当前界面上的段为准）'}>
+            {/* N1:导出内容已不止音频(导出区可选视频),固定文案去掉"音频"二字;「以当前界面上的段为准」保留(D15 语义) */}
+            <Tooltip title={readOnlyMsg ?? '导出（以当前界面上的段为准）'}>
               <span>
                 <Button icon={<ExportOutlined />} loading={exporting} disabled={readOnly} onClick={() => void doExport()} />
               </span>
             </Tooltip>
-            {/* 「打点」是本地编辑的入口，保留（计划工具栏清单漏列了它——去掉就无法新增段，与编辑页功能冲突） */}
-            <Tooltip title={readOnlyMsg ?? '在当前播放头打点'}>
+            {/* 「打点」是本地编辑的入口，保留（计划工具栏清单漏列了它——去掉就无法新增段，与编辑页功能冲突）。
+                W3(T9 复核,2026-10-02 deferred 批):禁用原因分流——视频没时长 / 段数满 / 可用,各说各的话,
+                别让用户对着灰按钮猜为什么点不了 */}
+            <Tooltip title={readOnlyMsg ?? (duration <= 0 ? '视频还没加载出时长，无法打点' : segments.length >= MAX_SEGMENTS ? `最多 ${MAX_SEGMENTS} 段，先删一段` : '在当前播放头打点')}>
               {/* 禁用态必须包一层 span，否则 antd Tooltip 收不到鼠标事件、悬停不出提示（D9 要求提示可查） */}
               <span>
                 <Button icon={<PlusOutlined />} disabled={readOnly || duration <= 0 || segments.length >= MAX_SEGMENTS} onClick={addSegment} />
@@ -676,48 +809,69 @@ export default function StudioDetailPage() {
 
             {/* 时间轴（spec 需求 7：三轨同屏）：时间尺 + 画轨（胶片条）+ 音轨（波形）+ 播放头 + 段区块 */}
             <div style={{ position: 'relative' }}>
-              <div ref={trackRef} style={{ position: 'relative', width: '100%' }}>
+              {/* 轨道层：**整层**接 pointerdown 做拖动定位（区域②，见 startScrub 处的三分区说明）。
+                  userSelect:'none' —— 拖动时别把刻度文字选中（这里不能靠 preventDefault，见 startScrub 注释）。
+                  段区块在它上面（自己处理 ① 和 ③）；下面那层"定位层"只剩光标与遮挡原生图片拖动的作用。 */}
+              <div
+                ref={trackRef}
+                onPointerDown={startScrub}
+                style={{ position: 'relative', width: '100%', userSelect: 'none' }}
+              >
                 {/* 时间尺：10 等分刻度 */}
-                <div style={{ position: 'relative', height: 20 }}>
+                <div style={{ position: 'relative', height: RULER_H }}>
                   {ticks.map((t, i) => (
                     <span key={i} style={{ position: 'absolute', left: `${(i / 10) * 100}%`, fontSize: 11, color: '#999', transform: 'translateX(-50%)' }}>{fmtTime(t)}</span>
                   ))}
                 </div>
-                {/* 画轨（胶片条 PNG，固定 1600×90，CSS 拉伸填满容器）——加载失败只记日志，不阻断页面 */}
+                {/* 画轨（胶片条 PNG，原图 1600×90）：显示高按容器宽**等比**算(N2-b) → 不变形、不裁，
+                    整段胶片条仍完整覆盖 [0, duration](N0 语义不受影响)。加载失败只记日志，不阻断页面。
+                    onLoad/onError 都置「已结论」→ 生成中提示消失(失败走日志,不重复造错误 UI)。 */}
                 <img
                   src={filmstripUrl(importId, version)}
                   alt="画轨"
-                  onError={() => logFe('error', `胶片条加载失败 import=${importId}`)}
-                  style={{ display: 'block', width: '100%', height: FILM_H, objectFit: 'fill', background: '#111' }}
+                  onLoad={() => setFilmReady(true)}
+                  onError={() => { setFilmReady(true); logFe('error', `胶片条加载失败 import=${importId}`); }}
+                  style={{ display: 'block', width: '100%', height: filmH, objectFit: 'contain', background: '#111' }}
                 />
-                {/* 音轨（波形 PNG，固定 1600×120） */}
+                {/* 音轨（波形 PNG，原图 1600×120）：同 N2-b，等比铺满；加载态同画轨 */}
                 <img
                   src={waveformUrl(importId, version)}
                   alt="音轨"
-                  onError={() => logFe('error', `波形图加载失败 import=${importId}`)}
-                  style={{ display: 'block', width: '100%', height: WAVE_H, objectFit: 'fill', background: '#0b1220' }}
+                  onLoad={() => setWaveReady(true)}
+                  onError={() => { setWaveReady(true); logFe('error', `波形图加载失败 import=${importId}`); }}
+                  style={{ display: 'block', width: '100%', height: waveH, objectFit: 'contain', background: '#0b1220' }}
                 />
-                {/* 点击定位层：空白处点一下 → seek（段区块叠在它之上，自己 stopPropagation） */}
-                <div onClick={(e) => seek(xToTime(e.clientX))} style={{ position: 'absolute', inset: 0, cursor: 'crosshair' }} />
-                {/* 段区块：按百分比绝对定位，覆盖画轨+音轨两行（top 让开 20px 的时间尺） */}
+                {/* 定位层：**不再挂 onClick**（旧实现的误跳来源，见 startScrub 注释）。
+                    保留它只为两件事：给空白区一个 crosshair 光标；盖住两张 <img>，不让浏览器把它们当图片拖走。 */}
+                <div style={{ position: 'absolute', inset: 0, cursor: 'crosshair' }} />
+                {/* 段区块：按百分比绝对定位，覆盖画轨+音轨两行（top 让开时间尺）。
+                    中部：pointerdown 冒到轨道层 → 拖动定位（②）；click 仍走下面的 setSelected → 选中该段（③）。 */}
                 {duration > 0 && segments.map((s, i) => (
                   <div
                     key={i}
                     onClick={(e) => { e.stopPropagation(); setSelected(i); }}
                     style={{
-                      position: 'absolute', top: 20, height: FILM_H + WAVE_H,
+                      position: 'absolute', top: RULER_H, height: filmH + waveH,
                       left: `${(s.start_sec / duration) * 100}%`, width: `${((s.end_sec - s.start_sec) / duration) * 100}%`,
                       background: 'rgba(22,119,255,0.20)', boxSizing: 'border-box',
                       border: selected === i ? '2px solid #1677ff' : '1px solid rgba(22,119,255,0.6)',
                     }}
                   >
-                    {/* 左右 8px 拖柄：按住改起止 */}
+                    {/* 左右 8px 拖柄：按住改起止（区域①，pointerdown 已 stopPropagation，不与定位抢） */}
                     <div onPointerDown={dragEdge(i, 'start')} style={{ position: 'absolute', left: 0, top: 0, width: 8, height: '100%', cursor: 'ew-resize' }} />
                     <div onPointerDown={dragEdge(i, 'end')} style={{ position: 'absolute', right: 0, top: 0, width: 8, height: '100%', cursor: 'ew-resize' }} />
                   </div>
                 ))}
-                {/* 播放头：随 <video> 的 timeupdate 走；pointerEvents none，别挡住点击定位 */}
-                {duration > 0 && <div style={{ position: 'absolute', top: 0, left: `${pct}%`, width: 2, height: 20 + FILM_H + WAVE_H, background: '#ff4d4f', pointerEvents: 'none' }} />}
+                {/* 播放头：随 <video> 的 timeupdate 走；pointerEvents none，别挡住拖动定位 */}
+                {duration > 0 && <div style={{ position: 'absolute', top: 0, left: `${pct}%`, width: 2, height: RULER_H + filmH + waveH, background: '#ff4d4f', pointerEvents: 'none' }} />}
+                {/* 生成中提示(W3/N0 复核遗留):胶片条/波形任一还没结论就在轨道上给一行小字——大素材服务端
+                    现生成要 ~50s,空轨道不说话用户只会以为坏了。不做骨架屏(高度已预留);覆盖层 pointerEvents
+                    none,不挡拖动定位;任一图失败即视为"有结论",提示消失,错误只走日志。 */}
+                {derivedLoading && (
+                  <div style={{ position: 'absolute', top: RULER_H, left: 0, width: '100%', height: filmH + waveH, display: 'flex', alignItems: 'center', justifyContent: 'center', pointerEvents: 'none' }}>
+                    <Typography.Text type="secondary" style={{ fontSize: 12, background: 'rgba(255,255,255,0.85)', padding: '2px 10px', borderRadius: 4 }}>画轨/波形生成中，大文件约需 1 分钟…</Typography.Text>
+                  </div>
+                )}
               </div>
             </div>
           </>
@@ -754,7 +908,20 @@ export default function StudioDetailPage() {
         <div style={{ border: '1px solid #f0f0f0', borderRadius: 6, padding: 12, display: 'flex', flexDirection: 'column', gap: 8 }}>
           <Space wrap>
             <Typography.Text strong>导出</Typography.Text>
-            {/* 修复轮 1 Minor 1：只读态把这两个单选组一并禁用 —— 导出按钮已灰，用户改设置却发现点不动会困惑。
+            {/* N1(spec D5.1):导出内容三选,标签样式同「导出」。选任一视频项 → 格式 Radio 隐藏(服务端固定 mp4);
+                切回音频恢复且保留上次选中的 exportFormat(state 不重置)。只读态一并禁用(修复轮 1 Minor 1 同款理由)。 */}
+            <Typography.Text strong>导出内容</Typography.Text>
+            <Tooltip title={readOnlyMsg ?? '导出什么:音频(mp3/m4a/wav)或视频(mp4)'}>
+              <span>
+                <Radio.Group
+                  value={exportKind}
+                  onChange={(e) => setExportKind(e.target.value as 'audio' | 'video' | 'videoAn')}
+                  options={[{ label: '音频', value: 'audio' }, { label: '视频（带音轨）', value: 'video' }, { label: '视频（纯视频）', value: 'videoAn' }]}
+                  disabled={readOnly}
+                />
+              </span>
+            </Tooltip>
+            {/* 修复轮 1 Minor 1：只读态把这几个单选组一并禁用 —— 导出按钮已灰，用户改设置却发现点不动会困惑。
                 Tooltip 给 span 垫层，禁用态也能悬停看到原因（与工具栏同一套写法）。 */}
             <Tooltip title={readOnlyMsg ?? '导出时怎么切段'}>
               <span>
@@ -766,16 +933,19 @@ export default function StudioDetailPage() {
                 />
               </span>
             </Tooltip>
-            <Tooltip title={readOnlyMsg ?? '导出成什么格式'}>
-              <span>
-                <Radio.Group
-                  value={exportFormat}
-                  onChange={(e) => setExportFormat(e.target.value as 'mp3' | 'm4a' | 'wav')}
-                  options={[{ label: 'mp3', value: 'mp3' }, { label: 'm4a', value: 'm4a' }, { label: 'wav', value: 'wav' }]}
-                  disabled={readOnly}
-                />
-              </span>
-            </Tooltip>
+            {/* 格式 Radio 仅音频导出需要(spec D5.1):选视频时隐藏;条件渲染只动 JSX,exportFormat state 不重置 → 切回不丢 */}
+            {exportKind === 'audio' && (
+              <Tooltip title={readOnlyMsg ?? '导出成什么格式'}>
+                <span>
+                  <Radio.Group
+                    value={exportFormat}
+                    onChange={(e) => setExportFormat(e.target.value as 'mp3' | 'm4a' | 'wav')}
+                    options={[{ label: 'mp3', value: 'mp3' }, { label: 'm4a', value: 'm4a' }, { label: 'wav', value: 'wav' }]}
+                    disabled={readOnly}
+                  />
+                </span>
+              </Tooltip>
+            )}
             <Typography.Text type="secondary" style={{ fontSize: 12 }}>导出的是当前界面上的剪辑段，不会自动保存</Typography.Text>
           </Space>
           {exporting && <Progress percent={exportPercent} />}
@@ -832,13 +1002,29 @@ export default function StudioDetailPage() {
                   {it.format} · {Number.isFinite(it.duration_sec) ? fmtTime(it.duration_sec as number) : '时长未知'}
                 </Typography.Text>
                 {/* src 取自 productSrcs（useMemo 钉住）——不能在这里直调 audioFileUrl，它内部会 logFe+POST，
-                    而 onTimeUpdate 每秒触发数十次重渲染会把日志环形缓冲刷爆（见 Important 2 修复注释） */}
-                <audio
-                  controls
-                  src={productSrcs.get(it.id)}
-                  onError={() => logFe('error', `成品音频加载失败 id=${it.id} work=${projectId} title=${it.title}`)}
-                  style={{ flex: '1 1 260px', minWidth: 220 }}
-                />
+                    而 onTimeUpdate 每秒触发数十次重渲染会把日志环形缓冲刷爆（见 Important 2 修复注释）。
+                    N1(spec D5.2):按 media_kind 分流(字段缺失按 'audio' 兜,老服务端混跑防护)——视频行 <video controls
+                    preload="metadata">(同一 /api/audio/:id/file 路由直接回 mp4)+ 分辨率徽标(无高不显示);音频行一字不动。
+                    删除按钮/确认框/空态两种成品共用,不改。 */}
+                {(it.media_kind ?? 'audio') === 'video' ? (
+                  <>
+                    <video
+                      controls
+                      preload="metadata"
+                      src={productSrcs.get(it.id)}
+                      onError={() => logFe('error', `成品视频加载失败 id=${it.id} work=${projectId} title=${it.title}`)}
+                      style={{ maxWidth: 320, borderRadius: 6 }}
+                    />
+                    {it.height ? <Tag>{it.height}p</Tag> : null}
+                  </>
+                ) : (
+                  <audio
+                    controls
+                    src={productSrcs.get(it.id)}
+                    onError={() => logFe('error', `成品音频加载失败 id=${it.id} work=${projectId} title=${it.title}`)}
+                    style={{ flex: '1 1 260px', minWidth: 220 }}
+                  />
+                )}
                 <Button size="small" danger onClick={() => removeProduct(it)}>删除</Button>
               </div>
             ))}
@@ -852,7 +1038,7 @@ export default function StudioDetailPage() {
         />
         {/* 映射口径自陈：让「点哪儿跳哪儿」的换算依据在界面上可见（窄窗下容器宽 < 1600，换算按容器宽） */}
         <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-          时间轴宽度 {trackW}px · 图固定 1600 宽（点击位置按容器宽度换算成时间）
+          时间轴宽度 {trackW}px · 图固定 1600 宽（点或拖动的位置都按容器宽度换算成时间；按住拖动可连续定位，段两端 8px 是拖边微调）
         </Typography.Text>
       </div>
     </div>

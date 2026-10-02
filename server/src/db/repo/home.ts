@@ -1,6 +1,6 @@
 // server/src/db/repo/home.ts
-// 首页仪表盘数据(P5-T1,spec §0.3「其它」):两块 Top3 —— 正在编辑的工程(editing)、
-// 按来源去重后最近下载的作品(recent)。与其它 repo 一致:工厂 createHomeRepo(db) + 显式 map
+// 首页仪表盘数据(P5-T1,spec §0.3「其它」):两块 Top3 —— 正在编辑的作品(editing,clip-works D18 口径)、
+// 按来源去重后最近下载的资料(recent)。与其它 repo 一致:工厂 createHomeRepo(db) + 显式 map
 // (SQL 返回的裸列是 unknown,统一在这里归一成类型化行,避免形状漂到路由层)。
 import type { DB } from '../index.js';
 

@@ -14,6 +14,7 @@ import { createAudioItemsRepo } from '../db/repo/audio-items.js';
 import { createClipProjectsRepo } from '../db/repo/clip-projects.js';
 import { createJobsRepo } from '../db/repo/jobs.js';
 import { registerProjectRoutes } from './project-routes.js';
+import { startExportJob, type ExportJobPayload } from './ffmpeg-export.js'; // 已被 vi.mock 换成 spy；S1 用例断言路由真的把任务交给了它（type 导入编译期擦除，不经过 mock）
 
 // 导出 job 本体（含 D22 在途校验）在 ffmpeg-export.test.ts 覆盖；这里只验「路由把 payload 填对了」。
 // 把 startExportJob 换成空实现，避免路由测试的 fire-and-forget 任务真去拉 ffmpeg（无法 await、会污染后续用例）。
@@ -54,12 +55,15 @@ const seedImportWithoutVideo = (): number =>
   });
 /** 直接造一件作品（路由按作品 id 操作，多数用例不必先有资料行；clip_projects.import_id 无外键约束） */
 const makeWork = (name = '作品'): number => createClipProjectsRepo(db).create(1, name).id;
-/** 造一条挂在某作品下的成品（真实落盘），返回文件路径 */
-const mkProduct = (workId: number, name: string): string => {
-  const f = join(root, `${name}-${++seq}.mp3`);
-  writeFileSync(f, 'AUDIOBYTES');
+/** 造一条挂在某作品下的成品（真实落盘），返回文件路径。
+ *  opts.mediaKind='video' → 造视频成品（N1 T4 summary 的 latest_product_kind 用），文件名/格式随类型。 */
+const mkProduct = (workId: number, name: string, opts: { mediaKind?: 'audio' | 'video' } = {}): string => {
+  const f = join(root, `${name}-${++seq}.${opts.mediaKind === 'video' ? 'mp4' : 'mp3'}`);
+  writeFileSync(f, 'PRODUCTBYTES');
   createAudioItemsRepo(db).create({
-    title: name, source_type: 'edit', source_url: '', file_path: f, format: 'mp3', duration_sec: 1, file_size: 5, source_work_id: workId,
+    title: name, source_type: 'edit', source_url: '', file_path: f,
+    format: opts.mediaKind === 'video' ? 'mp4' : 'mp3', duration_sec: 1, file_size: 5, source_work_id: workId,
+    media_kind: opts.mediaKind, // 不传 → repo 缺省 'audio'（与列默认一致，老调用零回归）
   });
   return f;
 };
@@ -210,6 +214,29 @@ describe('作品路由', () => {
     expect(existsSync(bFile)).toBe(true);
   });
 
+  // N1 D4（spec video-export，2026-10-02 审查 Minor①）：删除链按行删、kind 无关——上面的 D6 用例只造了音频成品，
+  // 本用例把 media_kind='video' 的成品行喂进同一条 DELETE 链，锁住「视频成品同样被连带删干净」。
+  // 运行时控制器已在真机用真实 API 删过两个带视频成品的测试作品；这条是把行为钉进测试。
+  // RED 反证（不碰产品代码的推演）：删掉 project-routes.ts DELETE 链事务里的
+  // `DELETE FROM audio_items WHERE source_work_id = ?`（:121）→ 成品行残留 + deleted_products=0 → 断言红；
+  // 删掉事务提交后的 unlinkSync 循环（:125-137）→ 磁盘文件残留 → existsSync 断言红；
+  // 删掉 `DELETE FROM clip_projects`（:120）→ deleted=0 且 repo.get 非 null → 断言红。
+  it('DELETE 作品 → 视频成品也连带删干净(DB 行 + 磁盘文件 + 作品行),kind 无关', async () => {
+    const repo = createClipProjectsRepo(db);
+    const w = repo.create(1, '作品甲');
+    const vf = mkProduct(w.id, 'pv', { mediaKind: 'video' }); // media_kind='video' 成品行,文件真实落盘
+    // 前置自证:视频成品行确实入库、文件确实在
+    expect(count("SELECT COUNT(*) AS n FROM audio_items WHERE source_work_id = ? AND media_kind = 'video'", w.id)).toBe(1);
+    expect(existsSync(vf)).toBe(true);
+    const res = await app.inject({ method: 'DELETE', url: `/api/projects/${w.id}` });
+    expect(res.statusCode).toBe(200);
+    expect((res.json() as { deleted: number; deleted_products: number }).deleted).toBe(1);
+    expect((res.json() as { deleted: number; deleted_products: number }).deleted_products).toBe(1);
+    expect(repo.get(w.id)).toBeNull(); // 作品行没了
+    expect(count('SELECT COUNT(*) AS n FROM audio_items WHERE source_work_id = ?', w.id)).toBe(0); // 成品行没了
+    expect(existsSync(vf)).toBe(false); // 磁盘文件没了
+  });
+
   it('DELETE 作品的文件删不掉(文件不存在) → 接口仍 200(不阻断)', async () => {
     const repo = createClipProjectsRepo(db);
     const w = repo.create(1, '作品');
@@ -298,5 +325,141 @@ describe('作品路由', () => {
     expect(saved.projectId).toBe(w.id);
     expect(saved.workName).toBe('作品甲');
     expect(saved.importId).toBe(imp); // 视频路径仍靠 importId
+  });
+
+  // S1(2026-10-02 deferred 批,账本 T3):导出路由的 `void startExportJob(...)` 是 fire-and-forget——
+  // 把这一行删掉,旧测试仍全绿(任务「真的跑起来」这件事零覆盖)。本用例锁住「路由确实把任务交给了 runner」:
+  // mock 版 startExportJob 模拟真实现入口的第一件事(置 running,ffmpeg-export.ts:39 同款),再用 vi.waitFor
+  // 轮询 jobs 表等状态推进,并核对传给 runner 的 jobId 与 deps。把 `void startExportJob(...)` 删掉 →
+  // mock 不再被调 → 状态停在 pending → 本用例变红(RED 证据见 deferred-batch-report.md)。
+  it('导出 201 后任务真的被启动:startExportJob 被调用且 job 状态推进到 running', async () => {
+    const imp = seedImportWithVideo();
+    const w = createClipProjectsRepo(db).create(imp, '作品甲');
+    // spy 是文件级共享的(前一个导出用例已调用过一次):先清调用历史,只清 calls 不动实现
+    vi.mocked(startExportJob).mockClear();
+    // Once:只在本用例消费一次,后续用例回落到模块级空实现,互不污染
+    vi.mocked(startExportJob).mockImplementationOnce(async (jobId) => {
+      createJobsRepo(db).update(jobId, { status: 'running' }); // 与真实现入口同款:先置 running
+    });
+    const r = await app.inject({
+      method: 'POST', url: `/api/projects/${w.id}/export`,
+      payload: { mode: 'merge', format: 'mp3', segments: [{ start_sec: 0, end_sec: 1 }] },
+    });
+    expect(r.statusCode).toBe(201);
+    const jobId = (r.json() as { jobId: number }).jobId;
+    // fire-and-forget 不可 await:轮询 jobs 表,等任务入口把状态从 pending 推进到 running
+    await vi.waitFor(() => {
+      expect(createJobsRepo(db).get(jobId)!.status).toBe('running');
+    });
+    // 交给 runner 的参数:jobId 与 201 响应对得上;deps 三件套原样透传(真实现要靠它们写库/落盘)
+    expect(startExportJob).toHaveBeenCalledTimes(1);
+    const [calledJobId, , depsArg] = vi.mocked(startExportJob).mock.calls[0]!;
+    expect(calledJobId).toBe(jobId);
+    expect(depsArg.db).toBe(db);
+    expect(depsArg.audioDir).toBe(join(root, 'audio'));
+    expect(depsArg.tempDir).toBe(join(root, 'tmp'));
+  });
+
+  // ===== 2026-10-02 N1 Task 4(spec video-export):导出内容 mediaKind 校验矩阵 =====
+  // ① video + format=mp3 → 400(视频导出仅支持 mp4)
+  it('导出 mediaKind=video + format=mp3 → 400(文案含 mp4)', async () => {
+    const imp = seedImportWithVideo();
+    const w = createClipProjectsRepo(db).create(imp, '作品甲');
+    const r = await app.inject({
+      method: 'POST', url: `/api/projects/${w.id}/export`,
+      payload: { mode: 'merge', format: 'mp3', mediaKind: 'video', segments: [{ start_sec: 0, end_sec: 1 }] },
+    });
+    expect(r.statusCode).toBe(400);
+    expect((r.json() as { error: { message: string } }).error.message).toContain('mp4');
+  });
+
+  // ② 老客户端回归:body 不带 mediaKind + format=mp3 → 按 audio 处理(缺省 'audio'),payload 落 mediaKind='audio'
+  it('导出 老客户端不传 mediaKind + format=mp3 → 仍成功(payload.mediaKind=audio)', async () => {
+    const imp = seedImportWithVideo();
+    const w = createClipProjectsRepo(db).create(imp, '作品甲');
+    const r = await app.inject({
+      method: 'POST', url: `/api/projects/${w.id}/export`,
+      payload: { mode: 'merge', format: 'mp3', segments: [{ start_sec: 0, end_sec: 1 }] },
+    });
+    expect(r.statusCode).toBe(201);
+    const job = createJobsRepo(db).get((r.json() as { jobId: number }).jobId)!;
+    const saved = JSON.parse(job.payload) as { mediaKind?: string };
+    expect(saved.mediaKind).toBe('audio');
+  });
+
+  // ③ video + format=mp4 → payload 带 mediaKind='video'/videoAn(照 S1 用 startExportJob mock 捕获 payload;
+  //   ExportJobPayload.format 类型未含 'mp4',运行时值断言用 as string 宽化比较)
+  it('导出 mediaKind=video + format=mp4 → payload.mediaKind=video、videoAn 透传(缺省 false)', async () => {
+    const imp = seedImportWithVideo();
+    const w = createClipProjectsRepo(db).create(imp, '作品甲');
+    vi.mocked(startExportJob).mockClear(); // spy 文件级共享,先清调用历史(照 S1 做法)
+    const send = (videoAn?: boolean) => app.inject({
+      method: 'POST', url: `/api/projects/${w.id}/export`,
+      payload: { mode: 'separate', format: 'mp4', mediaKind: 'video', ...(videoAn === undefined ? {} : { videoAn }), segments: [{ start_sec: 0, end_sec: 1 }] },
+    });
+    const withAn = await send(true);
+    expect(withAn.statusCode).toBe(201);
+    const deflt = await send(); // videoAn 缺省 → false(带音轨,实测 A3)
+    expect(deflt.statusCode).toBe(201);
+    expect(startExportJob).toHaveBeenCalledTimes(2);
+    const first = vi.mocked(startExportJob).mock.calls[0]![1] as ExportJobPayload;
+    expect(first.mediaKind).toBe('video');
+    expect(first.videoAn).toBe(true);
+    expect(first.format as string).toBe('mp4');
+    const second = vi.mocked(startExportJob).mock.calls[1]![1] as ExportJobPayload;
+    expect(second.videoAn).toBe(false);
+  });
+
+  // videoAn 仅 video 有意义且必须是 boolean 或缺省:乱传字符串 → 400
+  it('导出 mediaKind=video + videoAn 非布尔 → 400(文案含 videoAn)', async () => {
+    const imp = seedImportWithVideo();
+    const w = createClipProjectsRepo(db).create(imp, '作品甲');
+    const r = await app.inject({
+      method: 'POST', url: `/api/projects/${w.id}/export`,
+      payload: { mode: 'merge', format: 'mp4', mediaKind: 'video', videoAn: 'yes', segments: [{ start_sec: 0, end_sec: 1 }] },
+    });
+    expect(r.statusCode).toBe(400);
+    expect((r.json() as { error: { message: string } }).error.message).toContain('videoAn');
+  });
+
+  // ④ mediaKind 传了别的值 → 400
+  it('导出 mediaKind=bogus → 400(文案含 mediaKind)', async () => {
+    const imp = seedImportWithVideo();
+    const w = createClipProjectsRepo(db).create(imp, '作品甲');
+    const r = await app.inject({
+      method: 'POST', url: `/api/projects/${w.id}/export`,
+      payload: { mode: 'merge', format: 'mp3', mediaKind: 'bogus', segments: [{ start_sec: 0, end_sec: 1 }] },
+    });
+    expect(r.statusCode).toBe(400);
+    expect((r.json() as { error: { message: string } }).error.message).toContain('mediaKind');
+  });
+
+  // ⑤ audio 回归矩阵:三个合法格式各一次全过(显式 mediaKind='audio',前端 T5 会显式传)
+  it('导出 audio 回归矩阵:mp3/m4a/wav 各一次全过', async () => {
+    const imp = seedImportWithVideo();
+    const w = createClipProjectsRepo(db).create(imp, '作品甲');
+    for (const format of ['mp3', 'm4a', 'wav'] as const) {
+      const r = await app.inject({
+        method: 'POST', url: `/api/projects/${w.id}/export`,
+        payload: { mode: 'merge', format, mediaKind: 'audio', segments: [{ start_sec: 0, end_sec: 1 }] },
+      });
+      expect(r.statusCode).toBe(201);
+    }
+  });
+
+  // ⑥ summary:latest_product_kind 与 latest_product_id 同源(同一行)——
+  //    无成品 → null;音频成品 → 'audio';再插视频成品(后插 = 最新)→ 'video'
+  it('GET /api/projects summary:latest_product_kind 跟随最新成品(null/audio/video)', async () => {
+    const wid = makeWork('作品甲');
+    const rowOf = async () => {
+      const res = await app.inject({ method: 'GET', url: '/api/projects' });
+      const rows = (res.json() as { projects: Array<{ id: number; latest_product_kind: string | null }> }).projects;
+      return rows.find((p) => p.id === wid)!;
+    };
+    expect((await rowOf()).latest_product_kind).toBeNull();   // 无成品 → null(与 latest_product_id 的 null 同步)
+    mkProduct(wid, 'pa');
+    expect((await rowOf()).latest_product_kind).toBe('audio'); // 音频成品
+    mkProduct(wid, 'pv', { mediaKind: 'video' });              // 后插视频成品 → 成为最新
+    expect((await rowOf()).latest_product_kind).toBe('video');
   });
 });

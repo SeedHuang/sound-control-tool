@@ -147,6 +147,7 @@ CREATE TABLE IF NOT EXISTS source_videos (
 ## 0.6 web（获取页新增一个模式）
 
 > ⚠️ **已废弃（2026-09-30，M2 工作台重构 `m2-workspace`）**：本节描述的「获取页新增一个模式（视频预览剪音频）」**已作废**。「获取」页已改名为**资料库**（仅下载视频素材，不再有模式切换器），原"下视频 → 画面上打点 → 剪出音频"的交互**迁至剪辑室 / 剪辑详情**：剪辑室 `/studio` 是媒体列表（含"编辑"入口），剪辑详情 `/studio/:importId` 是同屏时间轴（画轨胶片条 + 音轨波形）打点编辑。下文保留为当时的历史设计。新落点见 `docs/superpowers/specs/m2-workspace.md`（§0.2 D4/D6/D17/D20、§0.3 接口、§0.5 P3/P4）。
+> **再注记（2026-10-01，spec `2026-10-01-clip-works.md`）**：剪辑详情路由参数已从资料 id（`/studio/:importId`）改为作品 id（`/studio/:projectId`，该 spec D16）；`clip_projects` 已从"与来源 1:1（import_id UNIQUE）"改为 1:N（一个资料可有多件作品，D1/D2）。正文不改写（历史记录）。
 
 获取页现在是"左列表 + 主区"，模式切换器放在页面顶部：
 

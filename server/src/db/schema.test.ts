@@ -8,6 +8,7 @@ import { join } from 'node:path';
 import { openDatabase, type DB } from './index.js';
 import { initSchema } from './schema.js';
 import { createImportsRepo } from './repo/imports.js';
+import { createAudioItemsRepo } from './repo/audio-items.js'; // 2026-10-02 spec video-export D1:视频列透传用例(惯例在 repo/audio-items.test.ts,受本任务文件白名单约束暂放此处)
 
 let db: DB;
 beforeEach(() => { db = openDatabase(':memory:'); initSchema(db); });
@@ -209,5 +210,117 @@ describe('initSchema 迁移判据与索引（F2/F3）', () => {
     initSchema(db); // 触发重建
     expect(tableSql('clip_projects')!.toUpperCase()).not.toContain('UNIQUE'); // 约束已去掉
     expect(indexNames('clip_projects')).toContain('idx_clip_projects_import'); // 索引补回
+  });
+});
+
+// 2026-10-02 spec video-export D1:audio_items 加 media_kind/width/height 3 列 —— 视频成品入库复用整条成品链。
+// 表名沿用 audio_items 不改(spec D1,clip_projects 同款先例);迁移照 Spec C T1 模式(幂等 ALTER 补列),
+// 但**不重建表、不备份**——加列是无破坏性操作(不删行不改行,备份语义只挂"重建表 + 删文件"的破坏性迁移)。
+type ColInfo = { name: string; type: string; notnull: number; dflt_value: unknown };
+const audioCols = (): ColInfo[] => db.prepare('PRAGMA table_info(audio_items)').all() as ColInfo[];
+
+describe('initSchema 视频列迁移(spec video-export D1)', () => {
+  /** 造"老库":audio_items 降级回 2026-10-02 前的形态(已有 source_work_id 等列,唯独没有这 3 新列),其余表保持新结构 */
+  const makeLegacyAudio = (): void => {
+    db.exec('DROP TABLE IF EXISTS audio_items');
+    db.exec(
+      "CREATE TABLE audio_items (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, " +
+      "source_type TEXT NOT NULL CHECK (source_type IN ('download','recording','edit')), source_url TEXT, " +
+      'entry_index INTEGER, collection_title TEXT, parent_id INTEGER, source_import_id INTEGER, source_work_id INTEGER, ' +
+      "file_path TEXT NOT NULL UNIQUE, format TEXT NOT NULL, duration_sec REAL, file_size INTEGER, " +
+      "created_at TEXT NOT NULL DEFAULT (datetime('now')))",
+    );
+  };
+  const insertLegacyRow = (): void => {
+    db.prepare('INSERT INTO audio_items (title, source_type, source_url, source_work_id, file_path, format) VALUES (?, ?, ?, ?, ?, ?)')
+      .run('老音频成品', 'edit', 'https://a/legacy', 9, 'leg-1.mp3', 'mp3');
+  };
+
+  it('新库:audio_items 含 media_kind/width/height;media_kind NOT NULL 默认 audio 且带 CHECK(spec D1 逐字)', () => {
+    const cols = audioCols();
+    expect(cols.find((c) => c.name === 'media_kind')).toMatchObject({ type: 'TEXT', notnull: 1, dflt_value: "'audio'" });
+    expect(cols.find((c) => c.name === 'width')).toMatchObject({ type: 'INTEGER', notnull: 0, dflt_value: null });
+    expect(cols.find((c) => c.name === 'height')).toMatchObject({ type: 'INTEGER', notnull: 0, dflt_value: null });
+    // CHECK 在新库与 legacy(ALTER) 两条路径都生效——2026-10-02 审查用 node:sqlite 实证：
+    // ALTER ADD COLUMN 的 CHECK 同样写进 sqlite_master 的建表文本（老注释说"不改"是错的），且插 'xxx'/NULL 都被拒。
+    expect(tableSql('audio_items')).toContain("CHECK (media_kind IN ('audio','video'))");
+  });
+
+  it('老库(缺 3 列)升级 → 3 列出现;旧行 media_kind=audio、宽高 NULL;既有数据(挂作品的 source_work_id)不丢', () => {
+    makeLegacyAudio();
+    insertLegacyRow();
+    initSchema(db); // 升级启动
+    const names = audioCols().map((c) => c.name);
+    expect(names).toContain('media_kind');
+    expect(names).toContain('width');
+    expect(names).toContain('height');
+    const row = db.prepare('SELECT media_kind, width, height, source_work_id FROM audio_items WHERE title = ?')
+      .get('老音频成品') as { media_kind: string; width: number | null; height: number | null; source_work_id: number };
+    expect(row.media_kind).toBe('audio');     // NOT NULL DEFAULT 'audio' 回填旧行
+    expect(row.width).toBeNull();
+    expect(row.height).toBeNull();
+    expect(row.source_work_id).toBe(9);       // 升级不动既有数据
+  });
+
+  it('迁移幂等:连跑两遍不炸、列不重复、结构不再变', () => {
+    makeLegacyAudio();
+    insertLegacyRow();
+    initSchema(db);
+    const cols1 = audioCols();
+    expect(() => initSchema(db)).not.toThrow();
+    expect(audioCols()).toEqual(cols1); // 列数与顺序分毫不变(不重复 ALTER)
+    expect(cols1.filter((c) => c.name === 'media_kind')).toHaveLength(1);
+  });
+
+  it('备份语义:加列迁移不产生 .bak;与破坏性重建共存于同一次启动时,备份仍只做一次', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'sct-n1-'));
+    const dbPath = join(dir, 'sct.db');
+    const d1 = openDatabase(dbPath);
+    initSchema(d1); // 首次建库:新结构(含 3 列),无迁移
+    // 降级成"老库":audio_items 缺 3 列(走 ensureColumns 加列) + clip_projects 带 UNIQUE(走重建 → 备份)
+    d1.exec('DROP TABLE IF EXISTS audio_items');
+    d1.exec(
+      "CREATE TABLE audio_items (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, " +
+      "source_type TEXT NOT NULL CHECK (source_type IN ('download','recording','edit')), source_url TEXT, " +
+      'entry_index INTEGER, collection_title TEXT, parent_id INTEGER, source_import_id INTEGER, source_work_id INTEGER, ' +
+      "file_path TEXT NOT NULL UNIQUE, format TEXT NOT NULL, duration_sec REAL, file_size INTEGER, " +
+      "created_at TEXT NOT NULL DEFAULT (datetime('now')))",
+    );
+    d1.exec('DROP TABLE IF EXISTS clip_projects');
+    d1.exec("CREATE TABLE clip_projects (id INTEGER PRIMARY KEY AUTOINCREMENT, import_id INTEGER NOT NULL UNIQUE, name TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT NOT NULL DEFAULT (datetime('now')))");
+    initSchema(d1, { dbPath }); // 加列 + 重建同一次启动
+    const names = (d1.prepare('PRAGMA table_info(audio_items)').all() as Array<{ name: string }>).map((r) => r.name);
+    expect(names).toContain('media_kind'); // 3 列照常补上
+    expect(readdirSync(dir).filter((f) => f.startsWith('sct.db.bak-'))).toHaveLength(1); // 备份恰 1 个(重建产生,加列不重复)
+    initSchema(d1, { dbPath }); // 第二次启动:全幂等
+    expect(readdirSync(dir).filter((f) => f.startsWith('sct.db.bak-'))).toHaveLength(1); // 不再备份
+    d1.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+// 2026-10-02 spec video-export D1:repo 对 3 新列全链路透传。
+// 注:repo 用例的惯例位置是 repo/audio-items.test.ts(同款先例「source_work_id 落库并回读」),
+// 受本任务"只动 schema.test.ts"白名单约束暂放此处,后续批次可挪回。
+describe('audioRepo 视频列透传(spec video-export D1)', () => {
+  it('create 传 media_kind/width/height → get/list 回读一致', () => {
+    const repo = createAudioItemsRepo(db);
+    const id = repo.create({ title: '视频成品', source_type: 'edit', source_url: '', file_path: 'C:/tmp/v.mp4', format: 'mp4', duration_sec: 10, file_size: 1, media_kind: 'video', width: 3840, height: 2160 });
+    const row = repo.get(id)!;
+    expect(row.media_kind).toBe('video');
+    expect(row.width).toBe(3840);
+    expect(row.height).toBe(2160);
+    const listed = repo.list()[0]!;
+    expect(listed.media_kind).toBe('video');
+    expect(listed.width).toBe(3840);
+    expect(listed.height).toBe(2160);
+  });
+  it('create 不传 → media_kind=audio、width/height=null(老调用零回归)', () => {
+    const repo = createAudioItemsRepo(db);
+    const id = repo.create({ title: '音频成品', source_type: 'download', source_url: 'u', file_path: 'C:/tmp/a.mp3', format: 'mp3', duration_sec: null, file_size: 1 });
+    const row = repo.get(id)!;
+    expect(row.media_kind).toBe('audio');
+    expect(row.width).toBeNull();
+    expect(row.height).toBeNull();
   });
 });

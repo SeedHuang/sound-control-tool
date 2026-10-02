@@ -200,6 +200,20 @@ function LogsCard() {
   );
 }
 
+/** 数据与备份说明卡(2026-10-01 spec clip-works §0.10 第 7 条):老库首次升级会生成 sct.db.bak-* 备份,
+ *  且新版本改过表结构 —— 旧版本打不开升级后的库。这两件事用户不知道会误删备份 / 误降级,设置页补一句。 */
+function DatabaseCard() {
+  return (
+    <Card title="数据与备份" style={{ marginBottom: 16 }}>
+      <Typography.Paragraph type="secondary" style={{ marginBottom: 0 }}>
+        升级后首次启动,若数据库需要迁移(如旧版本的剪辑数据),会自动在数据库同目录生成一份
+        sct.db.bak-日期时间 备份文件(只生成一次,日志里有完整路径)。新版本改过数据库结构,旧版本打不开升级后的库
+        —— 确认新版本一切正常之前,请保留这份备份。
+      </Typography.Paragraph>
+    </Card>
+  );
+}
+
 /** 导出目录卡片（spec D1/D2/D4/D5/D8）：留空 = 用应用数据目录（与改造前一致）。
  *  两种"没 Electron"的情况都禁用「浏览…」并给提示，而不是点了没反应。 */
 function ExportDirCard() {
@@ -365,6 +379,7 @@ export default function SettingsPage() {
       <BinCard title="ffmpeg" bin={bins?.ffmpeg ?? null} loading={loading} />
       <CookieCard />
       <LogsCard />
+      <DatabaseCard />
     </div>
   );
 }

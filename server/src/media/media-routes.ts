@@ -18,6 +18,21 @@ export { formatClipTitle } from './clip-job.js';
 // Task 9 同款:文件流 Content-Type 按扩展名映射——给 <video> 标签可识别的 MIME,未知格式回退 octet-stream
 const MEDIA_MIME: Record<string, string> = { mp4: 'video/mp4', webm: 'video/webm', mkv: 'video/x-matroska' };
 
+/**
+ * 派生图生成失败的「失败码 → HTTP 状态 + 下一步提示」映射（单一来源，路由里不再写 if/三元）。
+ * 2026-10-02 审查修复轮 1 minor 4：原来只有 PROBE_FAIL 一种失败被单独分流，其余一律
+ * 「到设置页检查 ffmpeg 配置」——把「素材本身的问题」与「环境没配好」混成一句话，把人引去错的地方。
+ * 加新失败码只加一行。
+ * ⚠️ 不要再往提示里加「素材太短（凑不满 12 帧）」这类说法：复核在 ffmpeg 9.0.2 上实测
+ * 0.1/0.2/0.3/0.4/0.5/0.8/1.0/1.5 秒八档**全部正常出 PNG**（tile 在 EOF 会冲刷不满的 tile），
+ * 写「不足 1 秒也会失败」是把用户引向一个不存在的病因。
+ */
+const DERIVED_FAIL: Record<'NO_FFMPEG' | 'FFMPEG_FAIL' | 'PROBE_FAIL', { status: number; next: string }> = {
+  NO_FFMPEG: { status: 500, next: '到设置页检查 ffmpeg 配置' },
+  FFMPEG_FAIL: { status: 500, next: '到设置页检查 ffmpeg 配置；若素材已损坏也会失败，详见日志页' },
+  PROBE_FAIL: { status: 422, next: '删除该素材后重新下载完整视频' },
+};
+
 export function registerMediaRoutes(
   app: FastifyInstance,
   deps: { db: DB; audioDir: string; tempDir: string; mediaDir: string; token: string },
@@ -43,7 +58,19 @@ export function registerMediaRoutes(
       return reply.code(404).send({ ok: false, error: { code: 'FILE_MISSING', message: '素材文件已丢失，请重新下载视频', next: '回到资料库重新下视频' } });
     }
     const r = await ensureDerivedImage({ kind, importId, videoPath: row.file_path, derivedDir: derivedDirFor(mediaDir), tempDir: deps.tempDir, db });
-    if (!r.ok) return reply.code(500).send({ ok: false, error: { code: r.code, message: r.message, next: '到设置页检查 ffmpeg 配置' } });
+    if (!r.ok) {
+      // 失败码 → (HTTP 状态, 下一步提示) 映射表（2026-10-02 审查修复轮 1 minor 4）：
+      // 加新失败码只加一行，别再让 if/三元把两种原因混成一句话。
+      // - PROBE_FAIL = 422：素材本身的问题（文件损坏/没下完），不是服务端故障。语义比 500 贴切
+      //   （对前端 <img> 效果一样，都进 onError；差别只在日志/排查时看得出是谁的锅）。
+      // - 其余 = 500：ffmpeg 装没装、跑没跑通，是服务端/环境问题。
+      // - FFMPEG_FAIL 的提示不再只让人查设置页：素材损坏也会走到这里，
+      //   只写「去设置页」会把人引到错误的地方。
+      //   ⚠️ 不要再提「素材太短」——复核实测 0.1~1.5 秒八档全部正常出图，那不是真病因。
+      const fail = DERIVED_FAIL[r.code];
+      pushLog('error', 'media', `派生图接口失败 kind=${kind} import=${importId} code=${r.code} status=${fail.status} msg=${r.message.slice(0, 200)}`);
+      return reply.code(fail.status).send({ ok: false, error: { code: r.code, message: r.message, next: fail.next } });
+    }
     // 静态派生图走「封面式裸流」，不用 sendFileWithRange（实测 H：<img> 不发 Range，PNG 无 seek 语义）。
     // cache-control no-store：素材一变派生图即作废、URL 不变，长缓存会显示上一集的波形（见计划 C-1）
     reply.header('content-type', 'image/png').header('cache-control', 'no-store');
@@ -91,6 +118,8 @@ export function registerMediaRoutes(
     return { ok: true, deleted: r.deleted.length };
   });
 
+  // 休眠路由(m1c 遗留;2026-10-01 spec clip-works D20 保留不删):web 侧无调用方(api.ts 的 clipMedia 已休眠)。
+  // ⚠️ 它产出的成品只记 source_import_id、**没有作品归属**(source_work_id 为空)——启用前必须先定归属(clip-works D20/backlog)。
   app.post('/api/media/:importId/clip', async (req, reply) => {
     const importId = Number((req.params as { importId: string }).importId);
     if (!Number.isInteger(importId) || importId <= 0) return reply.code(404).send({ ok: false, error: { code: 'NOT_FOUND', message: '素材不存在', next: '' } });

@@ -7,7 +7,7 @@
 import { Button, Empty, Input, Modal, Tag, Tooltip, Typography } from 'antd';
 import { DeleteOutlined, MutedOutlined, PlusOutlined, SearchOutlined, SoundOutlined } from '@ant-design/icons';
 import { useNavigate } from '@umijs/max';
-import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
 import {
   apiGet, audioFileUrl, coverUrl, deleteAudio, deleteWork, getPreviewMuted, listWorks, logFe, onAudioChanged,
   setPreviewMuted, type AudioRow, type WorkSummaryDTO,
@@ -18,10 +18,19 @@ import WorkPreview, { unlockAudio } from '@/components/WorkPreview';
 
 const BATCH = 20;                // 每批渲染 20 条(spec D13):服务端一次性返回全部,前端分批渲染
 const CARD_MIN_WIDTH = 190;
-const CARDS_MAX_WIDTH = 1160;
-// 「重拉列表时保住滚动位置」用的**行高估算**:卡片封面上限 16:9 + 文字区,约 200 上下;
-// 拿它乘"新插入的条数"给 scrollTop 补位。列数随窗口变,这只是"大致对齐",不追求像素级。
+const CARD_GAP = 12;             // 卡片网格列间距(必须与下面 grid 的 gap 一致,算列数要用)
+const CARDS_SIDE_PAD = 24;       // 网格左右最小边距。**不再限宽**(见 body 处注释)
+// 「重拉列表时保住滚动位置」用的**单行高估算**:卡片封面上限 16:9 + 文字区,约 200 上下。
+// ⚠️ 仍是估算(卡片文字行数不同会让真实行高有出入),只用来把 scrollTop 补回大致位置,不追求像素级。
 const ROW_HEIGHT_EST = 210;
+
+/** auto-fill 网格当前的实际列数。CSS 是 repeat(auto-fill, minmax(最小宽, 1fr)) + gap:
+ *  n 列要占 n*最小宽 + (n-1)*gap ≤ 可用宽,反解即 n = floor((可用宽 + gap) / (最小宽 + gap))。
+ *  量不到宽度(首帧未布局/容器隐藏)时返回 0 —— 调用方据此**诚实降级**到旧估算,不假装算得准。 */
+function columnCountOf(gridWidth: number): number {
+  if (!(gridWidth > 0)) return 0;
+  return Math.max(1, Math.floor((gridWidth + CARD_GAP) / (CARD_MIN_WIDTH + CARD_GAP)));
+}
 
 function formatDuration(sec: number): string {
   const m = Math.floor(sec / 60);
@@ -121,8 +130,16 @@ export default function StudioPage(): JSX.Element {
   const [newOpen, setNewOpen] = useState(false);             // 「新建作品」弹层开关(T8)
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const sentinelRef = useRef<HTMLDivElement | null>(null);
-  // 记上一次列表长度:重拉后按「新长度 − 旧长度」估算"被插到最前面的条数",给 scrollTop 补位(spec D13)
+  // 卡片网格本体:补偿时要用它的**实测内容宽**反解列数(auto-fill 的列数只由宽度决定)
+  const gridRef = useRef<HTMLDivElement | null>(null);
+  // 记上一次列表长度:重拉后按「新长度 − 旧长度」算出"被插到最前面的条数",给 scrollTop 补位(spec D13)
   const prevLenRef = useRef(0);
+  // 待补位的条数。**不在 rAF 里补**:rAF 早于/不晚于 React 提交,可能读到旧 scrollHeight,赋值被 clamp 回
+  // scrollHeight-clientHeight(等于没补)。改由下面的 useLayoutEffect 在**提交后**补(见该 effect 注释)。
+  const pendingDeltaRef = useRef(0);
+  // 补偿锚点:重拉那一刻的 scrollTop。布局阶段据此写回"锚点 + 新增行高",不依赖补位瞬间的 scrollTop
+  // (那时浏览器的滚动锚定可能已经动过它)。
+  const anchorTopRef = useRef(0);
 
   // 过滤(spec §0.5:按作品名 / 所属资料名过滤)。放在 effects 之前,供 IntersectionObserver 的依赖使用。
   const q = query.trim().toLowerCase();
@@ -140,12 +157,13 @@ export default function StudioPage(): JSX.Element {
           setWorks(rows);
           setError(null);
           // 服务端按 updated_at 倒序返回 → 新作品 / 刚改过的作品会插在**最前**,已有内容整体下移。
-          // 给 scrollTop 补上这几位的高度,正在看第 3 屏的用户就不会被顶回顶部(只在"本来就滚着"时补)。
+          // 给 scrollTop 补上这几行的高度,正在看第 3 屏的用户就不会被顶回顶部。
+          // 这里**只记账**,真正补位交给下面的 useLayoutEffect(必须在 React 提交之后做,理由见 pendingDeltaRef 注释)。
+          // 顺带把用户当时的滚动位置记下来:布局阶段的补位要"加在原位置之上",而那时 scrollTop 可能已被浏览器的
+          // 滚动锚定动过 —— 用补偿前记下的锚点更稳(补位只在意"补多少",不依赖补位瞬间的 scrollTop)。
           if (delta > 0) {
-            requestAnimationFrame(() => {
-              const el = scrollRef.current;
-              if (el !== null && el.scrollTop > 0) el.scrollTop += delta * ROW_HEIGHT_EST;
-            });
+            pendingDeltaRef.current = delta;
+            anchorTopRef.current = scrollRef.current?.scrollTop ?? 0;
           }
         })
         .catch((e: Error) => { setError(e.message); logFe('error', `拉取作品列表失败: ${e.message}`); });
@@ -164,6 +182,28 @@ export default function StudioPage(): JSX.Element {
     window.addEventListener('focus', load);
     return () => { off(); document.removeEventListener('visibilitychange', onVisible); window.removeEventListener('focus', load); };
   }, []);
+
+  // 滚动位置补偿（2026-10-02 N3 改：按**实际行数**补，不再按"条数 × 固定行高"）。
+  // 旧算法两处不准：① 网格是 auto-fill 多列，插 K 条只下移 ⌈K/列数⌉ 行，按每条 210px 累加会**过量下移**；
+  // ② 补位写在 rAF 里，而 rAF 不保证晚于 React 提交 —— 提交还没发生、scrollHeight 还是旧的，
+  //    `scrollTop += X` 会被浏览器 clamp 回 scrollHeight - clientHeight，等于没补。
+  // 现在：load() 只记账（pendingDeltaRef / anchorTopRef），本 effect 在**每次提交后**、浏览器绘制前补位。
+  // 为什么用 useLayoutEffect 而不是 useEffect：后者在绘制后才跑，用户会看到"先跳上去、再被拉回来"的一帧闪动。
+  // 为什么列数要从 gridRef 的实测宽度反解：解除限宽后列数随窗口变，写死列数/条数都是猜。
+  useLayoutEffect(() => {
+    const delta = pendingDeltaRef.current;
+    if (delta <= 0) return;
+    pendingDeltaRef.current = 0; // 先清：下面的异常路径也不能留着下次再补一遍
+    const el = scrollRef.current;
+    const anchor = anchorTopRef.current;
+    if (el === null || anchor <= 0) return; // 本来就停在顶部:补位只会把用户无端往下推,维持原行为
+    const cols = columnCountOf(gridRef.current?.clientWidth ?? 0);
+    // 降级说明（诚实）：量不到网格宽度（首帧还没布局 / 网格未渲染）时 cols=0，
+    //   此时退回旧估算"每条一行"。这仍会过量下移，但**只在量不到宽度的那一次**发生，且不会更糟于修复前。
+    const rows = cols > 0 ? Math.ceil(delta / cols) : delta;
+    el.scrollTop = anchor + rows * ROW_HEIGHT_EST;
+    logFe('info', `作品列表重拉补滚动位 新增=${delta} 列数=${cols > 0 ? cols : '(量不到,按每条一行降级)'} 下移行数=${rows} 补=${rows * ROW_HEIGHT_EST}px 锚点=${anchor}`);
+  });
 
   // 无限下拉:哨兵元素进视口 → 多渲染一批。**重拉列表不重置 shown、不给容器加 key** →
   // 已渲染内容与滚动位置天然保住(配合上面的 scrollTop 补位,spec D13 的"不跳回顶部"才真的成立)。
@@ -231,15 +271,29 @@ export default function StudioPage(): JSX.Element {
   const pageWorks = visible.slice(0, shown);
 
   const body: ReactNode = (
-    <div style={{ width: '100%', maxWidth: CARDS_MAX_WIDTH, margin: '0 auto' }}>
+    // N3（2026-10-02，用户当天拍板）：**解除 1160px 硬限宽，改为只保留左右最小边距**。
+    // 原先 maxWidth:1160 + margin:0 auto，1495px 窗口两侧各空 (1495−1160)/2 ≈ 167px 纯空白，
+    // 而这里没有背景色差，视觉上就是"东西挤在中间、两边空着"。现在宽度吃满可用空间，列数交给 auto-fill 自适应。
+    // 边距取 24px：与页面外层 padding:16 叠加后够透气又不至于像限宽那样浪费一列的宽度。
+    // 实际留白（1495px 窗口实测，Chrome dpr1.5）：窗口左缘到网格左缘 48px（body 默认 margin 8 + 页面 padding 16 + 这里 24），
+    // 网格右缘到滚动容器右缘 43px（24 + 滚动容器 paddingRight 4 + 15px 垂直滚动条占位）。
+    <div style={{ width: '100%', padding: `0 ${CARDS_SIDE_PAD}px`, boxSizing: 'border-box' }}>
       {visible.length === 0 ? (
         // 空态:一个作品都没有(或搜索无结果)。**这里不放「新建作品」按钮** —— 新建入口按 spec 只在 toolbar 上,
         // 空态再放一个会与 toolbar 的按钮重复。弹层(T8 已落地)挂在页面末尾,toolbar 按钮点它。
         <Empty description={q === '' ? '还没有剪辑作品' : `没有匹配「${query.trim()}」的作品`} style={{ marginTop: 64 }} />
       ) : (
         <>
-          {/* 卡片网格:auto-fill + 最小宽 —— 窗口越宽列数越多;整块居中限宽,超宽屏不把卡片拉成巨幅 */}
-          <div style={{ display: 'grid', gridTemplateColumns: `repeat(auto-fill, minmax(${CARD_MIN_WIDTH}px, 1fr))`, gap: 12 }}>
+          {/* 卡片网格:auto-fill + 最小宽 —— 窗口越宽列数越多。**这里不写死列数**：列数只由网格实测宽决定，
+              反解公式见 columnCountOf（那才是滚动补偿唯一依赖的口径）。
+              1495px 窗口实测（Chrome dpr1.5，取自 getComputedStyle(grid).gridTemplateColumns 的轨道条数）：
+                · 列表短、无滚动条 → 网格内容宽 1380px → 6 列（轨道各 220px）
+                · 列表长、有 15px 滚动条 → 网格内容宽 1365px → 6 列（轨道各约 217.4px）
+                · 解除限宽前（把网格宽设成旧版的 1160px）→ 浏览器实排 5 列
+              即这一轮是 **5 列 → 6 列**。（PRD 里「1160px 能放 6 列」漏算了 5 个 12px 间距：
+              6 列要占 6×190+5×12=1200 > 1160；排 7 列要网格宽 ≥ 7×190+6×12=1402px，对应窗口 ≥1517px。）
+              gridRef 供滚动补偿反解实际列数用（见 useLayoutEffect 处注释），别删。 */}
+          <div ref={gridRef} style={{ display: 'grid', gridTemplateColumns: `repeat(auto-fill, minmax(${CARD_MIN_WIDTH}px, 1fr))`, gap: CARD_GAP }}>
             {pageWorks.map((w) => (
               <WorkCard
                 key={w.id}

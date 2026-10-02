@@ -31,6 +31,10 @@ export function ingestDownloadedFile(opts: {
   entryIndex?: number | null; collectionTitle?: string | null; // 剧集信息:第几集 / 所属合集(单视频不传)
   /** D8：剪辑/导出产物传 'edit'；缺省 'download'（老下载路径不变——回归保护） */
   sourceType?: 'download' | 'edit';
+  /** 2026-10-02 spec video-export D1:成品类型与视频宽高;不传 → 'audio'/null/null(老调用零回归) */
+  mediaKind?: 'audio' | 'video';
+  width?: number | null;
+  height?: number | null;
   exists: (p: string) => boolean; audioRepo: AudioItemsRepo;
 }): { audioId: number; finalPath: string } {
   const audioId = opts.audioRepo.create({
@@ -38,6 +42,7 @@ export function ingestDownloadedFile(opts: {
     entry_index: opts.entryIndex ?? null, collection_title: opts.collectionTitle ?? null,
     source_import_id: opts.sourceImportId ?? null,
     source_work_id: opts.sourceWorkId ?? null,
+    media_kind: opts.mediaKind ?? 'audio', width: opts.width ?? null, height: opts.height ?? null,
     file_path: opts.tmpPath, format: opts.format, duration_sec: opts.durationSec, file_size: opts.fileSize,
   });
   const id8 = String(audioId).padStart(8, '0').slice(-8);

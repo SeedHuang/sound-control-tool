@@ -68,15 +68,27 @@ export default function LibraryPage() {
   const refreshImports = (): Promise<ImportSource[]> =>
     listImports().then((list) => { setImports(list); return list; });
 
+  // 选中来源的序号守卫(W2,2026-10-02 deferred 批):selectSource 会被「首挂载预选」与「弹窗解析后选中新来源」
+  // 交错调用,getImport 响应乱序到达时,旧响应不得覆盖新选中的来源(同 probeSeq 的现成范式:先自增再判早退)。
+  const selectSeq = useRef(0);
   const selectSource = (id: number): void => {
+    const seq = ++selectSeq.current;
     setSelectedId(id); setError(null); setDone(null);
     setCoverFailed(false); setVideoFailed(false); // 换来源 → 共用位错误态复位(Task 9)
     getImport(id)
       .then((d) => {
+        if (seq !== selectSeq.current) return; // 过期响应丢弃:用户已切到别的来源,旧详情不得写回
         setDetail(d);
         setVideoSelectedIndex(null); // 换来源 → 视频单选复位(与 setDetail 同批;「默认选中素材所在集」的 effect 会按新来源重新挑)
       })
-      .catch((e: Error) => setError(e.message));
+      .catch((e: Error) => {
+        if (seq !== selectSeq.current) return; // 过期失败同样丢弃:不得清掉最新选中的详情
+        setError(e.message);
+        // 失败即复位 detail(W2):否则 detail 停在旧来源而 selectedId 已指向新来源,staleSource 恒为真 →
+        // 剪辑按钮永久灰、tooltip 一直说「正在切换来源…」,要点一次左列表才能恢复。
+        // 复位后 staleSource 判据自洽(detail 为 null),错误条照常显示,再点一次左列表即可重试。
+        setDetail(null);
+      });
   };
 
   // 预选来源(P5-T3 / Ruling P5-3):从首页「最近下载」点进来时路径带 ?id=N —— 列表加载完若匹配到该 id 就选中它,
@@ -240,7 +252,7 @@ export default function LibraryPage() {
   // D19 下载判定链(Task 9 从 onDownloadVideo 抽出——工具栏"下载"与"点击集数"共用这一份,不复制第二份):
   // playlist 目标集必填;素材行存在且(集号未知 或 目标集 ≠ 当前素材集)→ 弹替换确认;首次下载/同集 → 直接下(服务端覆盖,不确认)。
   // 2026-09-30 终审修:原判定 `currentMaterialEp !== null && ...` 对「素材行存在但集号为 NULL」的存量素材跳过确认,
-  // 而服务端此时仍会清空该来源剪辑工程 → 集号未知也必须弹;集号已知且相同(同集换清晰度)维持不弹。
+  // 而服务端此时仍会清空该来源下作品的剪辑点(2026-10-01 spec clip-works D8) → 集号未知也必须弹;集号已知且相同(同集换清晰度)维持不弹。
   const requestDownloadVideo = (targetEp: number | null): void => {
     if (detail === null || busy) return;
     if (detail.kind === 'playlist') {

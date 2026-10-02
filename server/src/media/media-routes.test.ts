@@ -15,7 +15,7 @@ import { createJobsRepo } from '../db/repo/jobs.js';
 import { createSourceVideosRepo } from '../db/repo/source-videos.js';
 import { getLogs } from '../logs.js';
 import { formatClipTitle, registerMediaRoutes } from './media-routes.js';
-import { invalidateDerived } from './derived-images.js';
+import { ensureDerivedImage, invalidateDerived } from './derived-images.js';
 
 // ffmpeg 路径桩:R2-d 返回桩路径;R2-e 置 null 验证「拿不到 ffmpeg 不得静默」(spec D16/D10)
 const ffmpegStub = vi.hoisted(() => ({ path: 'C:/stub/ffmpeg.exe' as string | null }));
@@ -242,6 +242,46 @@ describe('媒体素材路由', () => {
     const res = await app.inject({ method: 'GET', url: '/api/media/1/waveform?token=wrong' });
     expect(res.statusCode).toBe(401);
     expect((res.json() as { error: { code: string } }).error.code).toBe('UNAUTHORIZED');
+  });
+  it('派生图:探测失败 PROBE_FAIL → 422（素材本身的问题，不是服务端故障），next 不得让人去查 ffmpeg 配置（那是误导，ffprobe 本身可能是好的）', async () => {
+    const importId = createImportsRepo(db).upsertByUrl({ url: 'https://a/pl', title: 't', site: 'bilibili', kind: 'single', duration_sec: null, entries: null });
+    const p = join(mediaDir, `media-${importId}.mp4`);
+    writeFileSync(p, 'V');
+    createSourceVideosRepo(db).upsert({ importId, filePath: p, height: 480, fileSize: 1 });
+    vi.mocked(ensureDerivedImage).mockResolvedValueOnce({ ok: false, code: 'PROBE_FAIL', message: '素材信息读取失败，无法生成画轨：视频文件可能未下载完整或已损坏' });
+    const res = await app.inject({ method: 'GET', url: `/api/media/${importId}/filmstrip?token=tok` });
+    expect(res.statusCode).toBe(422);
+    const err = (res.json() as { error: { code: string; next: string } }).error;
+    expect(err.code).toBe('PROBE_FAIL');
+    expect(err.next).not.toContain('ffmpeg');
+    expect(err.next).toContain('重新下载');
+  });
+  it('派生图:FFMPEG_FAIL → 500，next 提设置页 + 带上「素材已损坏」（只写设置页会把人引到错的地方）', async () => {
+    const importId = createImportsRepo(db).upsertByUrl({ url: 'https://a/pl', title: 't', site: 'bilibili', kind: 'single', duration_sec: null, entries: null });
+    const p = join(mediaDir, `media-${importId}.mp4`);
+    writeFileSync(p, 'V');
+    createSourceVideosRepo(db).upsert({ importId, filePath: p, height: 480, fileSize: 1 });
+    vi.mocked(ensureDerivedImage).mockResolvedValueOnce({ ok: false, code: 'FFMPEG_FAIL', message: 'ffmpeg 失败（1）：Invalid data found' });
+    const res = await app.inject({ method: 'GET', url: `/api/media/${importId}/filmstrip?token=tok` });
+    expect(res.statusCode).toBe(500);
+    const err = (res.json() as { error: { code: string; next: string } }).error;
+    expect(err.next).toContain('ffmpeg');
+    expect(err.next).toContain('损坏');
+    // 2026-10-02 复核实测：ffmpeg 9.0.2 上 0.1~1.5 秒八档素材**全部正常出 PNG**
+    //（tile 在 EOF 会冲刷不满的 tile），所以「素材太短（不足 1 秒）也会失败」是假话、
+    // 会把用户引向一个不存在的病因。断言反锁，防止这句话被加回来。
+    expect(err.next).not.toContain('太短');
+    expect(err.next).not.toContain('不足 1 秒');
+  });
+  it('派生图:NO_FFMPEG 仍指向设置页（别把两种失败原因混成一句提示）', async () => {
+    const importId = createImportsRepo(db).upsertByUrl({ url: 'https://a/pl', title: 't', site: 'bilibili', kind: 'single', duration_sec: null, entries: null });
+    const p = join(mediaDir, `media-${importId}.mp4`);
+    writeFileSync(p, 'V');
+    createSourceVideosRepo(db).upsert({ importId, filePath: p, height: 480, fileSize: 1 });
+    vi.mocked(ensureDerivedImage).mockResolvedValueOnce({ ok: false, code: 'NO_FFMPEG', message: 'ffmpeg 未找到或未配置' });
+    const res = await app.inject({ method: 'GET', url: `/api/media/${importId}/filmstrip?token=tok` });
+    expect(res.statusCode).toBe(500);
+    expect((res.json() as { error: { next: string } }).error.next).toContain('ffmpeg');
   });
   it('DELETE /api/media/:id → 作废派生图（invalidateDerived 调一次）', async () => {
     const importId = createImportsRepo(db).upsertByUrl({ url: 'https://a/pl', title: 't', site: 'bilibili', kind: 'single', duration_sec: null, entries: null });

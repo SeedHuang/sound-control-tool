@@ -6,7 +6,9 @@ import { inTransaction } from './tx.js';
 /** clip_projects 的列定义(**唯一真相**,2026-10-01 OCR 审查 F4)：
  *  SCHEMA_SQL 的建表与迁移里的 `CREATE TABLE clip_projects_new (...)` 共用这一份 —— 两处建表语句不再各写各的。
  *  ⚠️ 边界(2026-10-01 F7 二轮):`rebuildWorkTable` 里的 `INSERT INTO clip_projects_new (列清单) SELECT ...`
- *  仍是手写列清单;新增列若不写进那句 INSERT,老库迁移时该列只会**取默认值**(NULL),不是"改完这一处就完事"。 */
+ *  仍是手写列清单;新增列若不写进那句 INSERT,老库迁移时该列只会**取默认值**(NULL),不是"改完这一处就完事"。
+ *  import_id **不再 UNIQUE**(2026-10-01 spec clip-works D1:一个资料可有多件作品,1:N)——
+ *  按 import_id 的查询靠紧随建表语句的 idx_clip_projects_import 索引(OCR 审查 F3 补回)。 */
 const CLIP_PROJECTS_COLUMNS =
   'id INTEGER PRIMARY KEY AUTOINCREMENT, ' +
   'import_id INTEGER NOT NULL, ' +
@@ -31,6 +33,12 @@ CREATE TABLE IF NOT EXISTS audio_items (
   format TEXT NOT NULL,
   duration_sec REAL,
   file_size INTEGER,
+  -- 2026-10-02 spec video-export D1:导出内容三选(音频 / 视频带音轨 / 视频纯视频),视频成品入库同一张表,
+  -- 展示层按 media_kind 分流;width/height 仅视频有值(音频 NULL),分辨率徽标用。
+  -- 老库靠 initSchema 的 ensureColumns 补列(照 source_work_id 先例);表名沿用 audio_items 不改(spec D1,clip_projects 同款先例)
+  media_kind TEXT NOT NULL DEFAULT 'audio' CHECK (media_kind IN ('audio','video')),
+  width INTEGER,
+  height INTEGER,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE TABLE IF NOT EXISTS jobs (
@@ -288,6 +296,13 @@ export function initSchema(db: DB, opts?: { dbPath?: string }): void {
   //   它是老库一次性整理(与重建同生命周期),且新库里的"无归属成品"是 bug 信号、应由安全网展示而非自动删。
   ensureColumns(db, 'audio_items', [
     { name: 'source_work_id', ddl: 'source_work_id INTEGER' }, // 指向 clip_projects.id;成品才有
+  ]);
+  // 2026-10-02 spec video-export D1:视频成品 3 列(老库补列;新库 SCHEMA_SQL 已直接建,这里幂等跳过)。
+  // 不触发备份/重建:加列是无破坏性操作,备份语义只挂下方 needsWorkTableRebuild 的重建路径。
+  ensureColumns(db, 'audio_items', [
+    { name: 'media_kind', ddl: "media_kind TEXT NOT NULL DEFAULT 'audio' CHECK (media_kind IN ('audio','video'))" },
+    { name: 'width', ddl: 'width INTEGER' },
+    { name: 'height', ddl: 'height INTEGER' },
   ]);
   if (needsWorkTableRebuild(db)) {
     // ⚠️ backupDbFile 依赖调用方传进来的 opts.dbPath(F1):真实启动路径由 bootstrap() 先调本函数(且重建就发生在这里),

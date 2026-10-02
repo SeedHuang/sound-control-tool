@@ -1,18 +1,20 @@
-// 导出任务(spec D9/D15/D8):separate 每段一条音频入库;merge concat 成一条。
+// 导出任务(spec D9/D15/D8):separate 每段一条成品入库;merge concat 成一条。
+// 2026-10-02 spec video-export:mediaKind 分流——audio(mp3/m4a/wav,重编码)/video(mp4/H.264,separate 逐段编码、
+//   merge 两阶段=逐段同参编码→concat demuxer -c copy),取消守卫 cancelGuard 两分支都走,视频编码 timeoutMs=1h。
 // 与 clip-job.ts 同族:产物走 ingestDownloadedFile + sourceType='edit'(D8),标题由后端强制拼(前端传的 label/title 不作前缀)。
 // 2026-10-01 spec clip-works:成品挂作品(D4)、payload 带作品名(D19)、入库前校验作品仍在(D22)。
-import { existsSync, mkdirSync, rmSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { DB } from '../db/index.js';
 import { createAudioItemsRepo } from '../db/repo/audio-items.js';
 import { createClipProjectsRepo } from '../db/repo/clip-projects.js';
 import { createJobsRepo } from '../db/repo/jobs.js';
 import { runClip, runFfmpegArgs } from '../ffmpeg/clip.js';
-import { buildMergeArgs } from '../ffmpeg/export-args.js';
+import { buildMergeArgs, buildVideoClipArgs, buildVideoConcatArgs, crfOf } from '../ffmpeg/export-args.js';
 import { pushLog } from '../logs.js';
 import { resolveOutputDir } from '../output-dir.js';
 import { emit } from '../ytdlp/job-events.js';
-import { probeDuration } from '../ytdlp/ffprobe.js';
+import { probeDuration, probeVideoMeta } from '../ytdlp/ffprobe.js';
 import { ingestDownloadedFile } from '../ytdlp/ingest.js';
 import { formatClipTitle } from './clip-job.js';
 import { resolveFfmpegPath } from './ffmpeg-path.js';
@@ -25,6 +27,10 @@ export interface ExportJobPayload {
   projectId: number;
   /** 2026-10-01 spec clip-works D19：任务抽屉优先显示的作品名；无命名 → null */
   workName: string | null;
+  /** 2026-10-02 spec video-export D2：导出内容类型；缺省 'audio'（老 payload 重试兼容，读取处一律 ==='video' 判断） */
+  mediaKind?: 'audio' | 'video';
+  /** 2026-10-02 spec video-export D3：纯视频（-an，不带音轨）；仅 mediaKind='video' 有意义 */
+  videoAn?: boolean;
 }
 /** merge 的标题:前缀 [共N段](spec §0.3) */
 export function formatMergeTitle(prefix: string, count: number): string { return `${prefix} [共${count}段]`; }
@@ -37,8 +43,40 @@ export async function startExportJob(jobId: number, payload: ExportJobPayload, d
   const jobsRepo = createJobsRepo(deps.db);
   const projectsRepo = createClipProjectsRepo(deps.db);
   jobsRepo.update(jobId, { status: 'running' });
-  // 失败收敛:置 error + 日志 + SSE 终态(一次写完,避免逐处漂移)——source 用 'job'(导出是 job 语义)
-  const fail = (msg: string): void => { jobsRepo.fail(jobId, msg); pushLog('error', 'job', `export job ${jobId} 失败: ${msg}`); emit(jobId, { type: 'status', state: 'error', message: msg }); };
+  // 失败收敛:置 error + 日志 + SSE 终态(一次写完,避免逐处漂移)——source 用 'job'(导出是 job 语义)。
+  // H2(2026-10-01 OCR 审查):已取消的任务不得被后续失败覆写成 error——取消是用户的终态意图,
+  // ffmpeg 失败只留日志;否则记录里「用户取消了」会变成「任务失败」,误导排障。
+  const fail = (msg: string): void => {
+    if (jobsRepo.get(jobId)?.status === 'cancelled') {
+      pushLog('info', 'job', `export job ${jobId} 已取消，忽略后续失败: ${msg}`);
+      return;
+    }
+    jobsRepo.fail(jobId, msg);
+    pushLog('error', 'job', `export job ${jobId} 失败: ${msg}`);
+    emit(jobId, { type: 'status', state: 'error', message: msg });
+  };
+  // H2:取消收敛守卫——取消路由杀不了正在跑的 ffmpeg(它不在任何进程登记表里),跑完后若照旧入库 + finish(),
+  // cancelled 会被覆写成 done、用户明确不要的产物还会进库。故每个 await 之后、入库之前查一次:
+  // 已取消 → 丢弃临时产物 + 留痕,返回 true 让调用方收尾(维持 cancelled 终态,不再 emit——终态事件取消路由已发过)。
+  // 修复轮 1(2026-10-02 独立审查 Important):separate 逐段 ingest,取消落在第 k 段时前 k-1 段已成品入库,
+  // 且 cancelled 不可重试——这些段永久保留。处置取「保留 + 诚实」:不回滚(回滚=白扔已花的编码时间,
+  // 且引入取消路径上删行删文件的新风险),改为把保留事实写进 job message(任务抽屉轮询读 DB 可见)。
+  // kept=当时已入库段数:separate 传 produced.length;merge(或首段前取消)传 0 → 不改 message,
+  // 维持取消路由写的「用户取消」,不打「已保留 0 段」这种没信息量的话。
+  const cancelGuard = (tmp: string, kept: number): boolean => {
+    if (jobsRepo.get(jobId)?.status !== 'cancelled') return false;
+    try { rmSync(tmp, { force: true }); } catch { /* 尽力清理 */ }
+    if (kept > 0) {
+      // 只改 message 不动 status:repo.update 只传 message 时不碰 status/finished_at;
+      // 不得用 finish/fail——它们会覆写 status(正是 H2 修掉的坑)
+      const msg = `已取消：前 ${kept} 段成品已保留，可在作品成品列表查看或删除`;
+      jobsRepo.update(jobId, { message: msg });
+      pushLog('info', 'job', `取消导出 job=${jobId} 保留段数=${kept}`);
+    } else {
+      pushLog('info', 'job', `export job ${jobId} 用户已取消 → 丢弃产物,维持 cancelled`);
+    }
+    return true;
+  };
   // D22:导出是异步长任务(几十秒到几分钟),用户完全可能中途删掉作品 → 入库前必须重查,
   // 否则会写出一条指向已删作品的成品(悬空行 + 白占一份文件)。丢弃产物 + 置 error + 记日志。
   const discardIfWorkGone = (tmp: string): boolean => {
@@ -65,19 +103,100 @@ export async function startExportJob(jobId: number, payload: ExportJobPayload, d
     }
     pushLog('info', 'job', `export job ${jobId} 目标目录 ${outputDir}`);
     const audioRepo = createAudioItemsRepo(deps.db);
-    // 统一的入库入口:sourceType='edit'(D8)——导出产物是「剪辑」而非「下载」
-    const ingest = (tmp: string, title: string, durationSec: number | null): number => {
+    // 统一的入库入口:sourceType='edit'(D8)——导出产物是「剪辑」而非「下载」。
+    // N1 Task 3(spec video-export):kind=video 时 format 固定 'mp4'(payload.format 由路由层保证,
+    // 防御性忽略其它值——分支入口记日志不中断),media_kind/width/height 随视频元数据透传;
+    // 音频调用处签名不变(第四参不传 → 'audio'/null/null,老路径零回归)。
+    const ingest = (tmp: string, title: string, durationSec: number | null, videoMeta?: { width: number | null; height: number | null }): number => {
+      const isVideo = payload.mediaKind === 'video';
       const audioId = ingestDownloadedFile({
-        tmpPath: tmp, title, format: payload.format, durationSec,
+        tmpPath: tmp, title, format: isVideo ? 'mp4' : payload.format, durationSec,
         fileSize: statSync(tmp).size, sourceUrl: '', entryIndex: null, collectionTitle: null,
         sourceType: 'edit',
         sourceImportId: payload.importId, // Spec A 的冗余列,继续写(权威是作品 D5)
         sourceWorkId: payload.projectId,   // 2026-10-01 spec clip-works D4:成品挂作品
+        mediaKind: isVideo ? 'video' : 'audio',
+        width: videoMeta?.width ?? null, height: videoMeta?.height ?? null,
         audioDir: outputDir, exists: existsSync, audioRepo,
       }).audioId;
       pushLog('info', 'job', `export job ${jobId} 入库 audio=${audioId} source_import_id=${payload.importId} source_work_id=${payload.projectId}`);
       return audioId;
     };
+
+    // ===== 2026-10-02 spec video-export(N1 Task 3):视频分支 =====
+    // 位置:必须在音频分支之前——视频 payload 的 mode 也是 'separate'/'merge',若排在音频判断后面会先掉进音频分支。
+    // kind=video:format 固定按 'mp4'(payload.format 由路由层保证,防御性忽略其它值——记日志不中断);
+    // 编码参数/超时/拼接方式全部按 plan 实测参数表(A1-A5),不自由发挥。
+    if (payload.mediaKind === 'video') {
+      // 防御检查按运行时值(payload 是 DB JSON 反序列化产物,类型窄不等于运行时值受保证;as string 宽化以通过 TS2367)
+      if ((payload.format as string) !== 'mp4') pushLog('info', 'job', `export job ${jobId} kind=video format=${payload.format} 非 mp4 → 防御性按 mp4 处理`);
+      const crf = crfOf(payload.quality);       // high→20、mid/缺省→23、low→28(实测 A4)
+      const an = payload.videoAn === true;      // 缺省 false(带音轨),只有显式 true 才 -an(实测 A3)
+      pushLog('info', 'job', `export job ${jobId} kind=video mode=${payload.mode} crf=${crf} an=${an} 段数=${payload.segments.length}`);
+      if (payload.mode === 'separate') {
+        const produced: number[] = [];
+        for (let i = 0; i < payload.segments.length; i++) {
+          const seg = payload.segments[i]!;
+          // 临时产物名唯一(spec D14 同族):固定名字会被并发任务互相覆盖
+          const tmp = join(deps.tempDir, `export-${jobId}-${i}-${Date.now()}.mp4`);
+          const r = await runFfmpegArgs({ ffmpegPath, args: buildVideoClipArgs({ inputPath: payload.videoPath, outPath: tmp, start: seg.start_sec, end: seg.end_sec, crf, an }), outPath: tmp, timeoutMs: 3_600_000 }); // 4K 实测:默认 120s 不够
+          if (!r.ok) { try { rmSync(tmp, { force: true }); } catch { /* 尽力清理 */ } fail(`导出第 ${i + 1} 段失败：${tail(r.stderr)}`); return; }
+          const title = formatClipTitle(payload.prefix, seg.start_sec, seg.end_sec); // 前端传的 label/title 不作前缀（后端强制拼）
+          const dur = await probeDuration(ffprobePath, tmp);
+          const meta = await probeVideoMeta(ffprobePath, tmp); // 宽高入库(探测失败 → null,按未知处理不失败)
+          pushLog('info', 'job', `export job ${jobId} 第 ${i + 1}/${payload.segments.length} 段请求 ${seg.start_sec}-${seg.end_sec}s，实测 ${dur ?? '?'}s ${meta.width ?? '?'}x${meta.height ?? '?'}`);
+          if (cancelGuard(tmp, produced.length)) return; // H2:已取消 → 丢弃本段,维持 cancelled;kept=已入库段数,message 写明保留事实
+          if (discardIfWorkGone(tmp)) return; // D22:逐段入库前校验(作品没了就丢弃这一段)
+          produced.push(ingest(tmp, title, dur, meta));
+          emit(jobId, { type: 'progress', percent: Math.round(((i + 1) / payload.segments.length) * 100) });
+        }
+        jobsRepo.finish(jobId);
+        pushLog('info', 'job', `export job ${jobId} done mode=separate kind=video → ${produced.length} 条`);
+        emit(jobId, { type: 'done', kind: 'video', audioId: produced[0]!, title: `${payload.prefix}（共 ${produced.length} 段）`, format: 'mp4', replaced: false, count: produced.length });
+        return;
+      }
+
+      // merge 视频两阶段(实测 A5:逐段同参编码 → concat demuxer -c copy 0.46s,vs 重编码 42.89s,93 倍):
+      // 阶段一逐段编码 export-<jobId>-m<i>-<ts>.mp4(同 crf/an);全部成功后写 concat 列表文件
+      // (每行 file 'C:/xxx/seg.mp4',路径统一正斜杠——Windows 反斜杠在 concat demuxer 里是转义符),
+      // 阶段二 -f concat -safe 0 -c copy 拼一条。每阶段之间都过 cancelGuard;任一段失败 → fail + 已产段清理。
+      // 列表文件与中间段用后删(成功/失败/取消路径统一走 finally——成功时最终产物已被 ingest rename 走)。
+      const segPaths: string[] = [];
+      let listPath: string | null = null;
+      try {
+        for (let i = 0; i < payload.segments.length; i++) {
+          const seg = payload.segments[i]!;
+          const tmp = join(deps.tempDir, `export-${jobId}-m${i}-${Date.now()}.mp4`);
+          const r = await runFfmpegArgs({ ffmpegPath, args: buildVideoClipArgs({ inputPath: payload.videoPath, outPath: tmp, start: seg.start_sec, end: seg.end_sec, crf, an }), outPath: tmp, timeoutMs: 3_600_000 });
+          if (!r.ok) { try { rmSync(tmp, { force: true }); } catch { /* 尽力清理 */ } fail(`导出第 ${i + 1} 段失败：${tail(r.stderr)}`); return; }
+          if (cancelGuard(tmp, 0)) return; // H2:merge 无已入库段,kept=0 不写保留话术
+          pushLog('info', 'job', `export job ${jobId} 第 ${i + 1}/${payload.segments.length} 段编码完成 crf=${crf} an=${an}`);
+          segPaths.push(tmp);
+        }
+        listPath = join(deps.tempDir, `export-${jobId}-concat-${Date.now()}.txt`);
+        writeFileSync(listPath, segPaths.map((p) => `file '${p.replace(/\\/g, '/')}'`).join('\n') + '\n', 'utf8'); // 正斜杠 + 单引号包裹(concat demuxer 语法);utf8 无 BOM
+        pushLog('info', 'job', `export job ${jobId} concat 列表就绪 ${listPath}(${segPaths.length} 段)`);
+        const tmpOut = join(deps.tempDir, `export-${jobId}-merge-${Date.now()}.mp4`);
+        const r = await runFfmpegArgs({ ffmpegPath, args: buildVideoConcatArgs({ listPath, outPath: tmpOut }), outPath: tmpOut });
+        if (!r.ok) { try { rmSync(tmpOut, { force: true }); } catch { /* 尽力清理 */ } fail(`合并导出失败：${tail(r.stderr)}`); return; }
+        const title = formatMergeTitle(payload.prefix, payload.segments.length);
+        const dur = await probeDuration(ffprobePath, tmpOut);
+        const meta = await probeVideoMeta(ffprobePath, tmpOut);
+        pushLog('info', 'job', `export job ${jobId} concat 完成 实测 ${dur ?? '?'}s ${meta.width ?? '?'}x${meta.height ?? '?'}`);
+        if (cancelGuard(tmpOut, 0)) return; // H2:已取消 → 丢弃产物,维持 cancelled
+        if (discardIfWorkGone(tmpOut)) return; // D22:合并产物入库前校验一次
+        const audioId = ingest(tmpOut, title, dur, meta);
+        jobsRepo.finish(jobId);
+        pushLog('info', 'job', `export job ${jobId} done mode=merge kind=video → audio ${audioId} @ ${title}`);
+        emit(jobId, { type: 'done', kind: 'video', audioId, title, format: 'mp4', replaced: false, count: 1 });
+      } finally {
+        // 过程文件清理:中间段(finally 里只清已编码成功的段;失败段自身在其分支已删)+ concat 列表文件。
+        // rmSync force:不存在也不抛(与音频分支同口径);最终产物不在清理之列(已被 ingest rename 走)
+        for (const p of segPaths) { try { rmSync(p, { force: true }); } catch { /* 尽力清理 */ } }
+        if (listPath !== null) { try { rmSync(listPath, { force: true }); } catch { /* 尽力清理 */ } }
+      }
+      return;
+    }
 
     if (payload.mode === 'separate') {
       const produced: number[] = [];
@@ -90,6 +209,7 @@ export async function startExportJob(jobId: number, payload: ExportJobPayload, d
         const title = formatClipTitle(payload.prefix, seg.start_sec, seg.end_sec); // 前端传的 label/title 不作前缀（后端强制拼）
         const dur = await probeDuration(ffprobePath, tmp);
         pushLog('info', 'job', `export job ${jobId} 第 ${i + 1}/${payload.segments.length} 段请求 ${seg.start_sec}-${seg.end_sec}s，实测 ${dur ?? '?'}s`);
+        if (cancelGuard(tmp, produced.length)) return; // H2:已取消 → 丢弃本段,维持 cancelled;kept=已入库段数,message 写明保留事实
         if (discardIfWorkGone(tmp)) return; // D22:逐段入库前校验(作品没了就丢弃这一段)
         produced.push(ingest(tmp, title, dur));
         emit(jobId, { type: 'progress', percent: Math.round(((i + 1) / payload.segments.length) * 100) });
@@ -108,6 +228,7 @@ export async function startExportJob(jobId: number, payload: ExportJobPayload, d
     if (!r.ok) { try { rmSync(tmp, { force: true }); } catch { /* 尽力清理 */ } fail(`合并导出失败：${tail(r.stderr)}`); return; }
     const title = formatMergeTitle(payload.prefix, payload.segments.length);
     const dur = await probeDuration(ffprobePath, tmp);
+    if (cancelGuard(tmp, 0)) return; // H2:已取消 → 丢弃产物,维持 cancelled;merge 无已入库段,kept=0 不写保留话术
     if (discardIfWorkGone(tmp)) return; // D22:合并产物入库前校验一次
     const audioId = ingest(tmp, title, dur);
     jobsRepo.finish(jobId);

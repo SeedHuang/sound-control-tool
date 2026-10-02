@@ -67,7 +67,7 @@ describe('GET /api/home —— editing(正在编辑 Top3)', () => {
     expect(res.json()).toEqual({ ok: true, editing: [], recent: [] });
   });
 
-  it('3 个工程按 updated_at 倒序;segment_count 正确;name 为 NULL 回 null', async () => {
+  it('3 个作品按 updated_at 倒序;segment_count 正确;name 为 NULL 回 null', async () => {
     const a = addImport('https://b/1', '来源A', 'bilibili');
     const b = addImport('https://b/2', '来源B', 'youtube');
     const c = addImport('https://b/3', '来源C', 'other');
@@ -96,7 +96,7 @@ describe('GET /api/home —— editing(正在编辑 Top3)', () => {
     ]);
   });
 
-  it('超过 3 个工程只回 3 条', async () => {
+  it('超过 3 个作品只回 3 条', async () => {
     const ids: number[] = [];
     for (let i = 0; i < 4; i++) {
       const id = addImport(`https://b/m${i}`, `来源M${i}`);
@@ -108,10 +108,10 @@ describe('GET /api/home —— editing(正在编辑 Top3)', () => {
     expect(body.editing.map((e) => e.import_id)).toEqual([ids[3], ids[2], ids[1]]); // 丢掉最旧的 ids[0]
   });
 
-  it('来源已不存在的工程不出现在 editing(INNER JOIN 排除)', async () => {
+  it('来源已不存在的作品不出现在 editing(INNER JOIN 排除)', async () => {
     const id = addImport('https://b/x', '来源X');
     addProject(id, '工程X', 1, '2026-09-01 10:00:00');
-    createImportsRepo(db).delete(id); // 删来源、留下工程行(模拟清理漏网)
+    createImportsRepo(db).delete(id); // 删来源、留下作品行(模拟清理漏网)
     expect((await getHome()).editing).toEqual([]);
   });
 });

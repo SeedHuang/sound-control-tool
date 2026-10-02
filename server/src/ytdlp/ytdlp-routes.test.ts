@@ -79,7 +79,7 @@ function makeApp(
         if (job === null || handlers === null) { resolve(); return; }
         void handlers.startDownload(jobId, JSON.parse(job.payload) as DownloadJobPayload, resolve).catch(() => resolve());
       }),
-    markCancelled: (jobId) => jobsRepo.update(jobId, { status: 'cancelled' }),
+    markCancelled: (jobId) => jobsRepo.update(jobId, { status: 'cancelled', message: '用户取消' }), // 与 index.ts 生产装配同款(H1)
   });
   return registerYtdlpRoutes(app, {
     db,
@@ -410,6 +410,90 @@ describe('POST /api/jobs/:id/cancel', () => {
     const res = await app.inject({ method: 'POST', url: '/api/jobs/abc/cancel' });
     expect(res.statusCode).toBe(404);
   });
+  // H1(2026-10-01 OCR 审查):排队中(pending)的任务被取消,正在订阅的 SSE 必须收到 cancelled 终态——
+  // 队列引入后 pending 窗口是分钟级,前端提交后立刻挂着 SSE;取消若只走队列路径(置 DB 不 emit),
+  // 在订的订阅者永远等不到终态(下载页 busy 态、任务抽屉在途数卡住)。
+  it('H1:排队中的任务被取消 → 在订 SSE 收到 status cancelled(不得悬挂)', async () => {
+    const dm = { start: vi.fn(), cancel: vi.fn(async () => {}), dispose: vi.fn(async () => {}) }; // A 从不发终态 → 永久 running
+    makeApp('yt-dlp', 'tok2', dm as unknown as ReturnType<typeof createDownloadManager>);
+    // A 占住唯一槽位 → running;B 无空槽 → pending(排队中)
+    const a = await app.inject({ method: 'POST', url: '/api/ytdlp/download', payload: { url: 'https://a/A', options: { format: 'mp3' } } });
+    expect(a.statusCode).toBe(201);
+    const b = await app.inject({ method: 'POST', url: '/api/ytdlp/download', payload: { url: 'https://a/B', options: { format: 'mp3' } } });
+    const pendingId = b.json().jobId as number;
+    expect(createJobsRepo(db).get(pendingId)!.status).toBe('pending');
+    await app.listen({ port: 0, host: '127.0.0.1' });
+    const port = (app.server.address() as AddressInfo).port;
+    const ac = new AbortController();
+    const sse = await fetch(`http://127.0.0.1:${port}/api/jobs/${pendingId}/events?token=tok2`, { signal: ac.signal });
+    const reader = sse.body!.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    try {
+      const cancelRes = await app.inject({ method: 'POST', url: `/api/jobs/${pendingId}/cancel` });
+      expect(cancelRes.statusCode).toBe(200);
+      const deadline = Date.now() + 3000;
+      while (Date.now() < deadline && !buf.includes('event: status')) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+      }
+    } finally {
+      await reader.cancel().catch(() => {});
+      ac.abort();
+    }
+    expect(buf).toContain('event: status');
+    expect(buf).toContain('"state":"cancelled"');
+    expect(createJobsRepo(db).get(pendingId)!.status).toBe('cancelled');
+  });
+  // H1 另一半:先取消后订阅(job 已终态)→ 补发分支必须把 cancelled 补出来。inject 可测:补发后连接立即 end。
+  it('H1:先取消后订阅 → 补发分支对 cancelled 也生效', async () => {
+    const dm = { start: vi.fn(), cancel: vi.fn(async () => {}), dispose: vi.fn(async () => {}) };
+    makeApp('yt-dlp', 'tok2', dm as unknown as ReturnType<typeof createDownloadManager>);
+    const a = await app.inject({ method: 'POST', url: '/api/ytdlp/download', payload: { url: 'https://a/A', options: { format: 'mp3' } } });
+    expect(a.statusCode).toBe(201);
+    const b = await app.inject({ method: 'POST', url: '/api/ytdlp/download', payload: { url: 'https://a/B', options: { format: 'mp3' } } });
+    const pendingId = b.json().jobId as number;
+    expect(createJobsRepo(db).get(pendingId)!.status).toBe('pending');
+    expect((await app.inject({ method: 'POST', url: `/api/jobs/${pendingId}/cancel` })).statusCode).toBe(200);
+    const res = await app.inject({ method: 'GET', url: `/api/jobs/${pendingId}/events?token=tok2` });
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toContain('event: status');
+    expect(res.body).toContain('"state":"cancelled"');
+  });
+  // H2(2026-10-01 OCR 审查)机制锁定:导出任务不进下载队列(ffmpeg 不排队,D1),取消走既有非队列路径
+  // (downloadManager.cancel 对未注册的 job 是 no-op → 照旧置 cancelled + emit)。此用例锁定「在订 SSE 收得到
+  // cancelled」这条链路;真正的缺口(取消后 ffmpeg 完成路径覆写状态)在 ffmpeg-export.test.ts 锁。
+  it('H2:运行中的导出任务被取消 → 在订 SSE 收到 status cancelled', async () => {
+    const dm = { start: vi.fn(), cancel: vi.fn(async () => {}), dispose: vi.fn(async () => {}) };
+    makeApp('yt-dlp', 'tok2', dm as unknown as ReturnType<typeof createDownloadManager>);
+    const jobsRepo = createJobsRepo(db);
+    const jid = jobsRepo.create('ffmpeg_export', { importId: 1, videoPath: 'C:/x.mp4', mode: 'merge', format: 'mp3', prefix: 'p', segments: [{ start_sec: 0, end_sec: 5 }], projectId: 1, workName: null });
+    jobsRepo.update(jid, { status: 'running' }); // 导出起跑即 running(不经队列)
+    await app.listen({ port: 0, host: '127.0.0.1' });
+    const port = (app.server.address() as AddressInfo).port;
+    const ac = new AbortController();
+    const sse = await fetch(`http://127.0.0.1:${port}/api/jobs/${jid}/events?token=tok2`, { signal: ac.signal });
+    const reader = sse.body!.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    try {
+      const cancelRes = await app.inject({ method: 'POST', url: `/api/jobs/${jid}/cancel` });
+      expect(cancelRes.statusCode).toBe(200);
+      const deadline = Date.now() + 3000;
+      while (Date.now() < deadline && !buf.includes('event: status')) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+      }
+    } finally {
+      await reader.cancel().catch(() => {});
+      ac.abort();
+    }
+    expect(buf).toContain('event: status');
+    expect(buf).toContain('"state":"cancelled"');
+    expect(jobsRepo.get(jid)!.status).toBe('cancelled');
+  });
 });
 
 describe('POST /api/jobs/:id/retry', () => {
@@ -454,6 +538,28 @@ describe('POST /api/jobs/:id/retry', () => {
     expect(res.statusCode).toBe(201);
     expect(typeof res.json().jobId).toBe('number');
     expect(res.json().jobId).not.toBe(errJid);
+  });
+  // H3(2026-10-01 OCR 审查,账本 T4「同类 JSON.parse 兜底未一并加」):payload 恰为字面量 'null' 时
+  // JSON.parse 不抛错但得到 null,裸解引用会 500。GET /api/jobs 的同款问题已修(T4 先例:按空载荷处理);
+  // 重试路由照同一写法兜底(非对象 → {}),按「字段缺失」走正常 4xx,不得 500。
+  it('H3:retry error job 且 payload 是字面量 null → 400(按字段缺失,不 500)', async () => {
+    const jobsRepo = createJobsRepo(db);
+    const jid = jobsRepo.create('ytdlp_download', null); // JSON.stringify(null)==='null',手工造损坏行
+    jobsRepo.fail(jid, '历史失败');
+    makeApp('yt-dlp', 'tok2');
+    const res = await app.inject({ method: 'POST', url: `/api/jobs/${jid}/retry` });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error.code).toBe('BAD_REQUEST');
+    expect(res.json().error.message).toContain('url');
+  });
+  it('H3:retry ffmpeg_export job 且 payload 是字面量 null → 409 MEDIA_GONE(不 500)', async () => {
+    const jobsRepo = createJobsRepo(db);
+    const jid = jobsRepo.create('ffmpeg_export', null);
+    jobsRepo.fail(jid, '历史失败');
+    makeApp('yt-dlp', 'tok2');
+    const res = await app.inject({ method: 'POST', url: `/api/jobs/${jid}/retry` });
+    expect(res.statusCode).toBe(409);
+    expect(res.json().error.code).toBe('MEDIA_GONE');
   });
 });
 
@@ -1041,10 +1147,12 @@ describe('下载视频素材(produce=video)', () => {
     expect(clipRepo.countSegmentsByImportId(importId)).toBe(0); // 两个作品的段都被清
     expect((db.prepare('SELECT COUNT(*) AS n FROM clip_projects WHERE import_id = ?').get(importId) as { n: number }).n).toBe(2); // 作品行保留
     expect(createAudioItemsRepo(db).list()).toHaveLength(1); // 成品保留
-    // 仓库铁律:关键步骤必须有日志,且按新文案说清影响面(作品数 / 段数)
-    expect(getLogs().some((l) => l.source === 'job' && l.message.includes('清空该资料下作品的剪辑点') && l.message.includes('作品2个/段3个'))).toBe(true);
+    // 仓库铁律:关键步骤必须有日志,且按诚实口径说清影响面——「该来源作品总数 / 被清空的作品数 / 段数」。
+    // 旧文案「作品2个/段3个」里的作品数只是"有段被清的作品数",会被误读成"该来源全部作品数"(S3,2026-10-02 deferred 批)。
+    // 本用例:该来源共 2 个作品(都有段) → 共2个作品,其中2个被清空3段
+    expect(getLogs().some((l) => l.source === 'job' && l.message.includes('该来源共2个作品') && l.message.includes('其中2个被清空3段'))).toBe(true);
   });
-  it('视频同集换清晰度(旧 2 → 新 2)下载完成 → 剪辑工程保留(用户剪辑点不丢)', async () => {
+  it('视频同集换清晰度(旧 2 → 新 2)下载完成 → 作品与剪辑点保留(用户剪辑点不丢)', async () => {
     const importId = createImportsRepo(db).upsertByUrl({ url: 'https://a/v', title: '凡人', site: 'bilibili', kind: 'playlist', duration_sec: null, entries: null });
     const producedPath = join(tempDir, 'vid720.mp4');
     writeFileSync(producedPath, 'VIDEOBYTES720');
@@ -1067,19 +1175,19 @@ describe('下载视频素材(produce=video)', () => {
     const res = await app.inject({ method: 'POST', url: '/api/ytdlp/download', payload: { url: 'https://a/v', options: { format: 'mp3', entryIndices: [2], videoHeight: 720 }, produce: 'video', title: '凡人', entryIndex: 2 } });
     expect(res.statusCode).toBe(201);
     const jobId = res.json().jobId as number;
-    fire!(); // 下载进程退出 → finalizeVideoDownload(entry_index 未变 → 保留工程)
+    fire!(); // 下载进程退出 → finalizeVideoDownload(entry_index 未变 → 保留作品与剪辑点)
     const deadline = Date.now() + 2000;
     while (Date.now() < deadline && createJobsRepo(db).get(jobId)!.status !== 'done') await new Promise((r) => setTimeout(r, 20));
     expect(createSourceVideosRepo(db).get(importId)!.entry_index).toBe(2);
     expect(createSourceVideosRepo(db).get(importId)!.height).toBe(720); // 素材确实换了清晰度
     expect(clipRepo.countSegmentsByImportId(importId)).toBe(2); // 段还在
-    expect((db.prepare('SELECT COUNT(*) AS n FROM clip_projects WHERE import_id = ?').get(importId) as { n: number }).n).toBe(1); // 工程行还在
-    expect(getLogs().some((l) => l.source === 'job' && l.message.includes('保留剪辑工程'))).toBe(true);
+    expect((db.prepare('SELECT COUNT(*) AS n FROM clip_projects WHERE import_id = ?').get(importId) as { n: number }).n).toBe(1); // 作品行还在
+    expect(getLogs().some((l) => l.source === 'job' && l.message.includes('保留作品与剪辑点'))).toBe(true);
   });
   // T7-3(2026-09-30,backlog 收口):单视频重下的 NULL→NULL 保留路径。
   // 旧素材 entry_index=NULL(单视频);新下载也没带 entryIndex(仍 NULL)——D19 两侧 ?? null 归一后相等,
-  // 工程与段必须原样保留,别把「单视频重下」误判成「换集」而清掉用户的剪辑点。
-  it('视频单视频重下(旧 NULL → 新 NULL)下载完成 → 剪辑工程保留(未误判为换集)', async () => {
+  // 作品与段必须原样保留,别把「单视频重下」误判成「换集」而清掉用户的剪辑点。
+  it('视频单视频重下(旧 NULL → 新 NULL)下载完成 → 作品与剪辑点保留(未误判为换集)', async () => {
     const importId = createImportsRepo(db).upsertByUrl({ url: 'https://a/v', title: '凡人', site: 'bilibili', kind: 'single', duration_sec: null, entries: null });
     const producedPath = join(tempDir, 'vidRedl.mp4');
     writeFileSync(producedPath, 'VIDEOBYTESREDL');
@@ -1103,14 +1211,14 @@ describe('下载视频素材(produce=video)', () => {
     const res = await app.inject({ method: 'POST', url: '/api/ytdlp/download', payload: { url: 'https://a/v', options: { format: 'mp3', videoHeight: 720 }, produce: 'video', title: '凡人' } });
     expect(res.statusCode).toBe(201);
     const jobId = res.json().jobId as number;
-    fire!(); // 下载进程退出 → finalizeVideoDownload(NULL → NULL 视为同集 → 保留工程)
+    fire!(); // 下载进程退出 → finalizeVideoDownload(NULL → NULL 视为同集 → 保留作品与剪辑点)
     const deadline = Date.now() + 2000;
     while (Date.now() < deadline && createJobsRepo(db).get(jobId)!.status !== 'done') await new Promise((r) => setTimeout(r, 20));
     expect(createSourceVideosRepo(db).get(importId)!.entry_index).toBeNull(); // 新集号仍 NULL
     expect(createSourceVideosRepo(db).get(importId)!.height).toBe(720); // 素材确实换了清晰度
     expect(clipRepo.countSegmentsByImportId(importId)).toBe(2); // 段原样保留
-    expect((db.prepare('SELECT COUNT(*) AS n FROM clip_projects WHERE import_id = ?').get(importId) as { n: number }).n).toBe(1); // 工程行原样保留
-    expect(getLogs().some((l) => l.source === 'job' && l.message.includes('保留剪辑工程'))).toBe(true);
+    expect((db.prepare('SELECT COUNT(*) AS n FROM clip_projects WHERE import_id = ?').get(importId) as { n: number }).n).toBe(1); // 作品行原样保留
+    expect(getLogs().some((l) => l.source === 'job' && l.message.includes('保留作品与剪辑点'))).toBe(true);
   });
 });
 

@@ -200,7 +200,7 @@ function createDownloadHandlers(deps: YtdlpDeps) {
       const ext = producedPath.slice(producedPath.lastIndexOf('.') + 1).toLowerCase();
       const videosRepo = createSourceVideosRepo(db);
       // 批4 裁定 R6:placeVideo 收「该来源当前登记的 file_path」(null=从未登记过),用于覆盖/避让判定
-      // P2 方案A(D19):同一发 get 顺带取旧 entry_index(upsert 前取)——Task 2 清空剪辑工程要靠这组新旧值判定
+      // P2 方案A(D19):同一发 get 顺带取旧 entry_index(upsert 前取)——Task 2 清空该资料下作品的剪辑点要靠这组新旧值判定
       const prev = videosRepo.get(row.id);
       const registeredPath = prev?.file_path ?? null;
       const oldEntryIndex = prev?.entry_index ?? null;
@@ -219,10 +219,16 @@ function createDownloadHandlers(deps: YtdlpDeps) {
       // 作品行与成品都保留(T2 已把 clearByImportId 换成 clearSegmentsByImportId —— 后者不删作品行)。
       // NULL 语义:两侧都 ?? null 归一后再比——同为 NULL(单视频重下)视为相同,不清
       if ((oldEntryIndex ?? null) !== (newEntryIndex ?? null)) {
-        const r = createClipProjectsRepo(db).clearSegmentsByImportId(row.id);
-        pushLog('info', 'job', `换集 ${oldEntryIndex} → ${newEntryIndex}: 清空该资料下作品的剪辑点 作品${r.works}个/段${r.segments}个 import=${row.id}`);
+        // S3(2026-10-02 deferred 批,账本 T4):日志口径改诚实。r.works 只是「有段被清掉的作品数」(0 段的作品不计),
+        // 旧写法打「作品N个/段M个」会被读成"该来源全部作品数",且 N=0 时整行没有信息量。
+        // 补上该来源的作品总数(countByImportId;清段只删段不删作品行,清前后数一致),两个数都摆明:
+        // 「共 X 个作品,其中 M 个被清空 N 段」——读者能自己算出还有多少作品没受影响。
+        const clipRepo = createClipProjectsRepo(db);
+        const r = clipRepo.clearSegmentsByImportId(row.id);
+        const totalWorks = clipRepo.countByImportId(row.id);
+        pushLog('info', 'job', `换集 ${oldEntryIndex} → ${newEntryIndex}: 清空剪辑点 该来源共${totalWorks}个作品,其中${r.works}个被清空${r.segments}段 import=${row.id}`);
       } else {
-        pushLog('debug', 'job', `video entry_index 未变(${String(newEntryIndex)}),保留剪辑工程 import=${row.id}`);
+        pushLog('debug', 'job', `video entry_index 未变(${String(newEntryIndex)}),保留作品与剪辑点 import=${row.id}`);
       }
       jobsRepo.finish(jobId);
       pushLog('info', 'job', `job ${jobId} done → video import=${row.id} @ ${placed.path} height=${videoHeight} bytes=${size}`);
@@ -753,7 +759,13 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
     if (!job) return reply.code(404).send({ ok: false, error: { code: 'NOT_FOUND', message: 'job 不存在', next: '' } });
     // 排队中的任务还没起进程:从队列移除并置 cancelled 就够,**不要**走 taskkill(D5)——
     // 否则会去杀一个根本不存在的 pid。命中即返回;未命中说明它在跑或已结束,落到既有 cancel 路径。
-    if (queue.cancelQueued(id)) return { ok: true };
+    // H1(2026-10-01 OCR 审查):命中队列也必须发 SSE 终态——pending 窗口自队列引入后是分钟级,
+    // 前端提交后立刻挂着 SSE;不发事件,在订的订阅者永远等不到终态(下载页 busy 态/在途数卡住)。
+    // 先取消后订阅的补发分支(SSE 路由)对 cancelled 本就覆盖,「在订 + 补发」两条路都闭合。
+    if (queue.cancelQueued(id)) {
+      emit(id, { type: 'status', state: 'cancelled', message: '用户取消' });
+      return { ok: true };
+    }
     await downloadManager.cancel(id);
     jobsRepo.update(id, { status: 'cancelled', message: '用户取消' });
     pushLog('info', 'job', `job ${id} cancelled by user`); // 诊断日志:取消也要留痕(用户反馈"取消没反应"要能查日志)

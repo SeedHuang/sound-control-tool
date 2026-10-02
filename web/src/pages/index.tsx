@@ -6,7 +6,7 @@
 import { Alert, Card, Empty, Spin, Typography } from 'antd';
 import { useNavigate } from '@umijs/max';
 import { useEffect, useState, type ReactNode } from 'react';
-import { coverUrl, getHome, listImports, logFe, type HomeEditingRow, type HomeRecentRow } from '@/api';
+import { coverUrl, getHome, logFe, type HomeEditingRow, type HomeRecentRow } from '@/api';
 import SiteLogo, { siteColor } from '@/components/SiteLogo';
 
 /** 首页卡片(封面 + 标题 + 副标题)。
@@ -64,7 +64,6 @@ export default function IndexPage() {
   const [recent, setRecent] = useState<HomeRecentRow[]>([]);
   const [loaded, setLoaded] = useState(false); // 主数据是否已返回 —— 区分「加载中」与「确实为空」
   const [error, setError] = useState<string | null>(null);
-  const [titles, setTitles] = useState<Map<number, string>>(new Map()); // import_id → 来源标题(name 为 null 时兜底)
 
   useEffect(() => {
     // 诊断日志:首页打开就留痕(「首页空着」时区分是没请求、请求挂了,还是真没数据)
@@ -73,10 +72,6 @@ export default function IndexPage() {
       .then((d) => { setEditing(d.editing); setRecent(d.recent); setError(null); })
       .catch((e: Error) => setError(e.message))
       .finally(() => setLoaded(true));
-    // 来源标题映射:只服务「编辑卡片没命名时兜底显示来源名」这一幕;它失败不该把整页钉在错误态 → 只记日志
-    void listImports()
-      .then((list) => setTitles(new Map(list.map((it) => [it.id, it.title]))))
-      .catch((e: Error) => logFe('error', `首页拉取来源标题失败(仅影响未命名工程兜底): ${e.message}`));
   }, []);
 
   return (
@@ -90,21 +85,21 @@ export default function IndexPage() {
       {/* 错误态只显示错误(不叠两块空态,否则「拉不到数据」会被误读成「本来就没有」) */}
       {error === null && loaded && (
         <>
-          {/* 正在编辑:点卡片进该来源的剪辑详情 /studio/:importId */}
+          {/* 正在编辑:一行 = 一件作品(1 资料 = N 作品,spec clip-works D18);点卡片进该作品的剪辑详情 /studio/:projectId。
+              key 必须用 project_id —— 多件作品共享同一 import_id,用 import_id 会撞出重复 key */}
           <Card title="正在编辑" style={{ marginBottom: 16 }}>
             {editing.length === 0 ? (
-              <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="还没有正在编辑的工程" />
+              <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="还没有正在编辑的作品" />
             ) : (
               <CardGrid>
                 {editing.map((row) => (
                   <HomeCard
-                    key={row.import_id}
+                    key={row.project_id}
                     importId={row.import_id}
                     site={row.site}
-                    /* name 为空 → 用来源标题兜底(映射里没有就用 id 兜个可读名,不显示空白) */
-                    title={row.name ?? titles.get(row.import_id) ?? `来源 #${row.import_id}`}
+                    title={row.name ?? '未命名作品'}
                     subtitle={`${row.segment_count} 段`}
-                    onClick={() => { logFe('info', `home editing → /studio/${row.import_id}`); navigate(`/studio/${row.import_id}`); }}
+                    onClick={() => { logFe('info', `home editing → /studio/${row.project_id}`); navigate(`/studio/${row.project_id}`); }}
                   />
                 ))}
               </CardGrid>

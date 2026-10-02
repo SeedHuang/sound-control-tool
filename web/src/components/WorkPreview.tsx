@@ -36,6 +36,9 @@ export default function WorkPreview({ work, active, muted }: Props): JSX.Element
   const isVideo = work.source !== null && work.source.has_video;
   const productId = work.latest_product_id;
   const isAudioOnly = !isVideo && work.source !== null && productId !== null;
+  // N1:仅音频卡的最新成品可能是**视频**成品(媒体_kind 分流由渲染分支处理)——它也要有 5s 上限,
+  // 否则 hover 一张"只有 4K 合并成品"的卡会整条解码(spec §0.5 纪律①的解码预算会被打穿)
+  const productIsVideo = isAudioOnly && work.latest_product_kind === 'video';
   const hasPreview = isVideo || isAudioOnly;
   // 首段(有剪辑点 → 播这一段);无首段 → 视频播开头 5 秒。
   // 依赖取原始数值而非 work.first_segment 对象 —— 每次 listWorks 都会给新对象,拿对象当依赖会让预览在重拉时反复重播。
@@ -57,8 +60,8 @@ export default function WorkPreview({ work, active, muted }: Props): JSX.Element
     currentEl = el;
 
     const startSec = segStart ?? 0;
-    // 停止点:有剪辑点 → 段尾;无剪辑点的视频 → 开头 5 秒;音频 → null(跟随鼠标离开,不主动停)
-    const stopSec: number | null = segEnd !== null ? segEnd : (isVideo ? 5 : null);
+    // 停止点:有剪辑点 → 段尾;无剪辑点的视频(素材或视频成品) → 开头 5 秒;音频成品 → null(跟随鼠标离开,不主动停)
+    const stopSec: number | null = segEnd !== null ? segEnd : (isVideo || productIsVideo ? 5 : null);
 
     // 定位到起点:元数据未就绪时直接设 currentTime 会被忽略 → 等 loadedmetadata 再设一次
     const seekToStart = (): void => { try { el.currentTime = startSec; } catch { /* 忽略 */ } };
@@ -94,7 +97,7 @@ export default function WorkPreview({ work, active, muted }: Props): JSX.Element
       if (currentEl === el) currentEl = null;
     };
     // muted 刻意**不进依赖**:切换静音开关不该把正在播的预览重播一遍(React 会自己更新 muted 属性)
-  }, [active, failed, hasPreview, isVideo, segStart, segEnd, work.id, work.import_id, productId]);
+  }, [active, failed, hasPreview, isVideo, productIsVideo, segStart, segEnd, work.id, work.import_id, productId]);
 
   // active=false → return null = **卸载元素**(纪律②:不只是暂停,元素都不留)
   if (!active || failed) return null;
@@ -115,7 +118,21 @@ export default function WorkPreview({ work, active, muted }: Props): JSX.Element
       />
     );
   } else if (isAudioOnly && productId !== null) {
-    media = (
+    // N1(spec video-export D5.4):这张"只有音频的卡"的最新成品若其实是**视频**(latest_product_kind==='video'),
+    // 改用 <video> 播那条成品(同一 /api/audio/:id/file 路由直接回 mp4);cover 裁切样式照抄上方素材 video 分支。
+    // 纪律①②③(单实例/移开卸载/起播被拒回退静音)全在 effect 里,mediaRef 类型本就是 HTMLVideoElement | HTMLAudioElement,直接复用;
+    // muted 仍走共享开关(与素材 video 分支同款"静音纪律"),不是写死。
+    media = work.latest_product_kind === 'video' ? (
+      <video
+        ref={(el) => { mediaRef.current = el; }}
+        muted={muted}
+        playsInline
+        preload="none"
+        src={audioFileUrl(productId)}
+        onError={onError}
+        style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'cover' }}
+      />
+    ) : (
       <audio
         ref={(el) => { mediaRef.current = el; }}
         muted={muted}

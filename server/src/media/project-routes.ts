@@ -146,15 +146,35 @@ export function registerProjectRoutes(
     if (badId(projectId)) return reply.code(404).send({ ok: false, error: { code: 'NOT_FOUND', message: '作品不存在', next: '' } });
     const project = projectsRepo.get(projectId);
     if (project === null) return reply.code(404).send({ ok: false, error: { code: 'NOT_FOUND', message: '作品不存在', next: '' } });
-    const body = (req.body ?? {}) as { mode?: unknown; format?: unknown; quality?: unknown; segments?: unknown };
+    const body = (req.body ?? {}) as { mode?: unknown; format?: unknown; quality?: unknown; segments?: unknown; mediaKind?: unknown; videoAn?: unknown };
     if (body.mode !== 'separate' && body.mode !== 'merge') {
       return reply.code(400).send({ ok: false, error: { code: 'BAD_REQUEST', message: 'mode 只能是 separate 或 merge', next: '选择导出方式' } });
     }
-    if (!['mp3', 'm4a', 'wav'].includes(String(body.format))) {
-      return reply.code(400).send({ ok: false, error: { code: 'BAD_REQUEST', message: 'format 必须是 mp3|m4a|wav', next: '选择输出格式' } });
+    // N1 Task 4(spec video-export)：导出内容类型。缺省 'audio'——老客户端不传走既有音频路径，零回归。
+    const rawKind = body.mediaKind;
+    if (rawKind !== undefined && rawKind !== 'audio' && rawKind !== 'video') {
+      return reply.code(400).send({ ok: false, error: { code: 'BAD_REQUEST', message: 'mediaKind 必须是 audio|video', next: '修正导出内容后重试' } });
     }
-    // 注意：`String(body.format)` 校验不会收窄 body.format 的类型（仍是 unknown），显式收敛成白名单联合供 payload 使用
-    const format = String(body.format) as 'mp3' | 'm4a' | 'wav';
+    const mediaKind: 'audio' | 'video' = rawKind === 'video' ? 'video' : 'audio'; // 显式收敛，供 payload 使用
+    if (mediaKind === 'audio') {
+      // 音频分支：校验与文案与现状逐字一致（回归保护）
+      if (!['mp3', 'm4a', 'wav'].includes(String(body.format))) {
+        return reply.code(400).send({ ok: false, error: { code: 'BAD_REQUEST', message: 'format 必须是 mp3|m4a|wav', next: '选择输出格式' } });
+      }
+    } else {
+      // 视频分支：前端固定传 mp4；videoAn 仅 video 有意义，必须是 boolean 或缺省（缺省 false = 带音轨，实测 A3）
+      if (String(body.format) !== 'mp4') {
+        return reply.code(400).send({ ok: false, error: { code: 'BAD_REQUEST', message: '视频导出仅支持 mp4 格式', next: '导出内容选音频时可选 mp3/m4a/wav' } });
+      }
+      if (body.videoAn !== undefined && typeof body.videoAn !== 'boolean') {
+        return reply.code(400).send({ ok: false, error: { code: 'BAD_REQUEST', message: 'videoAn 必须是布尔值', next: '修正导出内容后重试' } });
+      }
+    }
+    // 注意：`String(body.format)` 校验不会收窄 body.format 的类型（仍是 unknown），显式收敛成白名单联合供 payload 使用。
+    // video 时 format 落 'mp4'——`string → 联合`断言仅是类型层收窄；运行时值由 T3 的视频分支防御保证
+    //（isVideo 固定按 mp4 入库、非 mp4 只记防御日志）。ExportJobPayload.format 类型未含 'mp4'：本次任务文件清单
+    // 不含 ffmpeg-export.ts 不扩类型（T3 测试注释预期过"T4 扩"，取舍见 n1-t4-report.md 偏离节）。
+    const format = (mediaKind === 'video' ? 'mp4' : String(body.format)) as 'mp3' | 'm4a' | 'wav';
     const parsed = parseSegments(body.segments); // D15：segments 必传，导出以请求体为准
     if (!parsed.ok) return reply.code(400).send({ ok: false, error: { code: 'BAD_REQUEST', message: parsed.message, next: parsed.next } });
     if (parsed.segments.length === 0) return reply.code(400).send({ ok: false, error: { code: 'BAD_REQUEST', message: '没有可导出的剪辑段', next: '先添加剪辑段' } });
@@ -169,9 +189,11 @@ export function registerProjectRoutes(
       importId, videoPath: video.file_path, mode: body.mode, format,
       quality: typeof body.quality === 'string' ? body.quality : undefined, prefix, segments: parsed.segments,
       projectId, workName: project.name, // D19：任务抽屉优先显示作品名
+      mediaKind,                                                          // N1 Task 4：导出内容类型（缺省 audio）
+      videoAn: mediaKind === 'video' ? body.videoAn === true : undefined, // 仅 video 落 boolean（缺省 false）；audio 不带该键
     };
     const jobId = createJobsRepo(db).create('ffmpeg_export', payload);
-    pushLog('info', 'job', `export job ${jobId} created project=${projectId} import=${importId} mode=${body.mode} 段数=${parsed.segments.length}`);
+    pushLog('info', 'job', `export job ${jobId} created project=${projectId} import=${importId} mode=${body.mode} mediaKind=${mediaKind} 段数=${parsed.segments.length}`);
     // 不 await（同 clip 路由）：201 先回，前端拿 jobId 建 SSE 订阅；异步完成后事件才有人收
     void startExportJob(jobId, payload, { db, audioDir: deps.audioDir, tempDir: deps.tempDir });
     return reply.code(201).send({ ok: true, jobId });
