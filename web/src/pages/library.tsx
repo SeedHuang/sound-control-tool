@@ -1,11 +1,12 @@
 // web/src/pages/library.tsx(资料库 2026-09-30:Task 7 收敛为纯视频下载——产物类型 Radio/音频格式 Radio/音频批量下载流已移除,音频一律从剪辑获得,spec D4 修订;服务端 produce='audio' 管线保留休眠)
 // 左列表持久化(imported_sources 表,parse 成功自动落库);点来源直接看缓存集数,不重新解析
-import { Alert, Badge, Button, Card, Empty, Input, Modal, Progress, Radio, Space, Spin, Tag, Tooltip, Typography } from 'antd';
+import { Alert, Badge, Button, Card, Empty, Input, Modal, Progress, Radio, Space, Spin, Tag, Tooltip, Typography, message } from 'antd';
 // 工具栏图标(spec D3/D4):原视频页/下载/删除来源;@ant-design/icons 是既有依赖,不新增包
-import { DeleteOutlined, DownloadOutlined, LinkOutlined } from '@ant-design/icons';
+// T8 新增「剪辑」剪刀 icon(spec clip-works D15:用当前这份资料直接开一个作品)
+import { DeleteOutlined, DownloadOutlined, LinkOutlined, ScissorOutlined } from '@ant-design/icons';
 import { useEffect, useRef, useState } from 'react';
-import { useSearchParams } from '@umijs/max';
-import { cancelJob, coverUrl, deleteImport, getFormats, getImport, listImports, listMedia, logFe, mediaFileUrl, parseUrl, startDownload, subscribeJob, type ImportDetail, type ImportSource, type MediaItem } from '@/api';
+import { useNavigate, useSearchParams } from '@umijs/max';
+import { cancelJob, coverUrl, createWork, deleteImport, getFormats, getImport, listImports, listMedia, logFe, mediaFileUrl, parseUrl, startDownload, subscribeJob, type ImportDetail, type ImportSource, type MediaItem } from '@/api';
 import PageHeader from '@/components/PageHeader';
 import SiteLogo from '@/components/SiteLogo';
 
@@ -23,6 +24,7 @@ const nearestTo480 = (list: number[]): number =>
   list.reduce((best, h) => (Math.abs(h - 480) < Math.abs(best - 480) ? h : best), list[0] ?? 480);
 
 export default function LibraryPage() {
+  const navigate = useNavigate();
   const [imports, setImports] = useState<ImportSource[]>([]);
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [detail, setDetail] = useState<ImportDetail | null>(null);
@@ -30,6 +32,8 @@ export default function LibraryPage() {
   const [url, setUrl] = useState('');
   const [parsing, setParsing] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // 「剪辑」按钮的提交中状态(T8):建作品期间转圈 + 禁用,防连点建出两个作品
+  const [creating, setCreating] = useState(false);
   const [jobId, setJobId] = useState<number | null>(null);
   const [percent, setPercent] = useState(0);
   const [phase, setPhase] = useState<'download' | 'ingest'>('download'); // 进度条第二段:下载结束→登记素材中(2026-09-29 用户拍板)
@@ -265,6 +269,34 @@ export default function LibraryPage() {
     requestDownloadVideo(detail.kind === 'playlist' ? videoSelectedIndex : null);
   };
 
+  // 工具栏「剪辑」按钮(T8,spec clip-works D15):用当前选中来源直接开一个新作品 → 跳编辑页。
+  // 前置门 = currentMaterial !== undefined,即"mediaList 里真有这个来源的素材行"——与 <video> 预览、
+  // D19 换集判定、D20「当前素材」标记同一个口径。**不能只看 detail.has_video**:它只在 selectSource 里
+  // 被写回一次(见 :74),用户下载完视频走的是 SSE onDone 分支(:110 只刷 mediaList,不动 detail)→
+  // 下完视频 detail.has_video 仍是下载前的旧值 false,剪刀会一直灰着、tooltip 一直说"先下载视频素材"。
+  // 这条判据跟着 mediaList 走,下载完成 → 素材行出现 → 立刻可剪,不用切走再切回。
+  // 前置门只保证"素材行在",文件被外部删了仍会失败 → 失败消息原样透出(apiPost 已把服务端 error.next 拼好),不重写措辞。
+  // stale:切来源时左列表高亮已换、detail 还没回来(右栏仍是上一份)。这段窗口里点剪刀建的是右栏正在显示的那一份,
+  // 语义自洽但用户看到的列表行与建出来的不是同一个 → 一并禁用(切回来自动恢复)。
+  const staleSource = detail !== null && selectedId !== detail.id;
+  const canClip = detail !== null && !staleSource && currentMaterial !== undefined;
+  const onNewWork = async (): Promise<void> => {
+    if (detail === null || creating) return;
+    setCreating(true);
+    logFe('info', `资料库「剪辑」建作品 import=${detail.id}`);
+    try {
+      const w = await createWork(detail.id);
+      logFe('info', `资料库建作品成功 import=${detail.id} 作品=${w.id}`);
+      navigate(`/studio/${w.id}`);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      logFe('error', `资料库建作品失败 import=${detail.id}: ${msg}`);
+      message.error(msg);
+    } finally {
+      setCreating(false);
+    }
+  };
+
   // 点击集数卡片(Task 9):选中该集;点的不是当前素材所在集 → 走下载判定链(无素材直接下 / 换集或集号未知弹 D19);
   // 点的就是当前素材所在集 → 只选中,不重复下载(素材已在)。busy 时 requestDownloadVideo 内部守卫挡提交,选中仍更新。
   const onEntryClick = (index: number): void => {
@@ -335,7 +367,8 @@ export default function LibraryPage() {
                       playlist 未选集时整组禁用(无可下对象)。视频素材固定带 mp3 音轨(payload 硬编码 format:'mp3')。
                       Task 4(spec D6/D6a/D7/D8):档位来自探测实测,标签归一到常见档位(tierLabel)、但 value 是实测值;
                       探测中禁用;探测失败(降级)整组仍可用并配小字说明,不弹错(探测是增强,不是主流程)。
-                      T3-a:控件行顺序 = 清晰度 → 下载 → 原视频页 → 删除来源(下载紧贴档位,危险操作放最后) */}
+                      T3-a:控件行顺序 = 清晰度 → 下载 → 原视频页 → 删除来源(下载紧贴档位,危险操作放最后);
+                      T8:插入「剪辑」后顺序 = 清晰度 → 下载 → 剪辑 → 原视频页 → 删除来源 */}
                   <Tooltip title={tiersFallback ? '未能读取视频信息，已用常用档位' : '清晰度（来自该视频的可用档位）'}>
                     <span>
                       <Radio.Group
@@ -359,6 +392,23 @@ export default function LibraryPage() {
                         onClick={onDownloadVideo}
                         loading={busy}
                         disabled={busy || (detail.kind === 'playlist' && videoSelectedIndex === null)}
+                      />
+                    </span>
+                  </Tooltip>
+                  {/* T8「剪辑」剪刀 icon(spec clip-works D15):用当前这份资料直接开一个新作品。
+                      位置在「下载」之后、「原视频页」之前 —— 顺着"先做视频、再进剪辑室"的动作次序,
+                      也不跟末尾那个红色实心「删除来源」抢最醒目的位置。
+                      没有视频素材就禁用 + tooltip 说清原因(不弹一个用户看不懂的失败);
+                      禁用态必须包 span,否则 antd Tooltip 收不到鼠标事件(与本页其余 icon 按钮同款写法)。
+                      aria-label:Tooltip 不产生可访问名,补上(文案与 tooltip 一致)。 */}
+                  <Tooltip title={canClip ? '用这份资料新建一个剪辑作品' : staleSource ? '正在切换来源…' : '先下载视频素材'}>
+                    <span>
+                      <Button
+                        icon={<ScissorOutlined />}
+                        aria-label="用这份资料新建一个剪辑作品"
+                        disabled={!canClip || creating}
+                        loading={creating}
+                        onClick={() => void onNewWork()}
                       />
                     </span>
                   </Tooltip>

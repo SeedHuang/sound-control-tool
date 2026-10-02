@@ -13,7 +13,8 @@ export default defineConfig({
     { path: '/', component: 'index' },
     { path: '/library', component: 'library' },       // 资料库(原 acquire)
     { path: '/studio', component: 'studio' },         // 剪辑室(原 library)
-    { path: '/studio/:importId', component: 'studio-detail' },
+    // 2026-10-01 spec clip-works D16:参数从 importId 改成**作品 id**(clip_projects.id)——1 资料 N 作品,按作品进编辑页
+    { path: '/studio/:projectId', component: 'studio-detail' },
     { path: '/settings', component: 'settings' },
   ],
 });

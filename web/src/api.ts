@@ -110,10 +110,17 @@ export async function apiPost<T>(path: string, body: unknown): Promise<T> {
     const res = await fetch(`${API_BASE}${path}`, { method: 'POST', headers, body: JSON.stringify(body), signal: ctl.signal });
     if (!res.ok) {
       const j = (await res.json().catch(() => null)) as { error?: { code?: string; message?: string; next?: string } } | null;
-      const msg = j?.error?.message ?? `请求失败 ${res.status}:${path}${j?.error?.next ? `。${j.error.next}` : ''}`;
+      // 后端 error.next 是「下一步怎么办」的指引(spec §0.5)。原实现用 `??` 短路——只在 message 缺失时才拼 next,
+      // 但 POST 的每一条业务错误都恒带 message(如 POST /api/projects 的三条前置校验)→ next 一次都到不了用户。
+      // 与 apiPut 同一套写法(message 非空也追加 next;!base.includes 防同一句拼两遍;空 next 不加尾巴)。
+      // 影响面:apiPost 是共享层,所有 POST 调用点的失败消息都会多出这个「（…）」尾巴——这是有意改善(多给一步指引)。
+      const errBody = j?.error;
+      const base = errBody?.message ?? `请求失败 ${res.status}:${path}`;
+      const next = typeof errBody?.next === 'string' && errBody.next.trim() !== '' && !base.includes(errBody.next) ? errBody.next : '';
+      const msg = next === '' ? base : `${base}（${next}）`;
       logFe('error', `请求失败 ${path}: ${msg}`); // 诊断日志:业务错误(400/409)也进前端面板
       // code 要带上:调用方按 code 分支(如 DUPLICATE → 弹「重新下载并替换」确认,2026-09-29)
-      throw new ApiError(msg, j?.error?.code, res.status); // 追加真实状态码(纯加字段,调用方可不看)
+      throw new ApiError(msg, errBody?.code, res.status); // 追加真实状态码(纯加字段,调用方可不看)
     }
     return (await res.json()) as T;
   } finally { clearTimeout(timer); }

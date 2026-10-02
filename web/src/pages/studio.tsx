@@ -12,6 +12,7 @@ import {
   apiGet, audioFileUrl, coverUrl, deleteAudio, deleteWork, getPreviewMuted, listWorks, logFe, onAudioChanged,
   setPreviewMuted, type AudioRow, type WorkSummaryDTO,
 } from '@/api';
+import NewWorkModal from '@/components/NewWorkModal';
 import SiteLogo, { siteColor } from '@/components/SiteLogo';
 import WorkPreview, { unlockAudio } from '@/components/WorkPreview';
 
@@ -117,6 +118,7 @@ export default function StudioPage(): JSX.Element {
   const [query, setQuery] = useState('');
   const [shown, setShown] = useState(BATCH);                // 已渲染条数
   const [muted, setMuted] = useState(true);                 // 默认静音(spec D12);初值由 getPreviewMuted 拉取后覆盖
+  const [newOpen, setNewOpen] = useState(false);             // 「新建作品」弹层开关(T8)
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const sentinelRef = useRef<HTMLDivElement | null>(null);
   // 记上一次列表长度:重拉后按「新长度 − 旧长度」估算"被插到最前面的条数",给 scrollTop 补位(spec D13)
@@ -231,8 +233,8 @@ export default function StudioPage(): JSX.Element {
   const body: ReactNode = (
     <div style={{ width: '100%', maxWidth: CARDS_MAX_WIDTH, margin: '0 auto' }}>
       {visible.length === 0 ? (
-        // 空态:一个作品都没有(或搜索无结果)。**这里不放「新建作品」按钮** —— 弹层由 T8 做,
-        // 先放会是个点了没反应的悬空按钮;新建入口只能在 toolbar 上。
+        // 空态:一个作品都没有(或搜索无结果)。**这里不放「新建作品」按钮** —— 新建入口按 spec 只在 toolbar 上,
+        // 空态再放一个会与 toolbar 的按钮重复。弹层(T8 已落地)挂在页面末尾,toolbar 按钮点它。
         <Empty description={q === '' ? '还没有剪辑作品' : `没有匹配「${query.trim()}」的作品`} style={{ marginTop: 64 }} />
       ) : (
         <>
@@ -280,8 +282,8 @@ export default function StudioPage(): JSX.Element {
     <div style={{ boxSizing: 'border-box', height: '100%', minHeight: 0, overflow: 'hidden', display: 'flex', flexDirection: 'column', padding: 16, gap: 12 }}>
       {/* 头:toolbar —— 新建作品 / 搜索 / 声音开关 / 计数 */}
       <div style={{ flexShrink: 0, display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
-        {/* 「新建作品」按钮:本任务只渲染按钮,**弹层由 T8 接入**(这里 onClick 先留空,不 import 尚未创建的组件) */}
-        <Button type="primary" icon={<PlusOutlined />} onClick={() => { /* T8: 打开新建作品弹层 */ }}>
+        {/* 「新建作品」按钮(T8):打开弹层列「可剪的资料」;选中创建成功后直接进编辑页 */}
+        <Button type="primary" icon={<PlusOutlined />} onClick={() => { logFe('info', '点「新建作品」打开弹层'); setNewOpen(true); }}>
           新建作品
         </Button>
         <Input
@@ -311,6 +313,13 @@ export default function StudioPage(): JSX.Element {
       >
         {body}
       </div>
+
+      {/* 新建作品弹层(T8):列可剪资料 → 选中创建 → 直接进编辑页(此时时间轴是空的,用户从零开始剪) */}
+      <NewWorkModal
+        open={newOpen}
+        onClose={() => setNewOpen(false)}
+        onCreated={(projectId) => { setNewOpen(false); navigate(`/studio/${projectId}`); }}
+      />
     </div>
   );
 }
