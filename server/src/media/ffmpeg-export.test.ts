@@ -2,7 +2,7 @@
 // P4 T4：导出任务（spec D9/D15/D8）；2026-10-01 spec clip-works 增 D4/D19/D22。
 // mock 手法仿 media-routes.test.ts——不真拉 ffmpeg：runClip / runFfmpegArgs 桩**真写产物文件**，
 // 后面 ingest（rename + INSERT）走真实现，整条「导出 → 入库」链路都被测到，只有 ffmpeg 进程本身是假的。
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -294,6 +294,15 @@ describe('视频导出(N1 Task 3)', () => {
 
   it('视频 merge 3 段 → concat 被调(args 含 -f concat 与 -safe 0)、最终产物 1 行、标题含 [共3段]、中间段与列表文件清理', async () => {
     vi.mocked(runFfmpegArgs).mockClear(); // vitest 无 clearMocks:mock.calls 跨用例累积,先清只清记录不动实现
+    // F4(OCR 43c032a 复审):onClip 桩每次写完产物都会收到完整 opts(args 在内)——借它把 concat 调用
+    // 时还**活着的列表文件**内容抓下来(跑完即被 finally 清理),验证条目形状:单引号包裹 + 正斜杠
+    let concatListContent: string | null = null;
+    clipHook.onClip = (o): void => {
+      const opts = o as unknown as { args?: string[] };
+      if (opts.args !== undefined && opts.args.includes('concat')) {
+        concatListContent = readFileSync(opts.args[opts.args.indexOf('-i') + 1]!, 'utf8');
+      }
+    };
     const payload = videoPayload({ mode: 'merge', segments: [{ start_sec: 0, end_sec: 10 }, { start_sec: 20, end_sec: 30 }, { start_sec: 40, end_sec: 50 }] });
     const jobId = await runJob(payload);
     const calls = vi.mocked(runFfmpegArgs).mock.calls;
@@ -307,6 +316,14 @@ describe('视频导出(N1 Task 3)', () => {
     expect(concat).toContain('concat');
     expect(concat).toContain('-safe');
     expect(concat).toContain('0');
+    expect(calls[3]![0].timeoutMs).toBe(3_600_000); // F5:concat -c copy 同样 1h(整段体量读写,慢盘 120s 不够)
+    expect(concat).toContain('-movflags');          // F2:最终成品(被预览服务的那份)moov 前移
+    expect(concat).toContain('+faststart');
+    // F4:列表条目 = file '正斜杠路径' × 3;单引号包裹、无反斜杠残留
+    expect(concatListContent).not.toBeNull();
+    expect(concatListContent!.split('\n').filter((l) => l.trim() !== '')).toHaveLength(3);
+    expect(concatListContent!).toContain("file '");
+    expect(concatListContent!).not.toContain('\\');
     const items = createAudioItemsRepo(db).list();
     expect(items).toHaveLength(1);
     expect(items[0]!.title).toBe(formatMergeTitle('凡人', 3)); // 标题含 [共3段]

@@ -57,9 +57,11 @@ export function buildVideoClipArgs(o: {
 /**
  * 逐段编码后的 concat 拼接(实测 A5:0.46s vs filter_complex 重编码 42.89s,93 倍;
  * 各段同参独立编码,段首必为 x264 IDR 关键帧,-c copy 拼接点落干净 GOP 起点,机理上不花屏)。
+ * -movflags +faststart(OCR 43c032a 复审 F2):合并输出才是被 /api/audio/:id/file 服务的**最终成品**,
+ *   moov 必须前移,否则 <video preload="metadata"> 要下完整文件才可播;与 -c copy 兼容(二次 pass 重排)。
  * list 文件由调用方(Task 3)写好,每行形如:
  *   file 'C:/Users/.../export-1-m0-123.mp4'   ← 正斜杠 + UTF-8 无 BOM;-safe 0 放行该路径
  */
 export function buildVideoConcatArgs(o: { listPath: string; outPath: string }): string[] {
-  return ['-y', '-f', 'concat', '-safe', '0', '-i', o.listPath, '-c', 'copy', o.outPath];
+  return ['-y', '-f', 'concat', '-safe', '0', '-i', o.listPath, '-c', 'copy', '-movflags', '+faststart', o.outPath];
 }

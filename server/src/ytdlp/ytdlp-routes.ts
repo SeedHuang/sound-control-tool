@@ -33,8 +33,10 @@ import type { DownloadQueue } from './download-queue.js';
 // Task 4:下载批次统计(spec D16)——在「任务创建 / 转入运行 / 终态」三处打点,供 GET /api/jobs 出分数
 import type { JobBatch } from '../media/jobs-routes.js';
 
-// Task 7:文件流 Content-Type 按扩展名映射——给 <audio> 标签可识别的 MIME,未知格式回退 octet-stream
-const MIME: Record<string, string> = { mp3: 'audio/mpeg', m4a: 'audio/mp4', wav: 'audio/wav' };
+// Task 7:文件流 Content-Type 按扩展名映射——给 <audio>/<video> 标签可识别的 MIME,未知格式回退 octet-stream。
+// mp4(N1 2026-10-02):视频成品(format='mp4')也走本路由,OCR 复审指出缺了会被 octet-stream 兜底、
+// 靠浏览器嗅探才能播——显式给 video/mp4,与 /api/media/:id/file 的 MEDIA_MIME 口径一致。
+const MIME: Record<string, string> = { mp3: 'audio/mpeg', m4a: 'audio/mp4', wav: 'audio/wav', mp4: 'video/mp4' };
 
 export interface YtdlpDeps {
   db: DB;

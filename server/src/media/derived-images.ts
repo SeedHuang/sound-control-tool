@@ -5,7 +5,7 @@
 // 落盘走「临时名 → rename」：图与 meta 都先落临时名，再连着 rename，中间失败整体回滚，不留半成品。
 import { execFile } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import type { DB } from '../db/index.js';
 import { pushLog } from '../logs.js';
@@ -162,6 +162,13 @@ async function generateDerivedImage(o: Parameters<typeof ensureDerivedImage>[0])
   } else {
     const probe = o.probe ?? probeDuration;
     const ffprobePath = ffmpegPath.replace(/ffmpeg(\.exe)?$/i, 'ffprobe$1'); // 同 clip-job.ts 的 ffprobePathFrom 一行口径
+    // OCR 43c032a 复审 F3:resolveFfmpegPath 对「配置了但文件不在」的路径不做校验,ffprobe 又是字符串推导的
+    // 兄弟路径 —— ffprobe 缺失时 probeDuration 收到 ENOENT → null → 会被 PROBE_FAIL 冤判成「素材损坏请重下」。
+    // 先查文件:缺了按环境问题(NO_FFMPEG)报,把人引去设置页而不是冤枉素材。
+    if (!existsSync(ffprobePath)) {
+      pushLog('error', 'media', `派生图失败：ffprobe 未找到 kind=film import=${o.importId} ffprobe=${ffprobePath}`);
+      return { ok: false, code: 'NO_FFMPEG', message: 'ffprobe 未找到（需与 ffmpeg 同目录）：请到设置页检查 ffmpeg 路径' };
+    }
     const durationSec = await probe(ffprobePath, o.videoPath, PROBE_TIMEOUT_MS);
     // 探测失败 → 明确失败，**不出图**（2026-10-02 修「误导性胶片条」）。
     // 旧实现在这里让 buildFilmstripArgs 退化成 fps=1：12 格 × 1fps = 只覆盖前 12 秒，PNG 却是标准 1600×90，

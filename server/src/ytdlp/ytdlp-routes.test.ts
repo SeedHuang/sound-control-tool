@@ -582,6 +582,18 @@ describe('GET /api/audio 与 GET /api/audio/:id/file', () => {
     expect(ok.headers['content-type']).toBe('audio/mpeg');
     expect(ok.body).toBe('abc');
   });
+  // OCR 43c032a 复审 F1:视频成品(format='mp4')走同一路由,必须显式 video/mp4——
+  // 不许落到 octet-stream 靠浏览器嗅探(与 /api/media/:id/file 的 MEDIA_MIME 口径一致)
+  it('video 成品(format=mp4) → Content-Type video/mp4', async () => {
+    const audioRepo = createAudioItemsRepo(db);
+    const audioDir = mkdtempSync(join(tmpdir(), 'sct-audio-'));
+    const id = audioRepo.create({ title: 'v', source_type: 'edit', source_url: '', file_path: join(audioDir, 'v.mp4'), format: 'mp4', duration_sec: 10, file_size: 4, media_kind: 'video', width: 3840, height: 2160 });
+    writeFileSync(join(audioDir, 'v.mp4'), 'MP4BYTES');
+    makeApp('yt-dlp', 'tok2');
+    const ok = await app.inject({ method: 'GET', url: `/api/audio/${id}/file?token=tok2` });
+    expect(ok.statusCode).toBe(200);
+    expect(ok.headers['content-type']).toBe('video/mp4');
+  });
   // D3 更新(2026-09-29):localhost 来源豁免 query token——<audio> 标签无法设 header,浏览器直连 dev 需免 token
   it('audio 文件 localhost origin + 无 token → 守卫放行(不存在 id → 404,证明未 401)', async () => {
     makeApp('yt-dlp', 'tok2');

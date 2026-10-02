@@ -309,7 +309,7 @@ export default function StudioDetailPage() {
   const removeProduct = (it: AudioRow): void => {
     Modal.confirm({
       title: `删除《${it.title}》？`,
-      content: '此操作会同时删除音频文件和数据库记录，不可恢复。',
+      content: '此操作会同时删除成品文件和数据库记录，不可恢复。',
       okText: '删除',
       okType: 'danger',
       cancelText: '取消',

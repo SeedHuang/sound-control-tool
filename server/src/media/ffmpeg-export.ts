@@ -174,10 +174,14 @@ export async function startExportJob(jobId: number, payload: ExportJobPayload, d
           segPaths.push(tmp);
         }
         listPath = join(deps.tempDir, `export-${jobId}-concat-${Date.now()}.txt`);
-        writeFileSync(listPath, segPaths.map((p) => `file '${p.replace(/\\/g, '/')}'`).join('\n') + '\n', 'utf8'); // 正斜杠 + 单引号包裹(concat demuxer 语法);utf8 无 BOM
+        // OCR 43c032a 复审 F4:列表条目按 concat demuxer 引号规则转义内嵌单引号(Windows 用户名如 O'Brien
+        // 会让 tempDir 带撇号,不转义会把 file '...' 条目截断成畸形);正斜杠 + 单引号包裹;utf8 无 BOM
+        const concatQuote = (p: string): string => p.replace(/\\/g, '/').replace(/'/g, "'\\''");
+        writeFileSync(listPath, segPaths.map((p) => `file '${concatQuote(p)}'`).join('\n') + '\n', 'utf8');
         pushLog('info', 'job', `export job ${jobId} concat 列表就绪 ${listPath}(${segPaths.length} 段)`);
         const tmpOut = join(deps.tempDir, `export-${jobId}-merge-${Date.now()}.mp4`);
-        const r = await runFfmpegArgs({ ffmpegPath, args: buildVideoConcatArgs({ listPath, outPath: tmpOut }), outPath: tmpOut });
+        // OCR 43c032a 复审 F5:concat -c copy 也要读写整段体量,慢盘上默认 120s 不够 —— 与逐段编码同为 1h
+        const r = await runFfmpegArgs({ ffmpegPath, args: buildVideoConcatArgs({ listPath, outPath: tmpOut }), outPath: tmpOut, timeoutMs: 3_600_000 });
         if (!r.ok) { try { rmSync(tmpOut, { force: true }); } catch { /* 尽力清理 */ } fail(`合并导出失败：${tail(r.stderr)}`); return; }
         const title = formatMergeTitle(payload.prefix, payload.segments.length);
         const dur = await probeDuration(ffprobePath, tmpOut);

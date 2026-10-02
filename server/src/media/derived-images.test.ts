@@ -12,12 +12,17 @@ let root: string;
 let derivedDir: string;
 let tempDir: string;
 let db: DB;
+let stubBin: string; // 桩 ffmpeg/ffprobe 所在目录 —— F3(OCR 复审)后 film 分支会 existsSync(ffprobePath),桩必须是**真文件**
 
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), 'sct-di-'));
   derivedDir = join(root, 'derived');
   tempDir = join(root, 'tmp');
   mkdirSync(tempDir, { recursive: true });
+  stubBin = join(root, 'bin');
+  mkdirSync(stubBin, { recursive: true });
+  writeFileSync(join(stubBin, 'ffmpeg.exe'), '');
+  writeFileSync(join(stubBin, 'ffprobe.exe'), '');
   db = openDatabase(':memory:');
 });
 afterEach(() => {
@@ -39,7 +44,8 @@ function execStub(behavior: (outPath: string) => { err?: Error; stderr?: string;
   return { fn, calls };
 }
 
-const resolveOk = async (): Promise<string | null> => 'C:/stub/ffmpeg.exe';
+// F3(OCR 复审)后 film 分支会 existsSync(ffprobe 兄弟文件),桩路径必须是真文件 —— 指向 beforeEach 造的 bin 目录
+const resolveOk = async (): Promise<string | null> => join(stubBin, 'ffmpeg.exe');
 
 describe('ensureDerivedImage', () => {
   it('命中缓存：文件存在且 size>0 → cached:true，且不调 doExec', async () => {
@@ -120,6 +126,16 @@ describe('ensureDerivedImage', () => {
     const { fn, calls } = execStub(() => ({ write: 'PNG' }));
     const r = await ensureDerivedImage({ kind: 'film', importId: 2, videoPath: 'v.mp4', derivedDir, tempDir, db, doExec: fn, probe: async () => 0, resolveFfmpeg: resolveOk });
     expect(r).toMatchObject({ ok: false, code: 'PROBE_FAIL' });
+    expect(calls).toHaveLength(0);
+  });
+
+  // F3(OCR 43c032a 复审)：ffprobe 兄弟文件缺失是**环境问题**，必须 NO_FFMPEG 引去设置页，
+  // 不许顺著 probe 失败被 PROBE_FAIL 冤判成「素材损坏请重下」
+  it('filmstrip：ffprobe 兄弟文件缺失 → NO_FFMPEG（不冤判 PROBE_FAIL、不调 doExec）', async () => {
+    const { fn, calls } = execStub(() => ({ write: 'PNG' }));
+    const r = await ensureDerivedImage({ kind: 'film', importId: 9, videoPath: 'v.mp4', derivedDir, tempDir, db, doExec: fn, probe: async () => 20, resolveFfmpeg: async () => join(stubBin, 'orphan', 'ffmpeg.exe') });
+    expect(r).toMatchObject({ ok: false, code: 'NO_FFMPEG' });
+    if (!r.ok) expect(r.message).toContain('ffprobe');
     expect(calls).toHaveLength(0);
   });
 

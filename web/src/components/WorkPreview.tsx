@@ -122,7 +122,8 @@ export default function WorkPreview({ work, active, muted }: Props): JSX.Element
     // 改用 <video> 播那条成品(同一 /api/audio/:id/file 路由直接回 mp4);cover 裁切样式照抄上方素材 video 分支。
     // 纪律①②③(单实例/移开卸载/起播被拒回退静音)全在 effect 里,mediaRef 类型本就是 HTMLVideoElement | HTMLAudioElement,直接复用;
     // muted 仍走共享开关(与素材 video 分支同款"静音纪律"),不是写死。
-    media = work.latest_product_kind === 'video' ? (
+    // OCR 43c032a 复审 F8:与 effect 里 5s 上限共用同一个 productIsVideo 判定,防两处口径漂移
+    media = productIsVideo ? (
       <video
         ref={(el) => { mediaRef.current = el; }}
         muted={muted}

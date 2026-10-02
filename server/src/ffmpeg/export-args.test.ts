@@ -75,8 +75,8 @@ describe('buildVideoClipArgs（视频切段参数，实测 A1/A3）', () => {
 describe('buildVideoConcatArgs（concat demuxer 拼接，实测 A5：0.46s vs 重编码 42.89s）', () => {
   // 列表文件写法归 Task 3 落实，每行形如：
   //   file 'C:/Users/.../export-1-m0-123.mp4'   ← 正斜杠 + -safe 0（T3 落实）
-  it('精确数组：-y -f concat -safe 0 -i list -c copy out', () => {
+  it('精确数组：-y -f concat -safe 0 -i list -c copy -movflags +faststart out（OCR 复审 F2：最终成品 moov 前移）', () => {
     expect(buildVideoConcatArgs({ listPath: 'list.txt', outPath: 'merged.mp4' }))
-      .toEqual(['-y', '-f', 'concat', '-safe', '0', '-i', 'list.txt', '-c', 'copy', 'merged.mp4']);
+      .toEqual(['-y', '-f', 'concat', '-safe', '0', '-i', 'list.txt', '-c', 'copy', '-movflags', '+faststart', 'merged.mp4']);
   });
 });
