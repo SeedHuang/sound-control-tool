@@ -388,7 +388,7 @@ describe('作品路由', () => {
   });
 
   // ③ video + format=mp4 → payload 带 mediaKind='video'/videoAn(照 S1 用 startExportJob mock 捕获 payload;
-  //   ExportJobPayload.format 类型未含 'mp4',运行时值断言用 as string 宽化比较)
+  //   F9③(2026-10-04)：ExportJobPayload.format 联合已含 'mp4',断言不再需要 as string 宽化)
   it('导出 mediaKind=video + format=mp4 → payload.mediaKind=video、videoAn 透传(缺省 false)', async () => {
     const imp = seedImportWithVideo();
     const w = createClipProjectsRepo(db).create(imp, '作品甲');
@@ -405,7 +405,7 @@ describe('作品路由', () => {
     const first = vi.mocked(startExportJob).mock.calls[0]![1] as ExportJobPayload;
     expect(first.mediaKind).toBe('video');
     expect(first.videoAn).toBe(true);
-    expect(first.format as string).toBe('mp4');
+    expect(first.format).toBe('mp4');
     const second = vi.mocked(startExportJob).mock.calls[1]![1] as ExportJobPayload;
     expect(second.videoAn).toBe(false);
   });

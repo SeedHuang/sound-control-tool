@@ -22,7 +22,9 @@ import { resolveFfmpegPath } from './ffmpeg-path.js';
 export interface ExportSegment { start_sec: number; end_sec: number; label?: string | null }
 export interface ExportJobPayload {
   importId: number; videoPath: string; mode: 'separate' | 'merge';
-  format: 'mp3' | 'm4a' | 'wav'; quality?: string; prefix: string; segments: ExportSegment[];
+  // F9③(2026-10-04):联合补 'mp4' —— 视频导出运行时 format 就是 'mp4',旧声明是「类型说谎」,
+  // 代价是调用处 3 处强转(测试里 as unknown as 彻底绕过类型检查);音频合法性仍由路由白名单保证(runClip/buildMergeArgs 只收音频联合)。
+  format: 'mp3' | 'm4a' | 'wav' | 'mp4'; quality?: string; prefix: string; segments: ExportSegment[];
   /** 2026-10-01 spec clip-works D4：成品归属的作品 id（写入 audio_items.source_work_id） */
   projectId: number;
   /** 2026-10-01 spec clip-works D19：任务抽屉优先显示的作品名；无命名 → null */
@@ -38,6 +40,9 @@ export function formatMergeTitle(prefix: string, count: number): string { return
 const tail = (s: string): string => s.trim().split('\n').slice(-1)[0]?.slice(0, 200) || '(ffmpeg 无 stderr 输出)';
 // 由 ffmpeg 路径推 ffprobe 路径(同 fpath 命名:ffmpeg(.exe) → ffprobe(.exe))
 const ffprobePathFrom = (ffmpegPath: string): string => ffmpegPath.replace(/ffmpeg(\.exe)?$/i, 'ffprobe$1');
+// 尽力删除:清理是收尾动作,文件不存在(成功入库已被 ingest rename 走)或被占用都不该让导出失败——
+// 与仓库「删除/写入接口的 IO 失败不让接口失败」同口径。全文件清理点统一走它,避免十几处 try/catch 各自漂移。
+const rmQuiet = (p: string): void => { try { rmSync(p, { force: true }); } catch { /* 尽力清理 */ } };
 
 export async function startExportJob(jobId: number, payload: ExportJobPayload, deps: { db: DB; audioDir: string; tempDir: string }): Promise<void> {
   const jobsRepo = createJobsRepo(deps.db);
@@ -68,7 +73,7 @@ export async function startExportJob(jobId: number, payload: ExportJobPayload, d
   // 维持取消路由写的「用户取消」,不打「已保留 0 段」这种没信息量的话。
   const cancelGuard = (tmp: string, kept: number): boolean => {
     if (jobsRepo.get(jobId)?.status !== 'cancelled') return false;
-    try { rmSync(tmp, { force: true }); } catch { /* 尽力清理 */ }
+    rmQuiet(tmp);
     if (kept > 0) {
       // 只改 message 不动 status:repo.update 只传 message 时不碰 status/finished_at;
       // 不得用 finish/fail——它们会覆写 status(正是 H2 修掉的坑)
@@ -84,7 +89,7 @@ export async function startExportJob(jobId: number, payload: ExportJobPayload, d
   // 否则会写出一条指向已删作品的成品(悬空行 + 白占一份文件)。丢弃产物 + 置 error + 记日志。
   const discardIfWorkGone = (tmp: string): boolean => {
     if (projectsRepo.get(payload.projectId) !== null) return false;
-    try { rmSync(tmp, { force: true }); } catch { /* 尽力清理 */ }
+    rmQuiet(tmp);
     fail('作品已被删除，产物已丢弃');
     return true;
   };
@@ -106,6 +111,11 @@ export async function startExportJob(jobId: number, payload: ExportJobPayload, d
     }
     pushLog('info', 'job', `export job ${jobId} 目标目录 ${outputDir}`);
     const audioRepo = createAudioItemsRepo(deps.db);
+    // 音频分支的 format 收敛(F9③):payload.format 联合含 'mp4'(视频专用),音频侧收敛回三选一。
+    // 依据:mediaKind!=='video' 时路由白名单只放行 mp3/m4a/wav(project-routes 校验,否则 400)。
+    // 必须在 ingest 之前算好——ingest 的入库 format/落盘扩展名(ingest.ts)与编码 format 必须是同一个值,
+    // 否则脏 payload(mediaKind!=video 且 format=mp4)会「按 mp3 编码、按 mp4 入库」产生错配产物。
+    const audioFormat: 'mp3' | 'm4a' | 'wav' = payload.format === 'mp4' ? 'mp3' : payload.format;
     // 统一的入库入口:sourceType='edit'(D8)——导出产物是「剪辑」而非「下载」。
     // N1 Task 3(spec video-export):kind=video 时 format 固定 'mp4'(payload.format 由路由层保证,
     // 防御性忽略其它值——分支入口记日志不中断),media_kind/width/height 随视频元数据透传;
@@ -113,7 +123,7 @@ export async function startExportJob(jobId: number, payload: ExportJobPayload, d
     const ingest = (tmp: string, title: string, durationSec: number | null, videoMeta?: { width: number | null; height: number | null }): number => {
       const isVideo = payload.mediaKind === 'video';
       const audioId = ingestDownloadedFile({
-        tmpPath: tmp, title, format: isVideo ? 'mp4' : payload.format, durationSec,
+        tmpPath: tmp, title, format: isVideo ? 'mp4' : audioFormat, durationSec,
         fileSize: statSync(tmp).size, sourceUrl: '', entryIndex: null, collectionTitle: null,
         sourceType: 'edit',
         sourceImportId: payload.importId, // Spec A 的冗余列,继续写(权威是作品 D5)
@@ -131,31 +141,40 @@ export async function startExportJob(jobId: number, payload: ExportJobPayload, d
     // kind=video:format 固定按 'mp4'(payload.format 由路由层保证,防御性忽略其它值——记日志不中断);
     // 编码参数/超时/拼接方式全部按 plan 实测参数表(A1-A5),不自由发挥。
     if (payload.mediaKind === 'video') {
-      // 防御检查按运行时值(payload 是 DB JSON 反序列化产物,类型窄不等于运行时值受保证;as string 宽化以通过 TS2367)
-      if ((payload.format as string) !== 'mp4') pushLog('info', 'job', `export job ${jobId} kind=video format=${payload.format} 非 mp4 → 防御性按 mp4 处理`);
+      // 防御检查按运行时值(payload 是 DB JSON 反序列化产物,类型窄不等于运行时值受保证)
+      if (payload.format !== 'mp4') pushLog('info', 'job', `export job ${jobId} kind=video format=${payload.format} 非 mp4 → 防御性按 mp4 处理`);
       const crf = crfOf(payload.quality);       // high→20、mid/缺省→23、low→28(实测 A4)
       const an = payload.videoAn === true;      // 缺省 false(带音轨),只有显式 true 才 -an(实测 A3)
       pushLog('info', 'job', `export job ${jobId} kind=video mode=${payload.mode} crf=${crf} an=${an} 段数=${payload.segments.length}`);
       if (payload.mode === 'separate') {
         const produced: number[] = [];
-        for (let i = 0; i < payload.segments.length; i++) {
-          const seg = payload.segments[i]!;
-          // 临时产物名唯一(spec D14 同族):固定名字会被并发任务互相覆盖
-          const tmp = join(deps.tempDir, `export-${jobId}-${i}-${Date.now()}.mp4`);
-          const r = await runFfmpegArgs({ ffmpegPath, args: buildVideoClipArgs({ inputPath: payload.videoPath, outPath: tmp, start: seg.start_sec, end: seg.end_sec, crf, an }), outPath: tmp, timeoutMs: 3_600_000 }); // 4K 实测:默认 120s 不够
-          if (!r.ok) { try { rmSync(tmp, { force: true }); } catch { /* 尽力清理 */ } fail(`导出第 ${i + 1} 段失败：${tail(r.stderr)}`); return; }
-          const title = formatClipTitle(payload.prefix, seg.start_sec, seg.end_sec); // 前端传的 label/title 不作前缀（后端强制拼）
-          const dur = await probeDuration(ffprobePath, tmp);
-          const meta = await probeVideoMeta(ffprobePath, tmp); // 宽高入库(探测失败 → null,按未知处理不失败)
-          pushLog('info', 'job', `export job ${jobId} 第 ${i + 1}/${payload.segments.length} 段请求 ${seg.start_sec}-${seg.end_sec}s，实测 ${dur ?? '?'}s ${meta.width ?? '?'}x${meta.height ?? '?'}`);
-          if (cancelGuard(tmp, produced.length)) return; // H2:已取消 → 丢弃本段,维持 cancelled;kept=已入库段数,message 写明保留事实
-          if (discardIfWorkGone(tmp)) return; // D22:逐段入库前校验(作品没了就丢弃这一段)
-          produced.push(ingest(tmp, title, dur, meta));
-          emit(jobId, { type: 'progress', percent: Math.round(((i + 1) / payload.segments.length) * 100) });
+        // F9①(2026-10-04):逐段临时产物登记进 tmpPaths,统一由 finally 清理——与视频 merge 分支(下方)对齐。
+        // 入库(rename EBUSY 等)/DB 抛错会绕过下面各显式失败分支直达外层 catch,残留 mp4 段在 temp 躺到下次重启;
+        // 成功入库的段已被 ingest rename 走,rmQuiet 是无害空操作。
+        const tmpPaths: string[] = [];
+        try {
+          for (let i = 0; i < payload.segments.length; i++) {
+            const seg = payload.segments[i]!;
+            // 临时产物名唯一(spec D14 同族):固定名字会被并发任务互相覆盖
+            const tmp = join(deps.tempDir, `export-${jobId}-${i}-${Date.now()}.mp4`);
+            tmpPaths.push(tmp);
+            const r = await runFfmpegArgs({ ffmpegPath, args: buildVideoClipArgs({ inputPath: payload.videoPath, outPath: tmp, start: seg.start_sec, end: seg.end_sec, crf, an }), outPath: tmp, timeoutMs: 3_600_000, jobId }); // 4K 实测:默认 120s 不够
+            if (!r.ok) { rmQuiet(tmp); fail(`导出第 ${i + 1} 段失败：${tail(r.stderr)}`); return; }
+            const title = formatClipTitle(payload.prefix, seg.start_sec, seg.end_sec); // 前端传的 label/title 不作前缀（后端强制拼）
+            const dur = await probeDuration(ffprobePath, tmp);
+            const meta = await probeVideoMeta(ffprobePath, tmp); // 宽高入库(探测失败 → null,按未知处理不失败)
+            pushLog('info', 'job', `export job ${jobId} 第 ${i + 1}/${payload.segments.length} 段请求 ${seg.start_sec}-${seg.end_sec}s，实测 ${dur ?? '?'}s ${meta.width ?? '?'}x${meta.height ?? '?'}`);
+            if (cancelGuard(tmp, produced.length)) return; // H2:已取消 → 丢弃本段,维持 cancelled;kept=已入库段数,message 写明保留事实
+            if (discardIfWorkGone(tmp)) return; // D22:逐段入库前校验(作品没了就丢弃这一段)
+            produced.push(ingest(tmp, title, dur, meta));
+            emit(jobId, { type: 'progress', percent: Math.round(((i + 1) / payload.segments.length) * 100) });
+          }
+          jobsRepo.finish(jobId);
+          pushLog('info', 'job', `export job ${jobId} done mode=separate kind=video → ${produced.length} 条`);
+          emit(jobId, { type: 'done', kind: 'video', audioId: produced[0]!, title: `${payload.prefix}（共 ${produced.length} 段）`, format: 'mp4', replaced: false, count: produced.length });
+        } finally {
+          for (const p of tmpPaths) rmQuiet(p);
         }
-        jobsRepo.finish(jobId);
-        pushLog('info', 'job', `export job ${jobId} done mode=separate kind=video → ${produced.length} 条`);
-        emit(jobId, { type: 'done', kind: 'video', audioId: produced[0]!, title: `${payload.prefix}（共 ${produced.length} 段）`, format: 'mp4', replaced: false, count: produced.length });
         return;
       }
 
@@ -168,14 +187,14 @@ export async function startExportJob(jobId: number, payload: ExportJobPayload, d
       let listPath: string | null = null;
       // OCR R1(2026-10-03) medium:合并成品也要进 finally 清理——ingest(rename EBUSY 等)/DB 抛错会绕过
       // 下面各显式失败分支直达外层 catch,多 GB 中间成品不能在 temp 躺到下次重启 cleanOrphans;
-      // 成功路径产物已被 ingest rename 走,rmSync force 是无害空操作。
+      // 成功路径产物已被 ingest rename 走,rmQuiet 是无害空操作。
       let mergedTmp: string | null = null;
       try {
         for (let i = 0; i < payload.segments.length; i++) {
           const seg = payload.segments[i]!;
           const tmp = join(deps.tempDir, `export-${jobId}-m${i}-${Date.now()}.mp4`);
-          const r = await runFfmpegArgs({ ffmpegPath, args: buildVideoClipArgs({ inputPath: payload.videoPath, outPath: tmp, start: seg.start_sec, end: seg.end_sec, crf, an }), outPath: tmp, timeoutMs: 3_600_000 });
-          if (!r.ok) { try { rmSync(tmp, { force: true }); } catch { /* 尽力清理 */ } fail(`导出第 ${i + 1} 段失败：${tail(r.stderr)}`); return; }
+          const r = await runFfmpegArgs({ ffmpegPath, args: buildVideoClipArgs({ inputPath: payload.videoPath, outPath: tmp, start: seg.start_sec, end: seg.end_sec, crf, an }), outPath: tmp, timeoutMs: 3_600_000, jobId });
+          if (!r.ok) { rmQuiet(tmp); fail(`导出第 ${i + 1} 段失败：${tail(r.stderr)}`); return; }
           if (cancelGuard(tmp, 0)) return; // H2:merge 无已入库段,kept=0 不写保留话术
           pushLog('info', 'job', `export job ${jobId} 第 ${i + 1}/${payload.segments.length} 段编码完成 crf=${crf} an=${an}`);
           segPaths.push(tmp);
@@ -189,8 +208,8 @@ export async function startExportJob(jobId: number, payload: ExportJobPayload, d
         const tmpOut = join(deps.tempDir, `export-${jobId}-merge-${Date.now()}.mp4`);
         mergedTmp = tmpOut;
         // OCR 43c032a 复审 F5:concat -c copy 也要读写整段体量,慢盘上默认 120s 不够 —— 与逐段编码同为 1h
-        const r = await runFfmpegArgs({ ffmpegPath, args: buildVideoConcatArgs({ listPath, outPath: tmpOut }), outPath: tmpOut, timeoutMs: 3_600_000 });
-        if (!r.ok) { try { rmSync(tmpOut, { force: true }); } catch { /* 尽力清理 */ } fail(`合并导出失败：${tail(r.stderr)}`); return; }
+        const r = await runFfmpegArgs({ ffmpegPath, args: buildVideoConcatArgs({ listPath, outPath: tmpOut }), outPath: tmpOut, timeoutMs: 3_600_000, jobId });
+        if (!r.ok) { rmQuiet(tmpOut); fail(`合并导出失败：${tail(r.stderr)}`); return; }
         const title = formatMergeTitle(payload.prefix, payload.segments.length);
         const dur = await probeDuration(ffprobePath, tmpOut);
         const meta = await probeVideoMeta(ffprobePath, tmpOut);
@@ -203,51 +222,68 @@ export async function startExportJob(jobId: number, payload: ExportJobPayload, d
         emit(jobId, { type: 'done', kind: 'video', audioId, title, format: 'mp4', replaced: false, count: 1 });
       } finally {
         // 过程文件清理:中间段(finally 里只清已编码成功的段;失败段自身在其分支已删)+ concat 列表文件
-        // + 合并成品(OCR R1:仅异常路径残留;成功时已被 ingest rename 走,rm 为无害空操作)。
-        // rmSync force:不存在也不抛(与音频分支同口径)
-        for (const p of segPaths) { try { rmSync(p, { force: true }); } catch { /* 尽力清理 */ } }
-        if (listPath !== null) { try { rmSync(listPath, { force: true }); } catch { /* 尽力清理 */ } }
-        if (mergedTmp !== null) { try { rmSync(mergedTmp, { force: true }); } catch { /* 尽力清理 */ } }
+        // + 合并成品(OCR R1:仅异常路径残留;成功时已被 ingest rename 走,rmQuiet 为无害空操作)。
+        for (const p of segPaths) rmQuiet(p);
+        if (listPath !== null) rmQuiet(listPath);
+        if (mergedTmp !== null) rmQuiet(mergedTmp);
       }
       return;
     }
 
+    // ===== 音频分支 =====
+    // 音频 format 已在上面(ingest 之前)收敛为 audioFormat;这里只补一条运行时防御日志。
+    // 运行时若真见 'mp4'(脏 payload,路由白名单本应挡住)→ 记日志并按 mp3 兜底,与视频分支「格式不符只记日志不中断」同口径。
+    if (payload.format === 'mp4') pushLog('info', 'job', `export job ${jobId} kind=audio format=mp4 非法 → 防御性按 mp3 处理`);
+
     if (payload.mode === 'separate') {
       const produced: number[] = [];
-      for (let i = 0; i < payload.segments.length; i++) {
-        const seg = payload.segments[i]!;
-        // 临时产物名唯一(spec D14 同族):固定名字会被并发任务互相覆盖
-        const tmp = join(deps.tempDir, `export-${jobId}-${i}-${Date.now()}.${payload.format}`);
-        const r = await runClip({ ffmpegPath, inputPath: payload.videoPath, outPath: tmp, start: seg.start_sec, end: seg.end_sec, format: payload.format, quality: payload.quality });
-        if (!r.ok) { try { rmSync(tmp, { force: true }); } catch { /* 尽力清理 */ } fail(`导出第 ${i + 1} 段失败：${tail(r.stderr)}`); return; }
-        const title = formatClipTitle(payload.prefix, seg.start_sec, seg.end_sec); // 前端传的 label/title 不作前缀（后端强制拼）
-        const dur = await probeDuration(ffprobePath, tmp);
-        pushLog('info', 'job', `export job ${jobId} 第 ${i + 1}/${payload.segments.length} 段请求 ${seg.start_sec}-${seg.end_sec}s，实测 ${dur ?? '?'}s`);
-        if (cancelGuard(tmp, produced.length)) return; // H2:已取消 → 丢弃本段,维持 cancelled;kept=已入库段数,message 写明保留事实
-        if (discardIfWorkGone(tmp)) return; // D22:逐段入库前校验(作品没了就丢弃这一段)
-        produced.push(ingest(tmp, title, dur));
-        emit(jobId, { type: 'progress', percent: Math.round(((i + 1) / payload.segments.length) * 100) });
+      // F9①:逐段临时产物登记,统一 finally 清理(理由同视频 separate 分支)
+      const tmpPaths: string[] = [];
+      try {
+        for (let i = 0; i < payload.segments.length; i++) {
+          const seg = payload.segments[i]!;
+          // 临时产物名唯一(spec D14 同族):固定名字会被并发任务互相覆盖
+          const tmp = join(deps.tempDir, `export-${jobId}-${i}-${Date.now()}.${audioFormat}`);
+          tmpPaths.push(tmp);
+          const r = await runClip({ ffmpegPath, inputPath: payload.videoPath, outPath: tmp, start: seg.start_sec, end: seg.end_sec, format: audioFormat, quality: payload.quality, jobId });
+          if (!r.ok) { rmQuiet(tmp); fail(`导出第 ${i + 1} 段失败：${tail(r.stderr)}`); return; }
+          const title = formatClipTitle(payload.prefix, seg.start_sec, seg.end_sec); // 前端传的 label/title 不作前缀（后端强制拼）
+          const dur = await probeDuration(ffprobePath, tmp);
+          pushLog('info', 'job', `export job ${jobId} 第 ${i + 1}/${payload.segments.length} 段请求 ${seg.start_sec}-${seg.end_sec}s，实测 ${dur ?? '?'}s`);
+          if (cancelGuard(tmp, produced.length)) return; // H2:已取消 → 丢弃本段,维持 cancelled;kept=已入库段数,message 写明保留事实
+          if (discardIfWorkGone(tmp)) return; // D22:逐段入库前校验(作品没了就丢弃这一段)
+          produced.push(ingest(tmp, title, dur));
+          emit(jobId, { type: 'progress', percent: Math.round(((i + 1) / payload.segments.length) * 100) });
+        }
+        jobsRepo.finish(jobId);
+        pushLog('info', 'job', `export job ${jobId} done mode=separate → ${produced.length} 条音频`);
+        // C-2:emit 在 done 后断连,故只发一次终态,用 count 带出总段数(前端提示「已导出 N 段」)
+        emit(jobId, { type: 'done', kind: 'audio', audioId: produced[0]!, title: `${payload.prefix}（共 ${produced.length} 段）`, format: audioFormat, replaced: false, count: produced.length });
+      } finally {
+        for (const p of tmpPaths) rmQuiet(p);
       }
-      jobsRepo.finish(jobId);
-      pushLog('info', 'job', `export job ${jobId} done mode=separate → ${produced.length} 条音频`);
-      // C-2:emit 在 done 后断连,故只发一次终态,用 count 带出总段数(前端提示「已导出 N 段」)
-      emit(jobId, { type: 'done', kind: 'audio', audioId: produced[0]!, title: `${payload.prefix}（共 ${produced.length} 段）`, format: payload.format, replaced: false, count: produced.length });
       return;
     }
 
     // merge
-    const tmp = join(deps.tempDir, `export-${jobId}-merge-${Date.now()}.${payload.format}`);
-    const args = buildMergeArgs({ inputPath: payload.videoPath, outPath: tmp, format: payload.format, quality: payload.quality, segments: payload.segments });
-    const r = await runFfmpegArgs({ ffmpegPath, args, outPath: tmp });
-    if (!r.ok) { try { rmSync(tmp, { force: true }); } catch { /* 尽力清理 */ } fail(`合并导出失败：${tail(r.stderr)}`); return; }
-    const title = formatMergeTitle(payload.prefix, payload.segments.length);
-    const dur = await probeDuration(ffprobePath, tmp);
-    if (cancelGuard(tmp, 0)) return; // H2:已取消 → 丢弃产物,维持 cancelled;merge 无已入库段,kept=0 不写保留话术
-    if (discardIfWorkGone(tmp)) return; // D22:合并产物入库前校验一次
-    const audioId = ingest(tmp, title, dur);
-    jobsRepo.finish(jobId);
-    pushLog('info', 'job', `export job ${jobId} done mode=merge → audio ${audioId} @ ${title}`);
-    emit(jobId, { type: 'done', kind: 'audio', audioId, title, format: payload.format, replaced: false, count: 1 });
+    const tmp = join(deps.tempDir, `export-${jobId}-merge-${Date.now()}.${audioFormat}`);
+    try {
+      const args = buildMergeArgs({ inputPath: payload.videoPath, outPath: tmp, format: audioFormat, quality: payload.quality, segments: payload.segments });
+      const r = await runFfmpegArgs({ ffmpegPath, args, outPath: tmp, jobId });
+      if (!r.ok) { rmQuiet(tmp); fail(`合并导出失败：${tail(r.stderr)}`); return; }
+      const title = formatMergeTitle(payload.prefix, payload.segments.length);
+      const dur = await probeDuration(ffprobePath, tmp);
+      if (cancelGuard(tmp, 0)) return; // H2:已取消 → 丢弃产物,维持 cancelled;merge 无已入库段,kept=0 不写保留话术
+      if (discardIfWorkGone(tmp)) return; // D22:合并产物入库前校验一次
+      const audioId = ingest(tmp, title, dur);
+      jobsRepo.finish(jobId);
+      pushLog('info', 'job', `export job ${jobId} done mode=merge → audio ${audioId} @ ${title}`);
+      emit(jobId, { type: 'done', kind: 'audio', audioId, title, format: audioFormat, replaced: false, count: 1 });
+    } finally {
+      // F9①(2026-10-04):合并成品入库(rename EBUSY 等)/DB 抛错会绕过上面的显式失败分支直达外层 catch,
+      // 残留文件不能在 temp 躺到下次重启;成功时已被 ingest rename 走,rmQuiet 是无害空操作
+      rmQuiet(tmp);
+    }
   } catch (err) {
     fail(err instanceof Error ? err.message : String(err));
   }

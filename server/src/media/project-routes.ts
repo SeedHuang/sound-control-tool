@@ -171,10 +171,10 @@ export function registerProjectRoutes(
       }
     }
     // 注意：`String(body.format)` 校验不会收窄 body.format 的类型（仍是 unknown），显式收敛成白名单联合供 payload 使用。
-    // video 时 format 落 'mp4'——`string → 联合`断言仅是类型层收窄；运行时值由 T3 的视频分支防御保证
-    //（isVideo 固定按 mp4 入库、非 mp4 只记防御日志）。ExportJobPayload.format 类型未含 'mp4'：本次任务文件清单
-    // 不含 ffmpeg-export.ts 不扩类型（T3 测试注释预期过"T4 扩"，取舍见 n1-t4-report.md 偏离节）。
-    const format = (mediaKind === 'video' ? 'mp4' : String(body.format)) as 'mp3' | 'm4a' | 'wav';
+    // video 时 format 落 'mp4'——`string → 联合`断言仅是类型层收窄；运行时值由上面的白名单校验 + 视频分支防御共同保证
+    //（isVideo 固定按 mp4 入库、非 mp4 只记防御日志）。F9③(2026-10-04)：ExportJobPayload.format 联合已补 'mp4'
+    //（原先因任务文件白名单限制没收，属漏做），此处断言随之放宽到完整联合；音频白名单校验（上方）不随之放宽。
+    const format = (mediaKind === 'video' ? 'mp4' : String(body.format)) as ExportJobPayload['format'];
     const parsed = parseSegments(body.segments); // D15：segments 必传，导出以请求体为准
     if (!parsed.ok) return reply.code(400).send({ ok: false, error: { code: 'BAD_REQUEST', message: parsed.message, next: parsed.next } });
     if (parsed.segments.length === 0) return reply.code(400).send({ ok: false, error: { code: 'BAD_REQUEST', message: '没有可导出的剪辑段', next: '先添加剪辑段' } });

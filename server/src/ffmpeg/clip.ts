@@ -1,7 +1,8 @@
-import { execFile } from 'node:child_process';
+import { execFile, type ChildProcess } from 'node:child_process';
 import { statSync } from 'node:fs';
 import { pushLog } from '../logs.js';
 import { buildClipArgs, type ClipArgsOpts } from './clip-args.js';
+import { registerExportProcess, unregisterExportProcess } from './export-processes.js';
 
 export type ExecLike = typeof execFile;
 
@@ -11,12 +12,17 @@ export interface RunClipOpts extends ClipArgsOpts {
   doExec?: ExecLike;
   /** 成功判定用;单测注入桩,避免为造"文件存在"真写磁盘 */
   fileSize?: (p: string) => number | null;
+  /** F11(2026-10-04):本 job 的 id(透传给 runFfmpegArgs 登记 ffmpeg 子进程,取消导出时可 taskkill) */
+  jobId?: number;
 }
 
 /** 通用 runner 入参(P4 抽出):抽音轨与导出拼接共用同一套进程执行 + 成功判定,不再各写一份 */
 export interface RunFfmpegArgsOpts {
   ffmpegPath: string; args: string[]; outPath: string;
   timeoutMs?: number; doExec?: ExecLike; fileSize?: (p: string) => number | null;
+  /** F11(2026-10-04):本 job 的 id——传入则把 ffmpeg 子进程登记进 export-processes,取消导出时可杀;
+   *  不传 = 不登记(clip-job.ts 等非导出调用方零回归) */
+  jobId?: number;
 }
 
 /**
@@ -32,9 +38,16 @@ export function runFfmpegArgs(o: RunFfmpegArgsOpts): Promise<{ ok: boolean; stde
     try { return statSync(p).size; } catch { return null; }
   });
   return new Promise((resolve) => {
-    doExec(o.ffmpegPath, o.args, {
+    // F11:进程登记/注销与 execFile 同生命周期。execFile 回调必异步,但注入的测试桩可能**同步**回调
+    // (那时 child 还没拿到)→ 用 settled 标记「回调已触发」,避免给已结束的调用留下永不注销的登记。
+    let child: ChildProcess | undefined;
+    let settled = false;
+    const untrack = (): void => { if (o.jobId !== undefined && child !== undefined) unregisterExportProcess(o.jobId, child); };
+    child = doExec(o.ffmpegPath, o.args, {
       timeout: o.timeoutMs ?? 120_000, windowsHide: true, maxBuffer: 4 * 1024 * 1024,
     }, (err, _stdout, stderr) => {
+      settled = true;
+      untrack();
       const out = stderr ?? '';
       if (err) {
         const e = err as NodeJS.ErrnoException;
@@ -51,10 +64,11 @@ export function runFfmpegArgs(o: RunFfmpegArgsOpts): Promise<{ ok: boolean; stde
       }
       resolve({ ok: true, stderr: out });
     });
+    if (o.jobId !== undefined && child !== undefined && !settled) registerExportProcess(o.jobId, child);
   });
 }
 
 /** 跑一次抽音轨(委托 runFfmpegArgs,签名与行为与重构前一致 —— clip.test.ts 作回归保护) */
 export function runClip(o: RunClipOpts): Promise<{ ok: boolean; stderr: string }> {
-  return runFfmpegArgs({ ffmpegPath: o.ffmpegPath, args: buildClipArgs(o), outPath: o.outPath, timeoutMs: o.timeoutMs, doExec: o.doExec, fileSize: o.fileSize });
+  return runFfmpegArgs({ ffmpegPath: o.ffmpegPath, args: buildClipArgs(o), outPath: o.outPath, timeoutMs: o.timeoutMs, doExec: o.doExec, fileSize: o.fileSize, jobId: o.jobId });
 }

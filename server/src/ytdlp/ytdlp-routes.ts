@@ -26,6 +26,8 @@ import { createSourceVideosRepo } from '../db/repo/source-videos.js';
 import { createClipProjectsRepo } from '../db/repo/clip-projects.js';
 import { deleteVideoFiles, placeVideo } from '../media/media-files.js';
 import { derivedDirFor, invalidateDerived } from '../media/derived-images.js';
+// F11(2026-10-04):取消导出时杀掉正在跑的 ffmpeg 子进程(它不在 DownloadManager 的登记表里,见 cancel 路由)
+import { killExportProcess } from '../ffmpeg/export-processes.js';
 // SSE 事件桥(2026-09-29 抽到 job-events.ts):下载路由与媒体剪辑路由共用,连接表/节流状态都在那边
 import { addSseConnection, emit, logSseClose, progressBucketChanged, removeSseConnection, type SseConn } from './job-events.js';
 // Task 1(2026-09-30 spec download-queue-tray):并发受限下载队列——提交/重试入队,cancel 先试队列
@@ -770,6 +772,9 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
     }
     await downloadManager.cancel(id);
     jobsRepo.update(id, { status: 'cancelled', message: '用户取消' });
+    // F11(2026-10-04):导出任务的 ffmpeg 不在 DownloadManager 登记表里,这里单独杀(未登记 → no-op)。
+    // 顺序必须在置 cancelled 之后:被杀的 ffmpeg 回调会走 startExportJob 的 fail(),fail 见 cancelled 只留日志不覆写(H2 守卫)。
+    await killExportProcess(id);
     pushLog('info', 'job', `job ${id} cancelled by user`); // 诊断日志:取消也要留痕(用户反馈"取消没反应"要能查日志)
     emit(id, { type: 'status', state: 'cancelled', message: '用户取消' });
     return { ok: true };

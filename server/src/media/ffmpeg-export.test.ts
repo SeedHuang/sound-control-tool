@@ -231,18 +231,40 @@ describe('startExportJob', () => {
     expect(job.message).not.toContain('已保留');
     expect(createAudioItemsRepo(db).list()).toHaveLength(0);
   });
+
+  // F11(2026-10-04)：导出逐段 ffmpeg 调用必须带 jobId——取消路由据此在 export-processes 登记表里
+  // 找到并 taskkill 该 job 正在跑的 ffmpeg（否则取消只停界面、ffmpeg 继续烧到当前段编码完）。
+  it('F11:导出 ffmpeg/runClip 调用都带 jobId(供取消时按 job 杀进程)', async () => {
+    vi.mocked(runClip).mockClear();
+    const payload = basePayload({ segments: [{ start_sec: 0, end_sec: 10 }, { start_sec: 20, end_sec: 30 }] });
+    const jobId = await runJob(payload);
+    const calls = vi.mocked(runClip).mock.calls;
+    expect(calls).toHaveLength(2);
+    expect(calls.every((c) => c[0]!.jobId === jobId)).toBe(true);
+  });
+
+  // F9③ 防御路径回归(OCR R1 medium):音频任务收到脏 payload(format='mp4')时,编码 format、
+  // 临时文件扩展名、入库 format 必须是同一个值——否则会「按 mp3 编码、按 mp4 入库」产生错配产物。
+  it('F9③:音频分支收到 format=mp4 脏 payload → 收敛为 mp3(编码/落盘/入库三处一致)', async () => {
+    vi.mocked(runClip).mockClear();
+    const payload = basePayload({ format: 'mp4', segments: [{ start_sec: 0, end_sec: 10 }] });
+    await runJob(payload);
+    expect(vi.mocked(runClip).mock.calls[0]![0]!.format).toBe('mp3'); // 编码用收敛值
+    const row = createAudioItemsRepo(db).list()[0]!;
+    expect(row.format).toBe('mp3');                                   // 入库用收敛值
+    expect(row.file_path.endsWith('.mp3')).toBe(true);                // 落盘扩展名一致
+  });
 });
 
 // ===== 2026-10-02 N1 Task 3:视频导出分支(spec video-export D2/D3,plan Task 3 行为规格)=====
 // 桩复用同款「真写产物文件」:runFfmpegArgs 桩写 'EXPORTED-AUDIO' + clipHook 回调,ingest 走真实现,
 // 视频分支整条「编码 → 探测 → cancelGuard → 入库」链路都被测到,只有 ffmpeg 进程本身是假的。
 describe('视频导出(N1 Task 3)', () => {
-  // kind=video 的 payload。format 语义是 mp4(kind=video 时实现固定按 mp4 处理,不读该值);
-  // ExportJobPayload.format 类型尚未含 'mp4'(T4 路由层扩),单测直接构造 payload 绕过路由,此处断言换语义。
+  // kind=video 的 payload。F9③(2026-10-04)：ExportJobPayload.format 联合已含 'mp4'，不再需要 as unknown as 绕过类型检查。
   const videoPayload = (over: Partial<ExportJobPayload> = {}): ExportJobPayload => ({
     ...basePayload(over),
     mediaKind: 'video',
-    format: 'mp4' as unknown as ExportJobPayload['format'],
+    format: 'mp4',
   });
   // 注册一个假 SSE 连接收集事件:走真实 emit 桥(job-events),不 mock 模块,done 事件形状连桥一起测
   const sseCollector = (sink: unknown[]): SseConn => ({
