@@ -27,10 +27,13 @@ const MEDIA_MIME: Record<string, string> = { mp4: 'video/mp4', webm: 'video/webm
  * 0.1/0.2/0.3/0.4/0.5/0.8/1.0/1.5 秒八档**全部正常出 PNG**（tile 在 EOF 会冲刷不满的 tile），
  * 写「不足 1 秒也会失败」是把用户引向一个不存在的病因。
  */
-const DERIVED_FAIL: Record<'NO_FFMPEG' | 'FFMPEG_FAIL' | 'PROBE_FAIL', { status: number; next: string }> = {
+const DERIVED_FAIL: Record<'NO_FFMPEG' | 'FFMPEG_FAIL' | 'PROBE_FAIL' | 'SRC_CHANGED', { status: number; next: string }> = {
   NO_FFMPEG: { status: 500, next: '到设置页检查 ffmpeg 路径（ffprobe 需与 ffmpeg 同目录）' },
   FFMPEG_FAIL: { status: 500, next: '到设置页检查 ffmpeg 配置；素材已损坏或磁盘写入失败也会走到这里，详见日志页' },
   PROBE_FAIL: { status: 422, next: '删除该素材后重新下载完整视频；若重下后仍失败，见日志页排查环境原因' },
+  // OCR R4(2026-10-03):生成期间素材被换源(重下/换清晰度)→ 旧内容产物按身份复核丢弃。瞬时冲突,刷新即自愈。
+  // OCR R7:替换与删除两种成因都走到这里,出路不同,一句话都要说清
+  SRC_CHANGED: { status: 409, next: '素材在生成期间被替换或删除：被替换则重新打开页面自动重画；被删除则需重新下载视频' },
 };
 
 export function registerMediaRoutes(
@@ -57,7 +60,15 @@ export function registerMediaRoutes(
       // 素材行在但文件被外部删了（同 /file 的两种 404 文案）
       return reply.code(404).send({ ok: false, error: { code: 'FILE_MISSING', message: '素材文件已丢失，请重新下载视频', next: '回到资料库重新下视频' } });
     }
-    const r = await ensureDerivedImage({ kind, importId, videoPath: row.file_path, derivedDir: derivedDirFor(mediaDir), tempDir: deps.tempDir, db });
+    const r = await ensureDerivedImage({
+      kind, importId, videoPath: row.file_path, derivedDir: derivedDirFor(mediaDir), tempDir: deps.tempDir, db,
+      // OCR R5/R9:落盘前查 DB 现登记做第二重身份校验。三态:row 没了='gone'(引导重下)、row 换人='replaced'(刷新自愈)
+      sourceState: (p) => {
+        const cur = videosRepo.get(importId);
+        if (cur === null) return 'gone';
+        return cur.file_path === p ? 'current' : 'replaced';
+      },
+    });
     if (!r.ok) {
       // 失败码 → (HTTP 状态, 下一步提示) 映射表（2026-10-02 审查修复轮 1 minor 4）：
       // 加新失败码只加一行，别再让 if/三元把两种原因混成一句话。

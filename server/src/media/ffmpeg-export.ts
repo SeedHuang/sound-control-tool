@@ -60,7 +60,10 @@ export async function startExportJob(jobId: number, payload: ExportJobPayload, d
   // 已取消 → 丢弃临时产物 + 留痕,返回 true 让调用方收尾(维持 cancelled 终态,不再 emit——终态事件取消路由已发过)。
   // 修复轮 1(2026-10-02 独立审查 Important):separate 逐段 ingest,取消落在第 k 段时前 k-1 段已成品入库,
   // 且 cancelled 不可重试——这些段永久保留。处置取「保留 + 诚实」:不回滚(回滚=白扔已花的编码时间,
-  // 且引入取消路径上删行删文件的新风险),改为把保留事实写进 job message(任务抽屉轮询读 DB 可见)。
+  // 且引入取消路径上删行删文件的新风险),把保留事实写进 job message。
+  // OCR R3(2026-10-03) 勘误:这条 message 目前**没有 UI 出口**——GET /api/jobs 只回 pending/running
+  // (cancelled 不在内),SSE 终态事件由取消路由先发(发的时候还不知道 kept 数)。保留事实当前可见渠道:
+  // 日志页(pushLog)与作品成品列表本身。message 仍写入 DB:语义正确、无害,供未来任务历史 UI 使用。
   // kept=当时已入库段数:separate 传 produced.length;merge(或首段前取消)传 0 → 不改 message,
   // 维持取消路由写的「用户取消」,不打「已保留 0 段」这种没信息量的话。
   const cancelGuard = (tmp: string, kept: number): boolean => {
@@ -163,6 +166,10 @@ export async function startExportJob(jobId: number, payload: ExportJobPayload, d
       // 列表文件与中间段用后删(成功/失败/取消路径统一走 finally——成功时最终产物已被 ingest rename 走)。
       const segPaths: string[] = [];
       let listPath: string | null = null;
+      // OCR R1(2026-10-03) medium:合并成品也要进 finally 清理——ingest(rename EBUSY 等)/DB 抛错会绕过
+      // 下面各显式失败分支直达外层 catch,多 GB 中间成品不能在 temp 躺到下次重启 cleanOrphans;
+      // 成功路径产物已被 ingest rename 走,rmSync force 是无害空操作。
+      let mergedTmp: string | null = null;
       try {
         for (let i = 0; i < payload.segments.length; i++) {
           const seg = payload.segments[i]!;
@@ -180,6 +187,7 @@ export async function startExportJob(jobId: number, payload: ExportJobPayload, d
         writeFileSync(listPath, segPaths.map((p) => `file '${concatQuote(p)}'`).join('\n') + '\n', 'utf8');
         pushLog('info', 'job', `export job ${jobId} concat 列表就绪 ${listPath}(${segPaths.length} 段)`);
         const tmpOut = join(deps.tempDir, `export-${jobId}-merge-${Date.now()}.mp4`);
+        mergedTmp = tmpOut;
         // OCR 43c032a 复审 F5:concat -c copy 也要读写整段体量,慢盘上默认 120s 不够 —— 与逐段编码同为 1h
         const r = await runFfmpegArgs({ ffmpegPath, args: buildVideoConcatArgs({ listPath, outPath: tmpOut }), outPath: tmpOut, timeoutMs: 3_600_000 });
         if (!r.ok) { try { rmSync(tmpOut, { force: true }); } catch { /* 尽力清理 */ } fail(`合并导出失败：${tail(r.stderr)}`); return; }
@@ -194,10 +202,12 @@ export async function startExportJob(jobId: number, payload: ExportJobPayload, d
         pushLog('info', 'job', `export job ${jobId} done mode=merge kind=video → audio ${audioId} @ ${title}`);
         emit(jobId, { type: 'done', kind: 'video', audioId, title, format: 'mp4', replaced: false, count: 1 });
       } finally {
-        // 过程文件清理:中间段(finally 里只清已编码成功的段;失败段自身在其分支已删)+ concat 列表文件。
-        // rmSync force:不存在也不抛(与音频分支同口径);最终产物不在清理之列(已被 ingest rename 走)
+        // 过程文件清理:中间段(finally 里只清已编码成功的段;失败段自身在其分支已删)+ concat 列表文件
+        // + 合并成品(OCR R1:仅异常路径残留;成功时已被 ingest rename 走,rm 为无害空操作)。
+        // rmSync force:不存在也不抛(与音频分支同口径)
         for (const p of segPaths) { try { rmSync(p, { force: true }); } catch { /* 尽力清理 */ } }
         if (listPath !== null) { try { rmSync(listPath, { force: true }); } catch { /* 尽力清理 */ } }
+        if (mergedTmp !== null) { try { rmSync(mergedTmp, { force: true }); } catch { /* 尽力清理 */ } }
       }
       return;
     }

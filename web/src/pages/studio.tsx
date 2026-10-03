@@ -184,7 +184,7 @@ export default function StudioPage(): JSX.Element {
   }, []);
 
   // 滚动位置补偿（2026-10-02 N3 改：按**实际行数**补，不再按"条数 × 固定行高"）。
-  // 旧算法两处不准：① 网格是 auto-fill 多列，插 K 条只下移 ⌈K/列数⌉ 行，按每条 210px 累加会**过量下移**；
+  // 旧算法两处不准：① 网格是 auto-fill 多列，插 K 条约下移 K/列数 行，按每条 210px 累加会**过量下移**；
   // ② 补位写在 rAF 里，而 rAF 不保证晚于 React 提交 —— 提交还没发生、scrollHeight 还是旧的，
   //    `scrollTop += X` 会被浏览器 clamp 回 scrollHeight - clientHeight，等于没补。
   // 现在：load() 只记账（pendingDeltaRef / anchorTopRef），本 effect 在**每次提交后**、浏览器绘制前补位。
@@ -200,7 +200,11 @@ export default function StudioPage(): JSX.Element {
     const cols = columnCountOf(gridRef.current?.clientWidth ?? 0);
     // 降级说明（诚实）：量不到网格宽度（首帧还没布局 / 网格未渲染）时 cols=0，
     //   此时退回旧估算"每条一行"。这仍会过量下移，但**只在量不到宽度的那一次**发生，且不会更糟于修复前。
-    const rows = cols > 0 ? Math.ceil(delta / cols) : delta;
+    // OCR R3(2026-10-03) 勘误:真实位移取决于被锚内容所在列位——⌊(锚点列位+K)/列数⌋ ∈ [⌊K/列数⌋, ⌈K/列数⌉]。
+    // 取 round(= 多数锚点的真位移,OCR R10:floor 只在余数 < 列数/2 时占多数,如 delta=2/cols=3 时 2/3 锚点
+    // 实际下移一行):对多数锚点精确;少数锚点差一行,方向是"少推"而非"多推",
+    // 与"不把用户无端往下推"的取向一致——⌈⌉ 在 delta=1(新建作品后重拉,最常见路径)上会多推一整行 ≈210px。
+    const rows = cols > 0 ? Math.round(delta / cols) : delta;
     el.scrollTop = anchor + rows * ROW_HEIGHT_EST;
     logFe('info', `作品列表重拉补滚动位 新增=${delta} 列数=${cols > 0 ? cols : '(量不到,按每条一行降级)'} 下移行数=${rows} 补=${rows * ROW_HEIGHT_EST}px 锚点=${anchor}`);
   });

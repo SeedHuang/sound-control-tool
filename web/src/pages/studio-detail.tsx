@@ -482,7 +482,8 @@ export default function StudioDetailPage() {
       seek(scrubTargetRef.current);
     });
   };
-  // 卸载兜底（审查 Minor 1）：把在途的 window 监听拆掉。stop() 里含 removeEventListener×3 + cancelAnimationFrame，
+  // 卸载兜底（审查 Minor 1）：把在途的 window 监听拆掉。stop() 里含 removeEventListener×4（move/up/cancel/
+  //   pointerdown-capture 兜底）+ cancelAnimationFrame，
   //   即「监听器」与「那一帧 rAF」两样都收干净（写法与 studio.tsx 卸载时清 400ms 定时器同一套）。
   // 不做也没有功能性危害（seek 里有 videoRef.current 判空、卸载后不会再 setState），但它是真泄漏，且触屏那条路彻底走不通。
   useEffect(() => () => { scrubStopRef.current?.(); }, []);
@@ -503,10 +504,11 @@ export default function StudioDetailPage() {
       if (!moved) { moved = true; logFe('info', `时间轴拖动定位开始 project=${projectId} t=${t.toFixed(2)}s`); }
       seekThrottled(t);
     };
-    const stop = (): void => { // 收尾 = 拆三个监听 + 取消在排期的那一帧。写成幂等的，pointerup / pointercancel / 卸载共用
+    const stop = (): void => { // 收尾 = 拆四个监听 + 取消在排期的那一帧。写成幂等的，pointerup / pointercancel / 下一次 pointerdown（capture 兜底）/ 卸载共用
       window.removeEventListener('pointermove', move);
       window.removeEventListener('pointerup', onUp);
       window.removeEventListener('pointercancel', onCancel);
+      window.removeEventListener('pointerdown', stop, true); // OCR R1(2026-10-03)medium:下方 capture 兜底监听一并拆
       if (scrubRafRef.current !== null) { window.cancelAnimationFrame(scrubRafRef.current); scrubRafRef.current = null; }
       scrubStopRef.current = null;
     };
@@ -524,6 +526,13 @@ export default function StudioDetailPage() {
     window.addEventListener('pointermove', move);
     window.addEventListener('pointerup', onUp);
     window.addEventListener('pointercancel', onCancel);
+    // OCR 复审 R1(2026-10-03) medium:pointerup 在窗口外松手等场景可能丢失 → 上面三个监听残留成
+    // 「活着的僵尸手势」:随后的无关 pointerup(点工具栏按钮)会经 onUp 误 seek 播放头;随后在段拖柄上
+    // 按下拖边(dragEdge 已 stopPropagation,startScrub 不会重入收尾)会让残留 move 在拖边时乱 seek。
+    // 兜底:任意下一次 pointerdown 先收尾上一手势。capture 阶段注册,赶在 startScrub/dragEdge 处理之前;
+    // stop 只拆监听、不碰事件对象 → 不影响任何正常点击/拖拽;本手势自己的 pointerdown 派发到轨道层时
+    // window 捕获阶段早已结束,运行期后注册的监听不会回头收尾本次按下。
+    window.addEventListener('pointerdown', stop, true);
   };
 
   // 「清空所有剪辑点」二次确认（仓库规则：破坏性操作必须确认；只删本作品的剪辑点，不动已导出的音频）
@@ -815,7 +824,10 @@ export default function StudioDetailPage() {
               <div
                 ref={trackRef}
                 onPointerDown={startScrub}
-                style={{ position: 'relative', width: '100%', userSelect: 'none' }}
+                // OCR R3(2026-10-03) low·bug:缺 touchAction:'none' 时触屏拖动会被浏览器当页面滚动接管(发
+                // pointercancel),连续定位在触屏上走不通——onCancel 只该是安全网,不该是主路径。
+                // 代价:从时间轴起手的竖向滚动不再滚页面(时间轴周边区域照常滚)——标准 scrubber 取舍。
+                style={{ position: 'relative', width: '100%', userSelect: 'none', touchAction: 'none' }}
               >
                 {/* 时间尺：10 等分刻度 */}
                 <div style={{ position: 'relative', height: RULER_H }}>

@@ -273,6 +273,18 @@ describe('媒体素材路由', () => {
     expect(err.next).not.toContain('太短');
     expect(err.next).not.toContain('不足 1 秒');
   });
+  it('派生图:SRC_CHANGED → 409（生成期间素材被换源的瞬时冲突,刷新自愈,不是 500 也不是素材坏）', async () => {
+    const importId = createImportsRepo(db).upsertByUrl({ url: 'https://a/sc', title: 't', site: 'bilibili', kind: 'single', duration_sec: null, entries: null });
+    const p = join(mediaDir, `media-${importId}.mp4`);
+    writeFileSync(p, 'V');
+    createSourceVideosRepo(db).upsert({ importId, filePath: p, height: 480, fileSize: 1 });
+    vi.mocked(ensureDerivedImage).mockResolvedValueOnce({ ok: false, code: 'SRC_CHANGED', message: '素材在生成期间被替换，产物已丢弃；重新打开页面会按新素材重新生成' });
+    const res = await app.inject({ method: 'GET', url: `/api/media/${importId}/filmstrip?token=tok` });
+    expect(res.statusCode).toBe(409);
+    const err = (res.json() as { error: { code: string; next: string } }).error;
+    expect(err.code).toBe('SRC_CHANGED');
+    expect(err.next).toContain('重新');
+  });
   it('派生图:NO_FFMPEG 仍指向设置页（别把两种失败原因混成一句提示）', async () => {
     const importId = createImportsRepo(db).upsertByUrl({ url: 'https://a/pl', title: 't', site: 'bilibili', kind: 'single', duration_sec: null, entries: null });
     const p = join(mediaDir, `media-${importId}.mp4`);

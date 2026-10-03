@@ -99,10 +99,23 @@ export function checkDerivedCache(derivedDir: string, kind: DerivedKind, importI
 
 export type DerivedResult =
   | { ok: true; path: string; cached: boolean }
-  | { ok: false; code: 'NO_FFMPEG' | 'FFMPEG_FAIL' | 'PROBE_FAIL'; message: string };
+  | { ok: false; code: 'NO_FFMPEG' | 'FFMPEG_FAIL' | 'PROBE_FAIL' | 'SRC_CHANGED'; message: string };
 
 const tail = (s: string | undefined): string => (s ?? '').trim().split('\n').slice(-1)[0]?.slice(0, 200) || '(无 stderr 输出)';
 const msgOf = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+
+/** 素材内容身份（OCR R3/R5/R6）：单次 statSync 取 mtime+size（纯 mtime 可被 cp -p/rsync -t 骗过）。
+ *  取不到（文件没了/测试桩假路径）→ null = 身份未知，key 退化为路径级、守卫跳过。
+ *  **身份规则只能有这一份**：在途 key 与落盘守卫共用，两处各写一份必然漂移（R6-3）。 */
+type SrcIdentity = { mtimeMs: number; size: number } | null;
+const srcIdentityOf = (p: string): SrcIdentity => {
+  try { const st = statSync(p); return { mtimeMs: st.mtimeMs, size: st.size }; } catch { return null; }
+};
+/** 身份的字符串形态：在途 key 用它——身份的「表达」也只此一份，字段增删时 key 自动跟着变（OCR R8）。 */
+const srcIdentityKey = (id: SrcIdentity): string => (id === null ? 'unknown' : `${id.mtimeMs}:${id.size}`);
+/** 相等判断同样只此一份（OCR R7）：借 srcIdentityKey 比较，字段增删时 key 与守卫一起变，不会漂移。 */
+const sameSrcIdentity = (a: SrcIdentity, b: SrcIdentity): boolean =>
+  a !== null && b !== null && srcIdentityKey(a) === srcIdentityKey(b);
 
 /**
  * 同一 (kind, importId) 正在生成时的在途合并表（2026-10-02 审查修复轮 1 important 2）。
@@ -117,26 +130,39 @@ export async function ensureDerivedImage(o: {
   kind: DerivedKind; importId: number; videoPath: string;
   derivedDir: string; tempDir: string; db: DB;
   doExec?: ExecLike; probe?: typeof probeDuration; resolveFfmpeg?: (db: DB) => Promise<string | null>;
+  /** OCR R5/R9(2026-10-03):落盘前第二重身份校验——「videoPath 指向的文件没变」≠「它仍是该 importId
+   *  登记的源」。**三态而非布尔**：row 没了('gone')与 row 换人('replaced')是两种成因、两条用户出路
+   *  （R9：布尔会把「素材被整个删除」误报成「被替换」，让用户去刷新一个注定 404 的页面）。
+   *  未注入（测试/其他调用方）→ 跳过该重校验，行为与旧版等价。 */
+  sourceState?: (videoPath: string) => 'current' | 'replaced' | 'gone';
 }): Promise<DerivedResult> {
   const hit = checkDerivedCache(o.derivedDir, o.kind, o.importId);
   if (hit.path !== null) {
     pushLog('debug', 'media', `派生图命中缓存 kind=${o.kind} import=${o.importId}`);
     return { ok: true, path: hit.path, cached: true };
   }
-  const key = `${o.derivedDir}|${o.kind}|${o.importId}`;
+  // OCR R3/R5(2026-10-03):在途 key 必须带「内容身份」。仅 (dir,kind,importId) 会把换源后的新请求并进
+  // 旧文件的任务(拿到旧内容图);仅加 videoPath 也不够——同容器重下时 placeVideo 原名改名,file_path 不变
+  // (R5-1)。折进请求时采样的身份(mtime+size,R6-2:纯 mtime 可被 cp -p 骗过)后:同路径换内容 → key 变 →
+  // 另起新任务;内容没变 → 照常并入去重。身份取不到(测试桩假路径)→ 退化回路径级(与旧行为等价)。
+  const srcId = srcIdentityOf(o.videoPath);
+  const key = `${o.derivedDir}|${o.kind}|${o.importId}|${o.videoPath}|${srcIdentityKey(srcId)}`;
   const running = inflight.get(key);
   if (running !== undefined) {
     pushLog('debug', 'media', `派生图并入在途任务（不重复起 ffmpeg）kind=${o.kind} import=${o.importId}`);
     return running;
   }
   pushLog('debug', 'media', `派生图判失效重画 kind=${o.kind} import=${o.importId} reason=${hit.reason}`);
-  const task = generateDerivedImage(o).finally(() => { inflight.delete(key); });
+  const task = generateDerivedImage(o, srcId).finally(() => { inflight.delete(key); });
   inflight.set(key, task);
   return task;
 }
 
-async function generateDerivedImage(o: Parameters<typeof ensureDerivedImage>[0]): Promise<DerivedResult> {
+async function generateDerivedImage(o: Parameters<typeof ensureDerivedImage>[0], srcId: SrcIdentity): Promise<DerivedResult> {
   const dest = join(o.derivedDir, `${o.kind}-${o.importId}.png`);
+  // OCR R4/R6(2026-10-03):素材内容身份由调用方在**请求时**采样后传入（R6-3：key 与守卫共用同一份采样,
+  // 不存在「两处各采一次、语义漂移」）。生成期间素材被换源/删除的产物是「旧内容的图」,且 meta 记旧
+  // 时长自洽会让它**永久命中**——落盘前必须复核身份,变了就丢弃(下次请求按新素材重画)。
   const resolve = o.resolveFfmpeg ?? resolveFfmpegPath;
   const ffmpegPath = await resolve(o.db);
   if (ffmpegPath === null) {
@@ -214,6 +240,33 @@ async function generateDerivedImage(o: Parameters<typeof ensureDerivedImage>[0])
     pushLog('error', 'media', `派生图退出码 0 但无产物 kind=${o.kind} import=${o.importId} out=${tmp}`);
     dropTmp();
     return { ok: false, code: 'FFMPEG_FAIL', message: 'ffmpeg 退出码 0 但未写出产物' };
+  }
+  // OCR R4~R10(2026-10-03):落盘前对素材做**一次性变局分类**——分类口径与文案只此一份(R10),两道
+  // 检查合一个出口,不漂移。这关必须卡在 rename 之前:旧内容的图一旦写进共享 dest,凭 meta 自洽没有
+  // 任何机制能再发现它;同时堵死「旧任务后落盘覆盖新内容」——过期任务永远到不了 rename。
+  //   ① 身份变了(mtime/size 不符) = 文件还在但内容被换 → 'replaced'(刷新自愈)
+  //   ② 文件没了:登记还认它 = 真被删 → 'deleted'(引导重下);登记换人 = 被替换 → 'replaced'
+  //   ③ 文件没变但登记换人(sourceState='replaced',换容器重下旧文件 EPERM 幸存) → 'replaced'
+  //   ④ 登记没了('gone',素材被整个删除) → 'deleted'
+  // srcId 取不到(测试桩假路径)→ 跳过①②,只看③④(与旧行为等价,不比它更差)。
+  let srcChanged: 'replaced' | 'deleted' | null = null;
+  if (srcId !== null) {
+    const now = srcIdentityOf(o.videoPath);
+    if (now === null) srcChanged = o.sourceState?.(o.videoPath) === 'replaced' ? 'replaced' : 'deleted';
+    else if (!sameSrcIdentity(now, srcId)) srcChanged = 'replaced';
+  }
+  if (srcChanged === null) {
+    const state = o.sourceState?.(o.videoPath);
+    if (state === 'replaced') srcChanged = 'replaced';
+    else if (state === 'gone') srcChanged = 'deleted';
+  }
+  if (srcChanged !== null) {
+    dropTmp();
+    // 删除与替换是两种成因、两条出路,不混成一句话(同 DERIVED_FAIL 表头口径):被替换刷新自愈,被删除引导重下
+    pushLog('info', 'media', `派生图产物丢弃：素材在生成期间被${srcChanged === 'replaced' ? '替换' : '删除'} kind=${o.kind} import=${o.importId} path=${o.videoPath}`);
+    return srcChanged === 'replaced'
+      ? { ok: false, code: 'SRC_CHANGED', message: '素材在生成期间被替换，产物已丢弃；重新打开页面会按新素材重新生成' }
+      : { ok: false, code: 'SRC_CHANGED', message: '素材已被删除，产物已丢弃；请重新下载视频后再查看' };
   }
   // 图与 meta 连着 rename：中途失败把已经 rename 进去的图**撤掉**，不留「有图无凭据」的半成品
   // （那种状态的后果是：图在、meta 缺 → 每次请求都判失效 → 用户反复白等 52 秒）。

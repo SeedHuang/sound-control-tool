@@ -1,6 +1,6 @@
 // server/src/media/derived-images.test.ts
 // 派生图生成（spec D6/D14）：用真实临时目录 + 注入 doExec/resolveFfmpeg/probe，不真拉 ffmpeg。
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -260,6 +260,18 @@ describe('ensureDerivedImage', () => {
     expect(c).toMatchObject({ ok: true, cached: true });
     expect(calls2).toHaveLength(0);
   });
+  it('并发同 importId 但 videoPath 不同（换源竞态）→ 不并入在途任务（OCR R3：并入会拿到旧文件内容的图，且 meta 记旧时长自洽 → 错图常驻）', async () => {
+    // 用 wave（一次生成恰一次 exec）：并入 → calls=1；不并入 → calls=2。断言才能一击区分两种行为。
+    const { fn, calls } = execStub(() => ({ write: 'PNG' }));
+    const base = { kind: 'wave' as const, importId: 25, derivedDir, tempDir, db, doExec: fn, resolveFfmpeg: resolveOk };
+    const [a, b] = await Promise.all([
+      ensureDerivedImage({ ...base, videoPath: 'old.mp4' }),
+      ensureDerivedImage({ ...base, videoPath: 'new.mp4' }),
+    ]);
+    expect(calls).toHaveLength(2); // 各起各的 ffmpeg —— 新内容的请求绝不复用旧内容任务的（未来）结果
+    expect(a).toMatchObject({ ok: true });
+    expect(b).toMatchObject({ ok: true });
+  });
   it('临时名带随机段：同毫秒连发两次不同 importId → 两个 ffmpeg 输出名不相同（不会 -y 抢同一个文件）', async () => {
     const { fn, calls } = execStub(() => ({ write: 'PNG' }));
     await Promise.all([
@@ -278,6 +290,43 @@ describe('ensureDerivedImage', () => {
     expect(readdirSync(tempDir)).toHaveLength(0);
     // 且这份落盘结果立刻可命中（自愈闭环：第二个人来看不用再等一次 52 秒）
     expect(checkDerivedCache(derivedDir, 'film', 23).path).not.toBeNull();
+  });
+  it('生成期间素材被替换 → SRC_CHANGED，产物丢弃不落盘（OCR R4：旧内容图凭 meta 自洽会永久命中，必须在 rename 前拦住）', async () => {
+    // 源必须是真文件（守卫前后都要 statSync 它）；exec 桩在生成期间确定性改它的 mtime（模拟换源重下）
+    const src = join(root, 'src-race.mp4');
+    writeFileSync(src, 'old-content');
+    const { fn } = execStub(() => {
+      const st = statSync(src);
+      utimesSync(src, st.atime, new Date(st.mtimeMs + 5000)); // 显式 +5s：同毫秒两次写 mtime 可能相等，必须确定性地变
+      return { write: 'PNG' };
+    });
+    const r = await ensureDerivedImage({ kind: 'wave', importId: 26, videoPath: src, derivedDir, tempDir, db, doExec: fn, resolveFfmpeg: resolveOk });
+    expect(r).toMatchObject({ ok: false, code: 'SRC_CHANGED' });
+    expect(existsSync(join(derivedDir, 'wave-26.png'))).toBe(false); // 旧内容绝不落盘
+    expect(readdirSync(tempDir)).toHaveLength(0); // 临时产物一并清干净
+  });
+  it('真实源文件、生成期间未被替换 → 正常落盘（mtime 守卫不误伤）', async () => {
+    const src = join(root, 'src-stable.mp4');
+    writeFileSync(src, 'stable-content');
+    const { fn } = execStub(() => ({ write: 'PNG' }));
+    const r = await ensureDerivedImage({ kind: 'wave', importId: 27, videoPath: src, derivedDir, tempDir, db, doExec: fn, resolveFfmpeg: resolveOk });
+    expect(r).toMatchObject({ ok: true, cached: false });
+    expect(existsSync(join(derivedDir, 'wave-27.png'))).toBe(true);
+  });
+  it('sourceState 判 replaced / gone → SRC_CHANGED 不落盘（OCR R5/R9：文件没变 ≠ 登记没变；row 换人与 row 没了分流两种出路）', async () => {
+    const src = join(root, 'src-orphan.mp4');
+    writeFileSync(src, 'orphan-content'); // 文件健在且身份不变 → 能过 mtime/size 守卫，卡在第二重校验
+    const { fn } = execStub(() => ({ write: 'PNG' }));
+    const base = { kind: 'wave' as const, importId: 28, videoPath: src, derivedDir, tempDir, db, doExec: fn, resolveFfmpeg: resolveOk };
+    const r1 = await ensureDerivedImage({ ...base, sourceState: () => 'replaced' as const });
+    expect(r1).toMatchObject({ ok: false, code: 'SRC_CHANGED' });
+    if (!r1.ok) expect(r1.message).toContain('被替换'); // 登记换人 → 引导刷新
+    expect(existsSync(join(derivedDir, 'wave-28.png'))).toBe(false);
+    const r2 = await ensureDerivedImage({ ...base, importId: 29, sourceState: () => 'gone' as const });
+    expect(r2).toMatchObject({ ok: false, code: 'SRC_CHANGED' });
+    if (!r2.ok) expect(r2.message).toContain('被删除'); // 登记没了 → 引导重下（刷新只会 404）
+    expect(existsSync(join(derivedDir, 'wave-29.png'))).toBe(false);
+    expect(readdirSync(tempDir)).toHaveLength(0);
   });
   it('meta 临时名写不进去 → 直接失败，不起 ffmpeg（图没有凭据，下次还得重画，不如别跑）', async () => {
     // 把 tempDir 指向一个不存在的深层路径 → writeFileSync 必失败（不 mock fs，保持真实 IO 语义）
