@@ -15,7 +15,7 @@ import { createJobsRepo } from '../db/repo/jobs.js';
 import { createSourceVideosRepo } from '../db/repo/source-videos.js';
 import { getLogs } from '../logs.js';
 import { formatClipTitle, registerMediaRoutes } from './media-routes.js';
-import { ensureDerivedImage, invalidateDerived } from './derived-images.js';
+import { ensureDerivedImage, invalidateDerived, probeDurationFor } from './derived-images.js';
 
 // ffmpeg 路径桩:R2-d 返回桩路径;R2-e 置 null 验证「拿不到 ffmpeg 不得静默」(spec D16/D10)
 const ffmpegStub = vi.hoisted(() => ({ path: 'C:/stub/ffmpeg.exe' as string | null }));
@@ -37,6 +37,8 @@ vi.mock('../ffmpeg/clip.js', async () => {
 vi.mock('../ytdlp/ffprobe.js', () => ({ probeDuration: vi.fn(async () => 10) }));
 // 派生图桩（P4-T2）：路由只关心「拿到 path 后裸流回传」，这里把 PNG 真写进测试临时目录（与 ffmpegStub 同法）
 const derivedStub = vi.hoisted(() => ({ dir: '' }));
+// T5：wavepeak 路由用 probeDurationFor 探时长（算末段窗口）；用 hoisted 变量注入结果（默认成功）
+const probeStub = vi.hoisted(() => ({ result: { ok: true, durationSec: 600 } as Record<string, unknown> }));
 vi.mock('./derived-images.js', () => ({
   derivedDirFor: (mediaDir: string) => mediaDir, // 测试里图写哪都行，路由只读回 path
   invalidateDerived: vi.fn(),
@@ -47,6 +49,28 @@ vi.mock('./derived-images.js', () => ({
     writeFileSync(p, 'PNG');
     return { ok: true, path: p, cached: false };
   }),
+  probeDurationFor: vi.fn(async () => probeStub.result),
+}));
+// T5：分段生成器与波形峰值各自是独立模块 —— 本文件只验**路由层**（状态码 / 鉴权 / 失败码映射），
+// 生成逻辑已被 derived-pyramid.test.ts 与 wave-peaks.test.ts 覆盖，这里 stub 掉。
+// pyramidStub.next 用来注入一次性的失败返回（如 SEGMENT_NOT_FOUND / LEVEL_UNAVAILABLE），用完即清。
+const pyramidStub = vi.hoisted(() => ({ next: null as null | Record<string, unknown> }));
+vi.mock('./derived-pyramid.js', () => ({
+  ensureFilmSegment: vi.fn(async (o: { importId: number; level: number; seg: number }) => {
+    if (pyramidStub.next !== null) { const r = pyramidStub.next; pyramidStub.next = null; return r; }
+    const { writeFileSync } = await import('node:fs');
+    const { join } = await import('node:path');
+    const p = join(derivedStub.dir, `film-${o.importId}-L${o.level}-${o.seg}.png`);
+    writeFileSync(p, 'PNG');
+    return { ok: true, path: p, cached: false };
+  }),
+}));
+vi.mock('./wave-peaks.js', () => ({
+  ensureWavePeaks: vi.fn(async (o: { importId: number; level: number; seg: number }) => ({
+    ok: true,
+    cached: false,
+    data: { v: 3, sig: `v3|level=${o.level}`, level: o.level, seg: o.seg, t0: 0, stepSec: 0.08, points: [-20, -30, -25] },
+  })),
 }));
 
 let app: FastifyInstance;
@@ -61,6 +85,7 @@ beforeEach(() => {
   mkdirSync(audioDir, { recursive: true }); mkdirSync(mediaDir, { recursive: true }); mkdirSync(tempDir, { recursive: true });
   derivedStub.dir = join(root, 'derived'); mkdirSync(derivedStub.dir, { recursive: true }); // 派生图桩写这
   vi.mocked(invalidateDerived).mockClear();
+  vi.mocked(probeDurationFor).mockClear(); // T5：懒求值断言要数「路由层没调它」，所以每次复位计数
   db = openDatabase(':memory:');
   initSchema(db);
   app = Fastify({ logger: false });
@@ -68,6 +93,8 @@ beforeEach(() => {
 });
 afterEach(async () => {
   runClipHook.beforeResolve = null; // R8 钩子只在设置它的用例内生效,防泄漏进后续用例
+  probeStub.result = { ok: true, durationSec: 600 }; // T5：注入的探时长结果同理，用完复位
+  pyramidStub.next = null;
   await app.close(); rmSync(root, { recursive: true, force: true });
 });
 
@@ -302,5 +329,120 @@ describe('媒体素材路由', () => {
     expect((await app.inject({ method: 'DELETE', url: `/api/media/${importId}?token=tok` })).statusCode).toBe(200);
     expect(vi.mocked(invalidateDerived)).toHaveBeenCalledTimes(1);
     expect(vi.mocked(invalidateDerived)).toHaveBeenCalledWith(mediaDir, importId);
+  });
+});
+
+// —— Spec B：分段雪碧图与波形峰值路由（T5）——
+// 本组只验**路由层**：鉴权三件套 / 参数校验（格式错 400 vs 越界 404 要分开）/ 失败码 → HTTP 状态映射。
+// 生成逻辑在 derived-pyramid.test.ts 与 wave-peaks.test.ts 里用真实现测（本文件把它们 stub 掉了）。
+describe('Spec B 分段/峰值路由', () => {
+  let seq = 0;
+  const mkMedia = (): number => {
+    seq += 1;
+    const importId = createImportsRepo(db).upsertByUrl({ url: `https://a/f${seq}`, title: 't', site: 'bilibili', kind: 'single', duration_sec: null, entries: null });
+    const p = join(mediaDir, `media-${importId}.mp4`);
+    writeFileSync(p, 'V');
+    createSourceVideosRepo(db).upsert({ importId, filePath: p, height: 480, fileSize: 1 });
+    return importId;
+  };
+
+  it('GET /filmseg?level=1&seg=3 → 200 image/png + no-store（鉴权走 query token 三件套）', async () => {
+    const id = mkMedia();
+    const res = await app.inject({ method: 'GET', url: `/api/media/${id}/filmseg?level=1&seg=3&token=tok` });
+    expect(res.statusCode).toBe(200);
+    expect(res.headers['content-type']).toBe('image/png');
+    expect(res.headers['cache-control']).toBe('no-store'); // URL 不变，靠 no-store + 前端 rev 双保险
+    expect(res.body).toBe('PNG');
+  });
+
+  it('level 非法（3 / 缺省 / 非数字）→ 400，文案说清只接受 1 或 2', async () => {
+    const id = mkMedia();
+    for (const q of ['level=3&seg=0', 'seg=0', 'level=abc&seg=0']) {
+      const res = await app.inject({ method: 'GET', url: `/api/media/${id}/filmseg?${q}&token=tok` });
+      expect(res.statusCode).toBe(400);
+      expect((res.json() as { error: { message: string } }).error.message).toContain('1');
+    }
+  });
+
+  // 格式错是**用法错**（400），与「素材短 / 段不存在」的 404 必须分开 —— 否则前端拼错 URL 时看不出是谁的锅
+  it('seg 缺失 / 非整数 / 负数 → 400', async () => {
+    const id = mkMedia();
+    for (const q of ['level=1', 'level=1&seg=abc', 'level=1&seg=-1']) {
+      const res = await app.inject({ method: 'GET', url: `/api/media/${id}/filmseg?${q}&token=tok` });
+      expect(res.statusCode).toBe(400);
+    }
+  });
+
+  // 越界由**生成层**判定（只有它知道时长，而路由不能为了校验去探时长 —— 那会毁掉「命中缓存零 ffprobe」）；
+  // 路由的职责是把 SEGMENT_NOT_FOUND 映射成 404。不夹到最后一段：那样图和 URL 说的不是同一段。
+  it('段号越界 → 404 SEGMENT_NOT_FOUND（不夹到最后一段）', async () => {
+    const id = mkMedia();
+    pyramidStub.next = { ok: false, code: 'SEGMENT_NOT_FOUND', message: '段号 9999 超出本档范围' };
+    const res = await app.inject({ method: 'GET', url: `/api/media/${id}/filmseg?level=1&seg=9999&token=tok` });
+    expect(res.statusCode).toBe(404);
+    expect((res.json() as { error: { code: string } }).error.code).toBe('SEGMENT_NOT_FOUND');
+  });
+
+  it('档位不可用 → 404 LEVEL_UNAVAILABLE，next 告诉用户换粗档（D5 诚实原则）', async () => {
+    const id = mkMedia();
+    pyramidStub.next = { ok: false, code: 'LEVEL_UNAVAILABLE', message: '素材时长 100s，放不下 300s 的时间窗（本档要求 300s 以上）' };
+    const res = await app.inject({ method: 'GET', url: `/api/media/${id}/filmseg?level=2&seg=0&token=tok` });
+    expect(res.statusCode).toBe(404);
+    const err = (res.json() as { error: { code: string; next: string } }).error;
+    expect(err.code).toBe('LEVEL_UNAVAILABLE');
+    expect(err.next).toContain('档位');
+  });
+
+  it('无 token 且非本机 origin → 401（两个新路由都要有，不许开天窗）', async () => {
+    const id = mkMedia();
+    const r1 = await app.inject({ method: 'GET', url: `/api/media/${id}/filmseg?level=1&seg=0`, headers: { origin: 'http://evil.example' } });
+    expect(r1.statusCode).toBe(401);
+    const r2 = await app.inject({ method: 'GET', url: `/api/media/${id}/wavepeak?level=0`, headers: { origin: 'http://evil.example' } });
+    expect(r2.statusCode).toBe(401);
+  });
+
+  it('filmseg：素材行不存在 → 404；文件被外部删 → 404 FILE_MISSING', async () => {
+    expect((await app.inject({ method: 'GET', url: '/api/media/999/filmseg?level=1&seg=0&token=tok' })).statusCode).toBe(404);
+    const id = createImportsRepo(db).upsertByUrl({ url: 'https://a/nofile', title: 't', site: 'bilibili', kind: 'single', duration_sec: null, entries: null });
+    createSourceVideosRepo(db).upsert({ importId: id, filePath: join(mediaDir, 'nope.mp4'), height: 480, fileSize: 1 });
+    const res = await app.inject({ method: 'GET', url: `/api/media/${id}/filmseg?level=1&seg=0&token=tok` });
+    expect(res.statusCode).toBe(404);
+    expect((res.json() as { error: { code: string } }).error.code).toBe('FILE_MISSING');
+  });
+
+  it('GET /wavepeak?level=1&seg=0 → 200 application/json，body 七字段齐全', async () => {
+    const id = mkMedia();
+    const res = await app.inject({ method: 'GET', url: `/api/media/${id}/wavepeak?level=1&seg=0&token=tok` });
+    expect(res.statusCode).toBe(200);
+    expect(res.headers['content-type']).toContain('application/json');
+    expect(res.headers['cache-control']).toBe('no-store');
+    const o = res.json() as Record<string, unknown>;
+    for (const k of ['v', 'sig', 'level', 'seg', 't0', 'stepSec', 'points']) expect(o).toHaveProperty(k);
+  });
+
+  it('wavepeak：level=0 合法（整片一张，不带段号）；level=1/2 必须给 seg；非法 level → 400', async () => {
+    const id = mkMedia();
+    expect((await app.inject({ method: 'GET', url: `/api/media/${id}/wavepeak?level=0&token=tok` })).statusCode).toBe(200);
+    expect((await app.inject({ method: 'GET', url: `/api/media/${id}/wavepeak?level=1&token=tok` })).statusCode).toBe(400);
+    expect((await app.inject({ method: 'GET', url: `/api/media/${id}/wavepeak?level=9&token=tok` })).statusCode).toBe(400);
+  });
+
+  // 2026-10-03（OCR 审查修复）：wavepeak 改成**懒探测** —— 路由层不再无条件先探时长，
+  // 而是传回调给 ensureWavePeaks（只有未命中才求值）。于是「命中缓存」不再付 ffprobe（2.1GB 素材上十几秒）。
+  // 代价：路由层的 `probeDurationFor` stub 不会被调用，探时长失败也不会在路由层变成 422 ——
+  // 它由 ensureWavePeaks 内部转成 PROBE_FAIL（该码已在 DERIVED_FAIL 表里）。
+  it('wavepeak：探时长改成懒求值（命中缓存不付 ffprobe；路由层不再先探）', async () => {
+    const id = mkMedia();
+    probeStub.result = { ok: false, code: 'PROBE_FAIL', message: '不该被调用' };
+    // 桩的 ensureWavePeaks 不解引用 durationSec → 无论传什么都返回 200；关键断言是「路由层没调 probeDurationFor」
+    const res = await app.inject({ method: 'GET', url: `/api/media/${id}/wavepeak?level=1&seg=0&token=tok` });
+    expect(res.statusCode).toBe(200); // 桩返回值
+    expect(vi.mocked(probeDurationFor)).not.toHaveBeenCalled(); // 路由层没探时长（懒求值生效）
+  });
+
+  it('legacy /filmstrip 与 /waveform 仍在（混跑兼容，不删）', async () => {
+    const id = mkMedia();
+    expect((await app.inject({ method: 'GET', url: `/api/media/${id}/filmstrip?token=tok` })).statusCode).toBe(200);
+    expect((await app.inject({ method: 'GET', url: `/api/media/${id}/waveform?token=tok` })).statusCode).toBe(200);
   });
 });

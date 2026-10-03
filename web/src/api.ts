@@ -185,7 +185,13 @@ export function mediaFileUrl(importId: number): string {
 /** 派生图地址（P4）：固定 1600 宽的波形 / 胶片条，服务端 ffmpeg 生成并按素材缓存（<数据目录>/derived/，D14）。
  *  取图口径同 mediaFileUrl —— <img> 带不了 header，只能走 query token；
  *  rev 版本串由调用方拼：素材被替换后 URL 不变，靠 rev 变化 + 服务端 no-store 双保险避免拿到上一集的图。
- *  这里**不写日志**：一页两张图、每次渲染都会取地址，逐条 logFe 只会把日志面板刷爆。 */
+ *  这里**不写日志**：一页两张图、每次渲染都会取地址，逐条 logFe 只会把日志面板刷爆。
+ *
+ *  Spec B（2026-10-03）之后的现状：
+ *  - `filmstripUrl`（下面）**仍是现役**：L0 总览接管了它 —— URL、文件名 `film-<id>.png`、语义全都不变。
+ *  - `filmSegUrl` / `wavePeakUrl` 是 Spec B 新增的（分段缩略图 / 波形峰值 JSON）。
+ *  - `waveformUrl`（legacy 波形 PNG）**前端已无调用方** —— 波形改成 fetch 峰值 + Canvas 自绘了。
+ *    路由与服务端文件都保留（混跑兼容：老页面/老缓存引用它时仍能拿到图），**不是死代码**。 */
 export function waveformUrl(importId: number, rev: string | number): string {
   const token = apiToken();
   return `${API_BASE}/api/media/${importId}/waveform?token=${encodeURIComponent(token ?? '')}&rev=${encodeURIComponent(String(rev))}`;
@@ -193,6 +199,19 @@ export function waveformUrl(importId: number, rev: string | number): string {
 export function filmstripUrl(importId: number, rev: string | number): string {
   const token = apiToken();
   return `${API_BASE}/api/media/${importId}/filmstrip?token=${encodeURIComponent(token ?? '')}&rev=${encodeURIComponent(String(rev))}`;
+}
+/** Spec B 分段雪碧图：level 1/2（128s / 24s 窗）+ 段号。取图口径同 filmstripUrl —— query token。
+ *  rev 的作用同 filmstripUrl：素材换源后 URL 不变，靠 rev + 服务端 no-store 双保险避免拿到上一集的段图。 */
+export function filmSegUrl(importId: number, level: 1 | 2, seg: number, rev: string | number): string {
+  const token = apiToken();
+  return `${API_BASE}/api/media/${importId}/filmseg?level=${level}&seg=${seg}&token=${encodeURIComponent(token ?? '')}&rev=${encodeURIComponent(String(rev))}`;
+}
+/** Spec B 波形峰值 JSON：level 0 = 整片一张（不带段号），1/2 = 分段（带段号）。
+ *  **不用 <img>**：前端 fetch 后用 Canvas 自绘（放大后能看到局部疏密，这是 D2 的全部目的）。 */
+export function wavePeakUrl(importId: number, level: 0 | 1 | 2, seg: number, rev: string | number): string {
+  const token = apiToken();
+  const segPart = level === 0 ? '' : `&seg=${seg}`;
+  return `${API_BASE}/api/media/${importId}/wavepeak?level=${level}${segPart}&token=${encodeURIComponent(token ?? '')}&rev=${encodeURIComponent(String(rev))}`;
 }
 
 export async function deleteMedia(importId: number): Promise<{ ok: boolean; deleted: number }> {

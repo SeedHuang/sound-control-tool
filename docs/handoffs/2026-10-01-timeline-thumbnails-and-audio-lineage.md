@@ -44,6 +44,7 @@
 - **Spec A · 音频血缘 + 来源/成品信息架构**：落地 PRD FR-3.7 的剪辑血缘 —— `audio_items` 增 `source_import_id`，**下载与剪辑产物两条路径都写**；剪辑室的归并键从 `source_url` 字符串**改为该外键**；来源卡内分「素材 / 成品」两组；无来源的（录制 + 历史遗留）收成**一张**「无来源」卡。
   > **注记（2026-10-01，已实现）**：本节描述的 Spec A 已由 Task 1–5 落地，实现见 `docs/superpowers/specs/2026-10-01-audio-lineage.md`（裁决 D1–D13）与 `docs/superpowers/plans/2026-10-01-audio-lineage.md`。本交接为过程记录，正文不改写。
 - **Spec B · 时间轴缩略图/波形的专业重构**：把「一条 12 格合成 PNG + 固定 1600px 波形」换成「**分级 + 分段雪碧图** + **多级波形峰值**」，支持**可缩放且随缩放变密**、**视口优先 + 空闲预取**。**第一步必须先跑一轮 ffmpeg 实测**（抽帧耗时/粗层级铺满耗时/波形峰值数据量）再定参数。
+  > **2026-10-03 注**：**本项已由 Spec B 批次落地**（spec `docs/superpowers/specs/2026-10-02-timeline-pyramid.md`，plan `docs/superpowers/plans/2026-10-03-timeline-pyramid.md`）。落地形态与本文设想的两处差异：① **L0 沿用了 legacy 路由与文件名**（`film-<id>.png` 不变，段图另加 `-L<lv>-<seg>` 后缀），不是新起一套；② 原设想的「空闲预取」本批**没做**（T7 只做了视口优先；预取留作后续）。
 
 流程：spec → 用户过目 → `writing-plans` 出实施计划 → `subagent-driven-development` 逐任务实现 + 独立审查 + 台账记账（**禁止 commit**）
 起点：**Spec A 的写 spec 环节**（决策已讨论完，可直接落文档；但**先答"开放问题"**）

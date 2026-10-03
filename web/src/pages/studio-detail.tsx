@@ -25,9 +25,10 @@ import { useNavigate, useParams } from '@umijs/max';
 import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
 import PageHeader from '@/components/PageHeader';
 import {
-  ApiError, audioFileUrl, deleteAudio, exportWork, filmstripUrl, getImport, getSettings, getWork, listMedia, listProducts,
-  logFe, mediaFileUrl, putWork, subscribeJob, waveformUrl, type AudioRow, type ImportDetail, type WorkDetailDTO,
+  ApiError, audioFileUrl, deleteAudio, exportWork, filmSegUrl, filmstripUrl, getImport, getSettings, getWork, listMedia,
+  listProducts, logFe, mediaFileUrl, putWork, subscribeJob, type AudioRow, type ImportDetail, type WorkDetailDTO,
 } from '@/api';
+import TimelineWave, { FILM_SHEET_W, LEVEL1_MIN_DURATION_SEC, LEVEL2_MIN_DURATION_SEC, LEVEL_SPAN_SEC, segsFor } from '@/components/TimelineWave';
 import { hasDesktopBridge } from '@/desktop';
 import { openExportDir } from '@/export-dir';
 
@@ -96,14 +97,109 @@ export default function StudioDetailPage() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const trackRef = useRef<HTMLDivElement | null>(null);
   const [trackW, setTrackW] = useState(IMG_W);
-  // —— 派生图(胶片条/波形)加载态(W3/N0 复核遗留,2026-10-02 deferred 批)——
-  // 服务端对大素材(如 2.1GB)现生成派生图要 ~50s,期间两张 <img> 是空轨道,用户不知道在等什么。
-  // 各一个布尔:onLoad 置 true;onError 也置 true(失败 = 有结论,提示消失,错误走既有 logFe,不造第二套错误 UI)。
+  // —— 派生图(胶片条)加载态(W3/N0 复核遗留,2026-10-02 deferred 批)——
+  // 服务端对大素材(如 2.1GB)生成 L0 胶片条约 10s（实测：36 格逐格 seek；Spec B 之前是 fps 滤镜整解码 ~50s），
+  // 期间 <img> 是空轨道,用户不知道在等什么。
   // 不做骨架屏:轨道高度已由等比布局预留,只补一行小字。
-  // 选「各自一个布尔再合成 derivedLoading」而非对象 state:两张图独立加载、各写各的,少一层整体替换写法。
-  const [filmReady, setFilmReady] = useState(false);
-  const [waveReady, setWaveReady] = useState(false);
-  const derivedLoading = !filmReady || !waveReady; // 任一没结论就提示
+  // ⚠️ 画轨的「已就绪」**按段键集合**记，不是一个全局布尔（2026-10-03 OCR 审查第 3 轮 medium 修复）：
+  //   原来「一个布尔 + 段集合变化就复位 false」有两个病 ——
+  //   ① 平移跨段（[0]→[0,1]）该复位，OK；但**回移**（[0,1]→[0]）也复位，而存活的 `<img key=0>`
+  //      src 没变、React 不会重新触发 load → 布尔永远回不到 true →「画轨生成中」永久盖住已加载完的轨道；
+  //   ② 一段失败（onError）把全局布尔置 true → 别的段还没好却提示「已完成」。
+  // 现在：**已加载 / 已失败**的段键各记一份，就绪 = 当前可见段全部有结论（旧的键不清，切档/平移自然复用）。
+  // （声明放在 level / visibleSegs 之后 —— 它要用那两者算 filmKeys。）
+  const [filmLoaded, setFilmLoaded] = useState<Record<string, true>>({});
+  const [filmFailed, setFilmFailed] = useState<Record<string, true>>({});
+
+  /**
+   * 从「已加载 / 已失败」记录里**删掉一个键**（2026-10-03 OCR 审查第 2 轮 low）。
+   * 四个调用点（L0 的 onLoad、段图的 onLoad、段图重试×2）原本各内联一份
+   * `if (p[k] !== true) return p; const next = {...p}; delete next[k]; return next;` ——
+   * 「**没有就原样返回**」那半句是 React 的关键：直接 `delete` 会每次都造新对象，
+   * 让 `useEffect`/memo 的依赖判定失效（这里恰好都只影响 setState 内容，尚未造成可见故障，
+   * 但它是下一处「为什么组件老是重渲染」的种子）。删键与「不变就返回」的判据只此一份。
+   */
+  const clearFilmKey = (k: string): ((p: Record<string, true>) => Record<string, true>) =>
+    (p) => {
+      if (p[k] !== true) return p;
+      const next = { ...p };
+      delete next[k];
+      return next;
+    };
+
+  // —— Spec B（T7）：缩放档位与可视窗口 ——
+  // 档位离散三档（spec D3：不做无级平滑缩放 —— 本地工具够用、实现简单、行为可预期）：
+  //   L0 = 整片一张（36 格）→ L1 = 128s 窗（12 格）→ L2 = 24s 窗（12 格）
+  // **windowStart / levelSpan 是「视口能看到哪一段秒」** —— 段区块 / 播放头 / 刻度 / 画轨全部按它换算，
+  // 不再按 duration 百分比（那是 L0 专属的算法；L0 时 windowStart=0、levelSpan=duration，两者等价）。
+  const [level, setLevel] = useState<0 | 1 | 2>(0);
+  const [windowStart, setWindowStart] = useState(0);
+  /** 波形「重试」计数器：拼进传给 <TimelineWave> 的 rev → rev 变 → 组件重新取数。
+   *  组件内部没有"命令式重取"的口子（它是按 rev 自取的），所以重试只能这样触发 —— 别把 onRetry 写成只记日志，
+   *  那样按钮是个假的（点了没反应，用户会以为波形坏了修不好）。 */
+  const [waveNonce, setWaveNonce] = useState(0);
+  /** 画轨段「重试」计数器（**按段号记**，不是全局一个）：与 waveNonce 同款机制（拼进 rev → URL 变 → 重新请求）。
+   *  ⚠️ 2026-10-03（OCR 审查第 1 轮 medium）：段图失败占位原本**只有一句文案、没有重试入口**，
+   *   而 `<img>` 的 src 在 importId/level/seg/version 都不变时是同一个 URL —— 浏览器不会重新请求、
+   *   React 也不会重新触发 onLoad/onError → 斜纹占位在本次会话里**永久停留**，用户切档/平移多少次都恢复不了。
+   *   那是 spec D5「斜纹 + 重试」只做了一半：诚实是诚实了，但用户被钉死在这一档。
+   *  ⚠️ 刻意**按段**而不是全局一个（第 2 轮 low）：全局的话点第 1 段的重试会让**同窗所有段**换 URL 重新请求 ——
+   *   服务端多数命中缓存不会重跑 ffmpeg，代价小，但语义不对（用户只想重试这一段），
+   *   且已加载好的邻段会**闪一下空白**（src 变 → 重新解码 → onLoad 前有帧空档）。 */
+  const [filmNonceBySeg, setFilmNonceBySeg] = useState<Record<string, number>>({});
+  /** 本档窗长（秒）：L0 = 整片。`Math.max(duration, 1)` 兜底 duration=0（避免除零 —— 那时时间轴本来也不渲染）。 */
+  const levelSpan = level === 0 ? Math.max(duration, 1) : LEVEL_SPAN_SEC[level];
+  /**
+   * 档位门槛（与**服务端** `checkLevelAvailable` 同口径，2026-10-03 OCR 审查：原先滚轮切档绕过了门槛）。
+   * 边界：L1 放行 `>= 128`（等价于按钮在 `duration < 128` 时禁用）、L2 放行 `> 300`。
+   * 为什么要在这里也判一次：滚轮/按钮是**两个入口**，只在一个判 → 另一个能绕过（滚轮能跳到素材放不下的档位，
+   * 画轨只留空白、错误只进日志）。服务端仍是权威判定（真出岔子会返回 LEVEL_UNAVAILABLE 404）。
+   */
+  const levelUsable = (lv: 0 | 1 | 2): boolean =>
+    lv === 0 || (lv === 1 ? duration >= LEVEL1_MIN_DURATION_SEC : duration > LEVEL2_MIN_DURATION_SEC);
+  /**
+   * 切档的**唯一入口**：档位与窗口在**同一次更新**里落。
+   * ⚠️ 为什么不能分开（2026-10-03 OCR 审查第 3 轮 medium）：只 setLevel 不夹 windowStart →
+   *   切档后那一帧的窗口可能已在素材之外（如近景末尾 windowStart=duration-24，点「中景」→
+   *   窗口变成 [duration-24, duration+104]）→ 越界段被请求 → 服务端 404 + 多余的时长探测，
+   *   而且时间尺/段区块/播放头会闪一帧错位。校正 effect 跑得再快也补不上这一帧。
+   * @param wantStart 可选的**期望**窗口起点（滚轮锚点保持用）；不传则沿用当前起点并夹紧
+   */
+  const applyLevel = (lv: 0 | 1 | 2, wantStart?: number): void => {
+    const span = lv === 0 ? Math.max(duration, 1) : LEVEL_SPAN_SEC[lv];
+    const maxStart = Math.max(0, duration - span);
+    const base = wantStart ?? windowStart;
+    setLevel(lv);
+    setWindowStart(Math.max(0, Math.min(base, maxStart)));
+    logFe('info', `时间轴切档 project=${projectId} level=${level}→${lv} start=${Math.max(0, Math.min(base, maxStart)).toFixed(2)}s span=${span}s`);
+  };
+  /** 当前档位下**可视窗口覆盖**的段号（画轨按段取图）。空数组 = 用 L0 整片图。
+   *  与波形共用同一份 `segsFor`（段边界上两者必须一致，各算一份必然差一格）。 */
+  const visibleSegs = useMemo(() => segsFor(level, windowStart, levelSpan), [level, windowStart, levelSpan]);
+  /**
+   * 当前可见段的「键」（L0 一个键、L1/L2 每段一个）。**与 <img> 的 key 同源** ——
+   * 两处各算一份必然漂移，而漂移的表现是「图加载完了但提示不消失」这种极难查的现象。
+   * 段集合**收缩**时（回移）存活的段键仍在 loaded 记录里 → filmReady 立刻为 true，
+   * 不需要「先复位再等一次 onLoad」—— 那是第 3 轮 medium 修掉的病。
+   */
+  const filmKeys = useMemo(
+    () => (level === 0 ? ['L0'] : visibleSegs.map((s) => `L${level}-${s}`)),
+    [level, visibleSegs],
+  );
+  /** 画轨就绪 = 可见段全部有结论（成功或失败都算「有结论」，错误另有斜纹占位） */
+  const filmReady = filmKeys.every((k) => filmLoaded[k] === true || filmFailed[k] === true);
+  const derivedLoading = !filmReady; // 波形自带「加载中」，这里只管画轨（所以提示文案只说画轨，见 JSX）
+  // 窗口越界校正 + **档位降级**（2026-10-03 OCR 审查第 2 轮修复）：
+  //  ① 换作品不重挂载、素材也可能被原地换成更短的片 → duration 变小后当前档可能已失效；
+  //     不降级的话按钮显示「选中但禁用」、轨道继续请求服务端必然 404 的档位 →
+  //     onError 把 filmReady 置 true → 用户只看到一条空画轨、错误只在日志里（正是这次要避免的症状）。
+  //  ② 窗口别停在素材之外（那时轨道整片空白，用户以为坏了）。
+  useEffect(() => {
+    if (duration <= 0) return;
+    if (level === 1 && !levelUsable(1)) { setLevel(0); setWindowStart(0); return; }
+    if (level === 2 && !levelUsable(2)) { setLevel(0); setWindowStart(0); return; }
+    setWindowStart((w) => Math.max(0, Math.min(w, Math.max(0, duration - levelSpan))));
+  }, [duration, level, levelSpan]); // eslint-disable-line react-hooks/exhaustive-deps
   // 过期响应丢弃（修复轮 1，Important 3）：换作品 id 时组件**不会**重挂载，effect 只是带着新 id 重跑，
   // 旧请求还在飞。若不丢弃，「作品 1 慢、作品 2 快」时作品 1 的响应后到，会把作品 1 的段与名字盖到作品 2 的页面上
   // （标题还是 作品 #2，肉眼看不出异常），用户一保存就把作品 1 的内容写进了作品 2 —— 静默写错数据。
@@ -159,6 +255,13 @@ export default function StudioDetailPage() {
         setDuration(0);
         setCurrent(0);
         setSelected(null);
+        // ⚠️ 缩放态也要复位（2026-10-03 OCR 审查第 6 轮 medium）：组件**不重挂载**，而 `info` 仍保留
+        //   上一件的值 → 复位后的那一帧会以「新 importId + duration=0 + 上一件的 level/windowStart」渲染，
+        //   segsFor 用旧窗口算出如 `L2-20` 这类段号 → 请求新素材上不存在的段 → 服务端 404 + 多余探测，
+        //   还会留下误导性的错误日志与「波形生成失败」占位。校正 effect 跑在渲染之后，补不上这一帧 ——
+        //   与 applyLevel 的约定一致：**档位与窗口必须在同一次更新里落**。
+        setLevel(0);
+        setWindowStart(0);
       })
       .catch((e: Error) => {
         if (seq !== workSeq.current) return;
@@ -391,13 +494,19 @@ export default function StudioDetailPage() {
     if (v !== null) v.currentTime = clamp(t, 0, duration || 0);
   };
 
+  // 时间 → 轨道内的百分比位置（Spec B：缩放后轨道的 0% / 100% 对应**窗口**两端，不再是整片两端；
+  // L0 时 windowStart=0、levelSpan=duration → 与旧的 (t/duration)*100 完全等价，所以 L0 行为不变）。
+  const timeToPct = useCallback((t: number): number => ((t - windowStart) / levelSpan) * 100, [windowStart, levelSpan]);
+
+  // 像素 → 时间。**缩放态下这是「窗口内换算」**：L0 时与旧公式 (px/width)*duration 完全等价。
   const xToTime = useCallback((clientX: number): number => {
     const el = trackRef.current;
     if (el === null || duration <= 0) return 0;
     const rect = el.getBoundingClientRect();
     // rect.width 是元素实际像素宽（= 1600 缩放后的值），不是 rect.right - left 的魔法数字
-    return (clamp(clientX - rect.left, 0, rect.width) / rect.width) * duration;
-  }, [duration]);
+    const t = windowStart + (clamp(clientX - rect.left, 0, rect.width) / rect.width) * levelSpan;
+    return clamp(t, 0, duration); // 窗口贴到片尾时右边界会略超出 → 夹回来
+  }, [duration, levelSpan, windowStart]);
 
   const addSegment = (): void => {
     if (duration <= 0 || segments.length >= MAX_SEGMENTS) return;
@@ -452,6 +561,67 @@ export default function StudioDetailPage() {
     window.addEventListener('pointerup', up);
   };
 
+  // Ctrl+滚轮 = 切档（spec D3）。**必须 useEffect + addEventListener(…, {passive:false})**：
+  //   React 的 onWheel 在 React 17+ 挂在根容器上、且是 passive 的，拦不住页面滚动 —— 而 Ctrl+滚轮在浏览器里
+  //   本来就是「缩放整页」，我们要在时间轴范围内把它接管过来（时间轴外照旧缩放整页）。
+  // ⚠️ 锚点 = 光标处的时间点：换档后那一秒必须留在**同一像素位置**，否则每次缩放画面都"跳"一下、用户找不到刚才看的地方。
+  // ⚠️ 依赖里**不能放 windowStart / level**（2026-10-03 OCR 审查第 3 轮 high）：
+  //   ① 放 windowStart → 平移时每帧都重订阅（拖动顺滑度直接受损）；
+  //   ② 不放它们又要读到当前值 → 用 ref（每次渲染同步最新值，监听器本身只在真正需要时重建）。
+  // ⚠️ 依赖里**必须**放 info / videoErrCode（同一批 high）：整块轨道挂载在
+  //   `info!==null && has_video && videoErrCode===null && importId!==null` 之下 ——
+  //   视频报错 → 轨道卸载；「重试加载」→ 在**新 DOM 节点**上重挂。这两个信号不变时 effect 不重跑、
+  //   清理不执行 → wheel 监听留在已脱离的节点上，**新挂的时间轴上 Ctrl+滚轮静默失灵**。
+  //   （与下面 ResizeObserver 那条是同一个坑，本仓已踩过一次。）
+  const levelRef = useRef(level);
+  const levelSpanRef = useRef(levelSpan);
+  const windowStartRef = useRef(windowStart);
+  levelRef.current = level;
+  levelSpanRef.current = levelSpan;
+  windowStartRef.current = windowStart;
+  useEffect(() => {
+    const el = trackRef.current;
+    if (el === null) return undefined;
+    const onWheel = (ev: WheelEvent): void => {
+      const lv = levelRef.current;
+      const span = levelSpanRef.current;
+      const wStart = windowStartRef.current;
+      if (!ev.ctrlKey) return; // 普通滚轮照常翻页面，不抢
+      if (duration <= 0) return;
+      const rect = el.getBoundingClientRect();
+      if (rect.width <= 0) return;
+      const ratio = (ev.clientX - rect.left) / rect.width;
+      if (ratio < 0 || ratio > 1) return; // 指针不在时间轴上 → 不拦截，让浏览器缩放整页
+      // 档位是离散的 0|1|2 —— 用显式边界判断（Math.min/Math.max 返回 number，收窄不回来）
+      const want = ev.deltaY < 0 ? lv + 1 : lv - 1;
+      if (want < 0 || want > 2 || want === lv) return; // 到顶/到底 → 不响应（也不改窗口）
+      const next = want as 0 | 1 | 2;
+      // ⚠️ 门槛要与按钮同一份（2026-10-03 OCR 审查修复）：原先这里只判 0..2 不判 duration，
+      // 于是素材太短时滚轮仍能切到 L1/L2 → 画轨空白、错误只进日志（按钮的 disabled 形同虚设）。
+      if (!levelUsable(next)) {
+        logFe('info', `时间轴切档被门槛拦下 project=${projectId} level=${lv}→${next} duration=${duration.toFixed(2)}s`);
+        return; // 不 preventDefault：让浏览器照常缩放整页（用户可能只是想缩页面）
+      }
+      // ⚠️ preventDefault 必须放在**所有守卫之后**（2026-10-03 OCR 审查第 2 轮修复）：
+      //   原来它在守卫之前无条件调用 → 上面两条 return（到顶/门槛拦下）时**页面缩放也被吞掉**，
+      //   结果「指针在时间轴上 Ctrl+滚轮」什么反应都没有（既不切档也不缩页面），用户无路可走。
+      ev.preventDefault();
+      // 锚点时间按**当前**窗算（换档前的位置），换档后按同一 ratio 反推新窗口起点 → 光标处那一秒不动
+      const anchorT = wStart + ratio * span;
+      const newSpan = next === 0 ? duration : LEVEL_SPAN_SEC[next];
+      const newStart = anchorT - ratio * newSpan;
+      // ⚠️ **必须传 newStart**（2026-10-03 OCR 审查第 4 轮 medium）：不传时 applyLevel 会退回
+      //   「沿用当前 windowStart」→ 锚点保持形同没写（每次缩放画面都跳一下）。
+      //   这是第 3 轮引入的回归 —— 加 applyLevel 时漏了参数。
+      applyLevel(next, newStart);
+    };
+    el.addEventListener('wheel', onWheel, { passive: false });
+    return () => el.removeEventListener('wheel', onWheel);
+    // ⚠️ `levelUsable` **不进依赖**（2026-10-03 OCR 审查第 4 轮 medium）：它是内联箭头函数，每次渲染
+    //   都是新引用 → 进了依赖就等于每次渲染都重订阅（平移时每帧一次），把上面三个 ref 的优化全抵消。
+    //   它只依赖 duration（已在依赖里）与模块常量，所以读到的永远是当前值。
+  }, [duration, projectId, info, videoErrCode]); // eslint-disable-line react-hooks/exhaustive-deps
+
   // —— 拖动定位（2026-10-02 N2-c）：时间轴上**三块区域各归谁**，实现时必须分区清楚、互不抢事件 ——
   //   ① 段区块左右各 8px 拖柄 → **拖边微调**（dragEdge）。它在 pointerdown 里已 stopPropagation，
   //      事件压根不冒到轨道层 → 拖边时永远不会误触发定位。
@@ -487,11 +657,26 @@ export default function StudioDetailPage() {
   //   即「监听器」与「那一帧 rAF」两样都收干净（写法与 studio.tsx 卸载时清 400ms 定时器同一套）。
   // 不做也没有功能性危害（seek 里有 videoRef.current 判空、卸载后不会再 setState），但它是真泄漏，且触屏那条路彻底走不通。
   useEffect(() => () => { scrubStopRef.current?.(); }, []);
+  // —— Spec B D3 · 手势分权（**切换规则写死在此，实现不许临时发挥**）——
+  //   ① L0（最粗档）：空白区拖动 = **拖动定位 seek**（N2-c 行为原样保持，不因引入缩放而变）
+  //   ② L1/L2：空白区拖动 = **平移视口**；**单击（位移 < 4px）= 定位**（用户仍能一步跳到某处）
+  //   ③ 段区块左右 8px 拖柄 = 拖边微调（任何档位都不变，dragEdge 已 stopPropagation）
+  //   ④ 段区块中部 click = 选中（任何档位都不变）
+  // 为什么这样切：L0 是「一屏看全片」，用户在 L0 想的是**定位**；放大后想的是「挪窗口看别处」——
+  //   同一个手势在两种意图下必须是两件事，否则二者必抢。**判据是「有没有位移」**：
+  //   位移 ≈ 0 = 点一下 = 定位（意图明确）；位移 > 阈值 = 拖 = 挪窗口（意图明确）。
+  // ⚠️ 别把②里的「单击定位」也砍掉：砍了之后缩放到 L1/L2 就再也点不到"某处"，用户只能拖到大概位置。
   const startScrub = (e: ReactPointerEvent<HTMLDivElement>): void => {
     if (e.button !== 0 || duration <= 0) return; // 只认左键（右键是上下文菜单，不抢）；没有 duration 谈不上定位
     scrubStopRef.current?.(); // 上一次若没被 up 收掉（窗口外松手那种），先拆干净再挂这一次的
-    scrubTargetRef.current = xToTime(e.clientX);
-    seek(scrubTargetRef.current); // 按下即 seek，不等移动
+    const panMode = level > 0; // L1/L2 拖动 = 平移窗口；L0 保持 N2-c 的拖动定位
+    const downX = e.clientX;
+    const startWindow = windowStart; // 平移的基准：用起始窗口算，别用「上一帧的 state」（否则位移会累积放大）
+    const rectW = trackRef.current?.getBoundingClientRect().width ?? 0;
+    if (!panMode) {
+      scrubTargetRef.current = xToTime(e.clientX);
+      seek(scrubTargetRef.current); // 按下即 seek，不等移动（L0 的既有行为）
+    }
     // 日志降噪（审查 Minor 4）：**纯点击（按下→松手，一次都没移动）不记任何日志**。
     //   logFe 不只往本地环形缓冲塞一条（web/src/api.ts 的 FE_LOG_CAP 只有 200 条），还同步 POST /api/logs；
     //   用户在时间轴上点几十下，真出问题时想看的那条 error 就被冲掉了 —— 与下方 productSrcs 那条既有教训同源。
@@ -500,6 +685,21 @@ export default function StudioDetailPage() {
     // 监听挂 window（与 dragEdge 同一套做法）：指针划出轨道后事件仍继续跟手，挂在元素上会中途"掉手"
     const move = (ev: PointerEvent): void => {
       if (ev.buttons === 0) return; // 丢键（拖出窗口）后 pointermove 仍会来，别再乱 seek
+      const dx = ev.clientX - downX;
+      if (panMode) {
+        // 4px 阈值：触摸与高分屏上「点一下」也会带一两像素抖动，不设阈值会把点击误判成拖动
+        if (Math.abs(dx) <= 4) return; // 还没越过阈值 → 先当作可能的单击，什么都不做
+        if (!moved) {
+          moved = true;
+          logFe('info', `时间轴平移开始 project=${projectId} level=${level} from=${startWindow.toFixed(2)}s`);
+        }
+        if (rectW > 0) {
+          // 向右拖（dx>0）→ 内容右移 → 窗口起点左移（减）；clamp 到 [0, duration-levelSpan]
+          const next = startWindow - (dx / rectW) * levelSpan;
+          setWindowStart(Math.max(0, Math.min(next, Math.max(0, duration - levelSpan))));
+        }
+        return;
+      }
       const t = xToTime(ev.clientX);
       if (!moved) { moved = true; logFe('info', `时间轴拖动定位开始 project=${projectId} t=${t.toFixed(2)}s`); }
       seekThrottled(t);
@@ -513,6 +713,23 @@ export default function StudioDetailPage() {
       scrubStopRef.current = null;
     };
     const onUp = (ev: PointerEvent): void => {
+      if (panMode) {
+        // ⚠️ 判据用 `moved`（move 里只有越过 4px 阈值才置 true = 「本次确实平移过」），**不用松手瞬间的 |dx|**：
+        //   用户把窗口拖走一段又挪回起点附近松手时，|dx| 会回到 0 → 会被误判成单击 → 用**陈旧的 xToTime 闭包**
+        //   （它捕获的 windowStart 是按下时的值，而此时窗口已被平移改过）算出与当前窗口不符的时间并 seek，
+        //   播放头会莫名跳一下。moved 是本次手势的既成事实，不受回移影响。（OCR 审查发现）
+        const wasDrag = moved;
+        stop(); // 先收尾：本次手势到此结束，不受后续事件影响
+        if (!wasDrag) {
+          // 位移没越过阈值 = 用户其实只想**点一下定位**（缩放态也要保留一步到位的定位能力，见上方分权注释②）
+          const t = xToTime(ev.clientX);
+          seek(t);
+          logFe('info', `时间轴单击定位 project=${projectId} level=${level} t=${t.toFixed(2)}s`);
+        } else {
+          logFe('info', `时间轴平移结束 project=${projectId} level=${level}`);
+        }
+        return;
+      }
       // 补最后一帧：rAF 可能还没跑就被 pointerup 打断 → 播放头会停在松手前一帧的位置（尾巴差十几像素）
       scrubTargetRef.current = xToTime(ev.clientX);
       stop(); // 先收尾再 seek：本次手势到此结束，不受后续事件影响
@@ -574,12 +791,17 @@ export default function StudioDetailPage() {
     [products],
   );
 
-  // 派生图加载态复位(N0 复核点名的坑):换素材(importId 变化)或版本串变化(素材被替换,fileSize 变)→
-  // 两张 <img> 的 src 都换成了新 URL,必须重新等 onLoad/onError;不复位的话上一份素材的「已就绪」
-  // 会让「生成中」提示永远不再出现,换素材后用户又对着空轨道发呆。
+  // 换素材时清空画轨的加载/失败记录（2026-10-03 OCR 审查第 3 轮）：段键不含 importId，
+  // 换素材后旧的 'L1-0' 会被误当成已加载 → 新素材的段图永远等不到 onLoad → 「画轨生成中」永不消失。
+  // ⚠️ 不依赖 windowStart / level：平移/切档不需要清（键命中已有记录就是已加载，见 filmReady 注释）。
   useEffect(() => {
-    setFilmReady(false);
-    setWaveReady(false);
+    setFilmLoaded({});
+    setFilmFailed({});
+    // nonce 也要清（2026-10-03 OCR 审查第 2 轮 low）：段键 `L1-0` 不含 importId，
+    // 上一件素材点过几次重试就会留下计数 → 新素材第一次取图就带一个非零 nonce。
+    // 功能上无害（服务端不认 rev），但它让「首屏 URL 与上次不同」失去诊断价值
+    // （排查时看到 URL 变却不知道为什么变），且素材 id 复用时计数会越滚越大。
+    setFilmNonceBySeg({});
   }, [importId, version]);
 
   // 顶栏「预览音频」（D16）：播**最新一条音频成品**。listProducts 的排序是 created_at DESC, id DESC（服务端 SQL），
@@ -670,8 +892,8 @@ export default function StudioDetailPage() {
   // 资料还在查：同样先占位（原因同上，见 info 未到时不渲染时间轴的老注释）
   if (info === null && !sourceMissing) return <Typography.Text type="secondary" style={{ padding: 16 }}>加载中…</Typography.Text>;
 
-  const pct = duration > 0 ? (current / duration) * 100 : 0;
-  const ticks = duration > 0 ? Array.from({ length: 11 }, (_v, i) => (duration * i) / 10) : [];
+  // （Spec B 已删除旧的 pct / ticks：时间尺、段区块、播放头的位置现在都由 timeToPct(时间) 按**当前窗口**换算，
+  //  不再是「整片百分比」。旧的 (i/10)*100% 刻度只在 L0 成立 —— 缩放到 L1/L2 后它会与窗口对不上。）
   // —— N2-b（2026-10-02）：两张派生图**按原图比例**铺满轨道，不再被拉变形 ——
   // 旧写法是 `width:100% + height:固定 90/120 + objectFit:'fill'`，fill 会强行改宽高比：
   // 容器 1400px 宽时横向缩到 0.875、纵向仍是 1.0 → 画面被纵向拉长约 14%（窗口越宽越扁）。
@@ -681,8 +903,16 @@ export default function StudioDetailPage() {
   // 那样"图上某点 ↔ 某个时间"就对不上了，等于毁掉 N0 刚修好的「覆盖整段」语义。**保持比例且不裁**才是对的。
   // 代价（已知、接受）：轨道总高随窗口宽变化（1400px 宽 → 胶片条 79px + 波形 105px = 184px）。
   // 高度只跟宽度走，横向映射（xToTime / 段区块的 left、width 百分比）**完全不受影响**。
-  const filmH = Math.round((trackW * FILM_H) / IMG_W);
-  const waveH = Math.round((trackW * WAVE_H) / IMG_W);
+  //
+  // ⚠️ 2026-10-03（OCR 审查修复）：Spec B 之后**胶片图宽度随档位变**（L0 = 36 格 × 160 = 5760，
+  // L1/L2 = 12 格 × 160 = 1920；tile 拼接不再做「整体 scale 到 1600×90」），所以这里**不能再用固定 IMG_W**：
+  // 沿用 1600 会让 L0 的图（5760×90）以 contain 塞进「按 1600 算出的框」里 → 宽度撑满、高度只有框高的 1/3.6，
+  // 轨道下半留大片空白（看起来像布局坏了）。服务端把该数导在 FILM_SHEET_W —— **单一来源，别在这里另写数字**。
+  // L0（5760 宽）比 L1/L2（1920 宽）更「扁」是几何必然：36 格排一行，格宽相对高度更小。
+  // 代价（接受）：**切档时轨道总高会变**（L0 更矮、L1/L2 更高）—— 这是「同屏看到的信息量不同」的诚实代价。
+  const sheetW = FILM_SHEET_W[level];
+  const filmH = Math.round((trackW * FILM_H) / sheetW);
+  const waveH = Math.round((trackW * WAVE_H) / IMG_W); // 波形仍是固定 1600×120 的 legacy PNG 口径
   // 集号只在素材登记了合集集号时显示；用 Number.isInteger 判定（字段缺失时为 undefined，
   // 用 !== null 会渲染出「第 undefined 集」——剪辑室页踩过同款坑）
   const epText = info !== null && Number.isInteger(info.material_entry_index) ? `第 ${info.material_entry_index} 集` : undefined;
@@ -816,6 +1046,18 @@ export default function StudioDetailPage() {
               style={{ width: '100%', maxWidth: 720, background: '#000', borderRadius: 8, alignSelf: 'center' }}
             />
 
+            {/* Spec B：缩放档位（离散三档，spec D3 明确不做无级平滑缩放）。
+                门槛数与服务端一致（128s / 300s）—— 服务端是权威判定，这里只是**别让用户点了才知道不行**。
+                ⚠️ 改这两个数要同时改 server/src/media/derived-pyramid.ts 的 checkLevelAvailable。 */}
+            <div style={{ display: 'flex', gap: 4, alignItems: 'center', marginBottom: 4, flexWrap: 'wrap' }}>
+              <Typography.Text type="secondary" style={{ fontSize: 11 }}>缩放</Typography.Text>
+              <Button size="small" type={level === 0 ? 'primary' : 'default'} onClick={() => applyLevel(0)}>全片</Button>
+              <Button size="small" type={level === 1 ? 'primary' : 'default'} disabled={!levelUsable(1)} onClick={() => applyLevel(1)}>中景</Button>
+              <Button size="small" type={level === 2 ? 'primary' : 'default'} disabled={!levelUsable(2)} onClick={() => applyLevel(2)}>近景</Button>
+              <Typography.Text type="secondary" style={{ fontSize: 11, marginLeft: 8 }}>
+                Ctrl+滚轮切档 · {level === 0 ? '拖动定位' : '拖动平移、单击定位'}
+              </Typography.Text>
+            </div>
             {/* 时间轴（spec 需求 7：三轨同屏）：时间尺 + 画轨（胶片条）+ 音轨（波形）+ 播放头 + 段区块 */}
             <div style={{ position: 'relative' }}>
               {/* 轨道层：**整层**接 pointerdown 做拖动定位（区域②，见 startScrub 处的三分区说明）。
@@ -829,59 +1071,204 @@ export default function StudioDetailPage() {
                 // 代价:从时间轴起手的竖向滚动不再滚页面(时间轴周边区域照常滚)——标准 scrubber 取舍。
                 style={{ position: 'relative', width: '100%', userSelect: 'none', touchAction: 'none' }}
               >
-                {/* 时间尺：10 等分刻度 */}
+                {/* 时间尺：10 等分刻度。（Spec B：刻度按**当前窗口**铺 —— L0 时窗口=整片，与旧版逐字一致）
+                    ⚠️ `duration > 0` 守卫必须留着（2026-10-03 OCR 审查）：素材 metadata 还没到时
+                    levelSpan 退化成 1，不挡的话会渲染出「0.00s…1.00s」这排看似正常、实则无意义的刻度。
+                    同源教训：N0 修掉的「时长未知却画出一张标准尺寸的正常图」。 */}
                 <div style={{ position: 'relative', height: RULER_H }}>
-                  {ticks.map((t, i) => (
-                    <span key={i} style={{ position: 'absolute', left: `${(i / 10) * 100}%`, fontSize: 11, color: '#999', transform: 'translateX(-50%)' }}>{fmtTime(t)}</span>
+                  {Array.from({ length: duration > 0 ? 11 : 0 }, (_v, i) => windowStart + (levelSpan * i) / 10).map((t, i) => (
+                    <span key={i} style={{ position: 'absolute', left: `${timeToPct(t)}%`, fontSize: 11, color: '#999', transform: 'translateX(-50%)' }}>{fmtTime(t)}</span>
                   ))}
                 </div>
-                {/* 画轨（胶片条 PNG，原图 1600×90）：显示高按容器宽**等比**算(N2-b) → 不变形、不裁，
-                    整段胶片条仍完整覆盖 [0, duration](N0 语义不受影响)。加载失败只记日志，不阻断页面。
-                    onLoad/onError 都置「已结论」→ 生成中提示消失(失败走日志,不重复造错误 UI)。 */}
-                <img
-                  src={filmstripUrl(importId, version)}
-                  alt="画轨"
-                  onLoad={() => setFilmReady(true)}
-                  onError={() => { setFilmReady(true); logFe('error', `胶片条加载失败 import=${importId}`); }}
-                  style={{ display: 'block', width: '100%', height: filmH, objectFit: 'contain', background: '#111' }}
-                />
-                {/* 音轨（波形 PNG，原图 1600×120）：同 N2-b，等比铺满；加载态同画轨 */}
-                <img
-                  src={waveformUrl(importId, version)}
-                  alt="音轨"
-                  onLoad={() => setWaveReady(true)}
-                  onError={() => { setWaveReady(true); logFe('error', `波形图加载失败 import=${importId}`); }}
-                  style={{ display: 'block', width: '100%', height: waveH, objectFit: 'contain', background: '#0b1220' }}
-                />
+                {/* 画轨：L0 = 整片一张（URL 与文件名都不变，向后兼容）；L1/L2 = 按可视窗口取段。
+                    显示高按容器宽**等比**算(N2-b) → 不变形、不裁。onLoad/onError 都置「已结论」→ 生成中提示消失。
+                    ⚠️ 2026-10-03（OCR 审查第 3 轮 medium）：L0 失败原先**只记日志、什么都不显示**（下面那句
+                    「失败走日志,不重复造错误 UI」是 N0 时代的旧决策）。那时 L0 是**唯一**档位，失败=页面没救了，
+                    记日志够用；现在 L1/L2 有了斜纹+重试，L0 却没有 → 同一份代码两套失败反馈，用户切回全片
+                    只看到一条空黑轨道，连「生成失败」四个字都没有。**失败必须看得见**（spec D5 诚实原则）。 */}
+                {level === 0 ? (
+                  <div style={{ position: 'relative', width: '100%', height: filmH, background: '#111' }}>
+                    <img
+                      src={filmstripUrl(importId, `${version}-f${filmNonceBySeg.L0 ?? 0}`)}
+                      alt="画轨"
+                      onLoad={() => {
+                        setFilmLoaded((p) => ({ ...p, L0: true }));
+                        // 同上：成功一次就清掉失败记录（记录不能自相矛盾）
+                        setFilmFailed(clearFilmKey('L0'));
+                      }}
+                      onError={() => {
+                        setFilmFailed((p) => ({ ...p, L0: true }));
+                        logFe('error', `胶片条加载失败 import=${importId}`);
+                      }}
+                      style={{ display: 'block', width: '100%', height: filmH, objectFit: 'contain', background: '#111' }}
+                    />
+                    {/* L0 失败占位：事件/z-index 与段图占位同款（理由见那里注释①②③）。
+                        段键复用 'L0' → 换素材时的清空、以及 filmReady 的判定都无需为它另开一套。 */}
+                    {filmFailed.L0 === true && (
+                      <div style={{
+                        position: 'absolute', zIndex: 1, pointerEvents: 'none', inset: 0,
+                        display: 'flex', alignItems: 'center', justifyContent: 'center',
+                        background: 'repeating-linear-gradient(45deg,rgba(26,32,44,0.9),rgba(26,32,44,0.9) 8px,rgba(35,43,59,0.9) 8px,rgba(35,43,59,0.9) 16px)',
+                      }}>
+                        <Typography.Text type="secondary" style={{ fontSize: 12, pointerEvents: 'none' }}>
+                          画轨生成失败
+                          <Typography.Link
+                            onPointerDown={(e) => e.stopPropagation()}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setFilmFailed(clearFilmKey('L0'));
+                              setFilmLoaded(clearFilmKey('L0'));
+                              setFilmNonceBySeg((p) => ({ ...p, L0: (p.L0 ?? 0) + 1 }));
+                              logFe('info', `用户重试画轨 L0 import=${importId}`);
+                            }}
+                            style={{ marginLeft: 8, pointerEvents: 'auto' }}
+                          >重试</Typography.Link>
+                        </Typography.Text>
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <div style={{ position: 'relative', width: '100%', height: filmH, background: '#111', overflow: 'hidden' }}>
+                    {/* 段图各自按「段起点 - 窗口起点」定位、按段**实际跨度**定宽 —— 段与段之间不留缝也不重叠。
+                        objectFit:'fill'：宽度已经按时间比例算好了，再用 contain 会因为原图比例不同而缩出缝。 */}
+                    {visibleSegs.map((seg) => {
+                      const segT0 = seg * levelSpan;
+                      // 末段可能是余数（不足一整窗）—— 图表宽度按实际跨度给，别撑到窗口外
+                      const segSpan = Math.max(0, Math.min(levelSpan, duration - segT0));
+                      const key = `L${level}-${seg}`;
+                      return (
+                        <img
+                          key={key}
+                          src={filmSegUrl(importId, level as 1 | 2, seg, `${version}-f${filmNonceBySeg[key] ?? 0}`)}
+                          alt={`画轨段 ${seg}`}
+                          onLoad={() => {
+                            setFilmLoaded((p) => ({ ...p, [key]: true }));
+                            // ⚠️ 同时**清掉失败记录**（2026-10-03 OCR 审查第 4 轮 medium）：
+                            //   失败可能是暂时的（500 环境问题 / 409 素材被换），用户切档再回来时这一次真的加载成功了 ——
+                            //   只写 loaded 不清 failed → 斜纹占位永久盖在已经加载好的段图上，页内还没法清。
+                            setFilmFailed(clearFilmKey(key));
+                          }}
+                          onError={() => { setFilmFailed((p) => ({ ...p, [key]: true })); logFe('error', `分段画轨加载失败 import=${importId} L${level}-${seg}`); }}
+                          style={{ position: 'absolute', left: `${timeToPct(segT0)}%`, width: `${(segSpan / levelSpan) * 100}%`, height: filmH, objectFit: 'fill' }}
+                        />
+                      );
+                    })}
+                    {/* 失败段斜纹占位（spec D5 诚实原则：**不用邻段内容冒充**）。
+                        ⚠️ **逐段定位，不做整轨覆盖**（2026-10-03 OCR 审查第 5 轮 medium）：L1/L2 的窗口只覆盖 1–2 段，
+                        整轨 `inset:0` 的斜纹会把**已经加载好的邻段也盖掉** —— 用户明明有画面却看不到，
+                        而文案还写着「部分画轨段失败」，自相矛盾。画轨是多个独立 <img>，占位就该跟它们同形。
+                        （波形那边整面覆盖是无奈之举：它是一整块 canvas，没有「部分失败」的概念。） */}
+                    {visibleSegs.filter((s) => filmFailed[`L${level}-${s}`] === true).map((seg) => {
+                      const segT0 = seg * levelSpan;
+                      const segSpan = Math.max(0, Math.min(levelSpan, duration - segT0));
+                      return (
+                        <div key={`failed-${seg}`} style={{
+                          // `zIndex:1` 与 `pointerEvents:'none'` 是上面注释 ①② 的落点，缺任一个重试就点不到
+                          position: 'absolute', zIndex: 1, pointerEvents: 'none',
+                          left: `${timeToPct(segT0)}%`, width: `${(segSpan / levelSpan) * 100}%`,
+                          top: 0, height: filmH, display: 'flex', alignItems: 'center', justifyContent: 'center',
+                          background: 'repeating-linear-gradient(45deg,rgba(26,32,44,0.9),rgba(26,32,44,0.9) 8px,rgba(35,43,59,0.9) 8px,rgba(35,43,59,0.9) 16px)',
+                        }}>
+                          {/* ⚠️ 事件与 z-index 与 TimelineWave 的失败占位同款（2026-10-03 OCR 审查第 1 轮 medium）：
+                              ① `zIndex:1` —— 父组件在画轨**之后**还有一层 `position:absolute; inset:0` 的定位层
+                                 （盖住 <img>、不让浏览器拖走图片），它会盖住本占位并**吞掉所有点击** → 重试永远点不到；
+                              ② `pointerEvents:'none'` 容器 + 只在链接上开 `auto` —— 整层吃事件会把音轨带的
+                                 定位/平移/段拖柄全吞掉（那比「重试点不到」更严重）；
+                              ③ stopPropagation —— 不让它冒到轨道层变成「点重试却 seek 了视频」。 */}
+                          <Typography.Text type="secondary" style={{ fontSize: 11, pointerEvents: 'none' }}>
+                            这段生成失败
+                            <Typography.Link
+                              onPointerDown={(e) => e.stopPropagation()}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                // nonce 变 → 该段 URL 变 → 浏览器重新请求；同时清掉失败记录，
+                                // 否则 filmReady 立刻又是 true（斜纹还在但「生成中」提示不出现，两边自相矛盾）。
+                                const k = `L${level}-${seg}`;
+                                setFilmFailed(clearFilmKey(k));
+                                setFilmLoaded(clearFilmKey(k));
+                                setFilmNonceBySeg((p) => ({ ...p, [k]: (p[k] ?? 0) + 1 }));
+                                logFe('info', `用户重试画轨段 import=${importId} L${level}-${seg}`);
+                              }}
+                              style={{ marginLeft: 8, pointerEvents: 'auto' }}
+                            >重试</Typography.Link>
+                          </Typography.Text>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+                {/* 音轨：Spec B 起为 Canvas 自绘 —— 按当前档位与窗口重绘，放大后能看到局部疏密。
+                    它自己带「加载中」与「失败占位 + 重试」，所以不再需要外层的 waveReady。
+                    ⚠️ **duration > 0 才挂载**（2026-10-03 OCR 审查第 10 轮 medium）：metadata 还没到时
+                    levelSpan 退化成哨兵值 1s → 每一列都落在文件的**第一秒**里 → 画出「看似正常的波形」
+                    （L0 是整条恒定竖条，更细的点距则把第一秒拉满全宽）—— 与时间尺那道守卫同一个病根。
+                    晚挂载零成本：峰值请求本来就由服务端缓存兜着。 */}
+                {duration > 0 && (
+                  <TimelineWave
+                    importId={importId}
+                    rev={`${version}-w${waveNonce}`}
+                    level={level}
+                    windowStart={windowStart}
+                    windowSpan={levelSpan}
+                    height={waveH}
+                    onRetry={() => {
+                      // rev 里带上 nonce → 组件收到新的 rev → 重新取数（见 waveNonce 的定义处注释）
+                      setWaveNonce((n) => n + 1);
+                      logFe('info', `用户重试波形 import=${importId} L${level}`);
+                    }}
+                  />
+                )}
                 {/* 定位层：**不再挂 onClick**（旧实现的误跳来源，见 startScrub 注释）。
                     保留它只为两件事：给空白区一个 crosshair 光标；盖住两张 <img>，不让浏览器把它们当图片拖走。 */}
                 <div style={{ position: 'absolute', inset: 0, cursor: 'crosshair' }} />
-                {/* 段区块：按百分比绝对定位，覆盖画轨+音轨两行（top 让开时间尺）。
-                    中部：pointerdown 冒到轨道层 → 拖动定位（②）；click 仍走下面的 setSelected → 选中该段（③）。 */}
-                {duration > 0 && segments.map((s, i) => (
-                  <div
-                    key={i}
-                    onClick={(e) => { e.stopPropagation(); setSelected(i); }}
-                    style={{
-                      position: 'absolute', top: RULER_H, height: filmH + waveH,
-                      left: `${(s.start_sec / duration) * 100}%`, width: `${((s.end_sec - s.start_sec) / duration) * 100}%`,
-                      background: 'rgba(22,119,255,0.20)', boxSizing: 'border-box',
-                      border: selected === i ? '2px solid #1677ff' : '1px solid rgba(22,119,255,0.6)',
-                    }}
-                  >
-                    {/* 左右 8px 拖柄：按住改起止（区域①，pointerdown 已 stopPropagation，不与定位抢） */}
-                    <div onPointerDown={dragEdge(i, 'start')} style={{ position: 'absolute', left: 0, top: 0, width: 8, height: '100%', cursor: 'ew-resize' }} />
-                    <div onPointerDown={dragEdge(i, 'end')} style={{ position: 'absolute', right: 0, top: 0, width: 8, height: '100%', cursor: 'ew-resize' }} />
-                  </div>
-                ))}
-                {/* 播放头：随 <video> 的 timeupdate 走；pointerEvents none，别挡住拖动定位 */}
-                {duration > 0 && <div style={{ position: 'absolute', top: 0, left: `${pct}%`, width: 2, height: RULER_H + filmH + waveH, background: '#ff4d4f', pointerEvents: 'none' }} />}
-                {/* 生成中提示(W3/N0 复核遗留):胶片条/波形任一还没结论就在轨道上给一行小字——大素材服务端
-                    现生成要 ~50s,空轨道不说话用户只会以为坏了。不做骨架屏(高度已预留);覆盖层 pointerEvents
-                    none,不挡拖动定位;任一图失败即视为"有结论",提示消失,错误只走日志。 */}
+                {/* 段区块：按**当前窗口**绝对定位，覆盖画轨+音轨两行（top 让开时间尺）。
+                    中部：pointerdown 冒到轨道层 → L0 拖动定位 / L1L2 拖动平移（②）；
+                    click 仍走下面的 setSelected → 选中该段（③，任何档位不变）。 */}
+                {duration > 0 && segments.map((s, i) => {
+                  // Spec B：只画**段与窗口的交集** —— 窗口外的段若照原样画，会溢出到容器外面去。
+                  const visStart = Math.max(s.start_sec, windowStart);
+                  const visEnd = Math.min(s.end_sec, windowStart + levelSpan);
+                  if (visEnd <= visStart) return null;
+                  return (
+                    <div
+                      key={i}
+                      onClick={(e) => { e.stopPropagation(); setSelected(i); }}
+                      style={{
+                        position: 'absolute', top: RULER_H, height: filmH + waveH,
+                        left: `${timeToPct(visStart)}%`, width: `${((visEnd - visStart) / levelSpan) * 100}%`,
+                        background: 'rgba(22,119,255,0.20)', boxSizing: 'border-box',
+                        border: selected === i ? '2px solid #1677ff' : '1px solid rgba(22,119,255,0.6)',
+                      }}
+                    >
+                      {/* 左右 8px 拖柄：按住改起止（区域①，pointerdown 已 stopPropagation，不与定位抢）。
+                          只在**段真实端点落在窗口内**时才画 —— 段被窗口裁掉一头时，那个拖柄不在视口里，
+                          画在裁剪边界上会让人以为拖柄在段的中间（拖起来才发现改的是别处）。 */}
+                      {visStart === s.start_sec && <div onPointerDown={dragEdge(i, 'start')} style={{ position: 'absolute', left: 0, top: 0, width: 8, height: '100%', cursor: 'ew-resize' }} />}
+                      {visEnd === s.end_sec && <div onPointerDown={dragEdge(i, 'end')} style={{ position: 'absolute', right: 0, top: 0, width: 8, height: '100%', cursor: 'ew-resize' }} />}
+                    </div>
+                  );
+                })}
+                {/* 播放头：随 <video> 的 timeupdate 走；pointerEvents none，别挡住拖动定位。
+                    Spec B：位置按窗口换算；播放头在**窗口外**时不画 —— 换算出来是负百分比或 >100%，
+                    画出来就是一条贴在容器边上、骗人的假红线。 */}
+                {duration > 0 && current >= windowStart && current <= windowStart + levelSpan && (
+                  <div style={{ position: 'absolute', top: 0, left: `${timeToPct(current)}%`, width: 2, height: RULER_H + filmH + waveH, background: '#ff4d4f', pointerEvents: 'none' }} />
+                )}
+                {/* 生成中提示(W3/N0 复核遗留)：画轨还没结论就在轨道上给一行小字 —— 空轨道不说话用户只会以为坏了。
+                    不做骨架屏(高度已预留)；覆盖层 pointerEvents none，不挡拖动定位；任一段失败即视为「有结论」，提示消失。
+                    ⚠️ 2026-10-03（OCR 审查第 4 轮）两处过时陈述已改：① 「~50s」是 Spec B 之前的数字（L0 逐格 seek 实测 10.29s，
+                    L1/L2 单段 3.38s，见下面按档位给秒数）；② 「错误只走日志」不再成立 —— 本轮给 L0 与 L1/L2 都补了
+                    斜纹占位 + 重试，失败是**看得见且可恢复**的（spec D5 诚实原则）。 */}
                 {derivedLoading && (
                   <div style={{ position: 'absolute', top: RULER_H, left: 0, width: '100%', height: filmH + waveH, display: 'flex', alignItems: 'center', justifyContent: 'center', pointerEvents: 'none' }}>
-                    <Typography.Text type="secondary" style={{ fontSize: 12, background: 'rgba(255,255,255,0.85)', padding: '2px 10px', borderRadius: 4 }}>画轨/波形生成中，大文件约需 1 分钟…</Typography.Text>
+                    {/* 文案只说画轨（2026-10-03 OCR 审查第 3 轮 low）：derivedLoading 现在只跟画轨，
+                        波形有自己的加载态 —— 说「画轨/波形」会有一半是假的。
+                        ⚠️ 秒数**按档位给**（第 4 轮 medium）：写死「10 秒」在 L0 对（实测 B1 = 10.29s），
+                        但 L1/L2 是单段 12 格（实测 B2 = 3.38s）—— 切到中景后仍写「约需 10 秒」是把用户
+                        的预期拉长 3 倍。数字取自实测报告 `.superpowers/sdd/2026-10-01-clip-works/ffmpeg-measure-report.md` §B 组。 */}
+                    <Typography.Text type="secondary" style={{ fontSize: 12, background: 'rgba(255,255,255,0.85)', padding: '2px 10px', borderRadius: 4 }}>
+                      画轨生成中，大文件约需 {level === 0 ? 10 : 4} 秒…
+                    </Typography.Text>
                   </div>
                 )}
               </div>

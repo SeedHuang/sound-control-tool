@@ -195,7 +195,11 @@ export async function createServer(opts: CreateServerOpts): Promise<{
       // 于是封面一律 401、卡片全退成纯色(路由内的 query token / Referer 判定根本没机会跑)
       if (/^\/api\/imports\/\d+\/cover$/.test(pathname)) return;
       // 派生图同属这一类(<img> 加不了 header)：与 /cover 同款豁免，由路由内 query token/Referer 判定接管（spec D14）
-      if (/^\/api\/media\/\d+\/(waveform|filmstrip)$/.test(pathname)) return;
+      // ⚠️ 新增派生图地址时**必须同步加进这条正则**（2026-10-03 用户实测「切中景/近景时胶片带生成失败」）：
+      //   Spec B 的 filmseg / wavepeak 漏加 → 守卫在路由之前就把 <img> 请求 401 掉，路由内那套
+      //   query token / Origin / Referer 三件套判定**根本没机会跑**，症状是「一直失败 + 磁盘零产物」。
+      //   判据：凡是用 <img>/<video> 直接取 URL 的地址，都要在这名单里；走 fetch 的（能带 header）不受此限。
+      if (/^\/api\/media\/\d+\/(waveform|filmstrip|filmseg|wavepeak)$/.test(pathname)) return;
       const origin = req.headers.origin;
       if (typeof origin === 'string' && isAllowedLocalOrigin(origin)) return; // dev 浏览器豁免(D12)
       if (req.headers['x-sct-token'] !== token) {

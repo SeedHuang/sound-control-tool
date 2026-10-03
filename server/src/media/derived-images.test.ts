@@ -5,8 +5,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { openDatabase, type DB } from '../db/index.js';
-import { filmstripShapeSig, filmstripVfFor } from '../ffmpeg/derived-args.js';
-import { checkDerivedCache, ensureDerivedImage, invalidateDerived, type ExecLike } from './derived-images.js';
+import { FILM_META_V, filmShapeSig } from '../ffmpeg/derived-args.js';
+import { checkDerivedCache, derivedFileName, ensureDerivedImage, invalidateDerived, type ExecLike, type FilmMeta } from './derived-images.js';
 
 let root: string;
 let derivedDir: string;
@@ -98,12 +98,17 @@ describe('ensureDerivedImage', () => {
     expect(existsSync(tmp)).toBe(false); // 临时名下已无残留
   });
 
-  it('filmstrip：probe 返 20 → 传进 doExec 的 -vf 含 fps=0.600000（把 duration 接进参数链）', async () => {
+  // Spec B (T2)：L0 的生成方式从「一次 fps 滤镜整解码」改成「36 格逐格 seek + 1 次 tile 拼接」。
+  // 旧断言查的是 -vf 里的 fps=0.600000 —— 那条路径已经不存在了（实测 B1：逐格 seek 10.29s vs 整解码 45–52s）。
+  it('filmstrip：probe 只用来算采样点，实际执行是 36 次逐格 seek（不再是单次 fps 滤镜）', async () => {
     const { fn, calls } = execStub(() => ({ write: 'PNG' }));
     const r = await ensureDerivedImage({ kind: 'film', importId: 2, videoPath: 'v.mp4', derivedDir, tempDir, db, doExec: fn, probe: async () => 20, resolveFfmpeg: resolveOk });
     expect(r).toMatchObject({ ok: true });
-    const args = calls[0]!.args;
-    expect(args[args.indexOf('-vf') + 1]).toContain('fps=0.600000');
+    const cellCalls = calls.filter((c) => c.args.includes('-ss'));
+    expect(cellCalls).toHaveLength(36);
+    // 每格的 -vf 是固定 160:90（2026-10-03 OCR 审查后：宽度固定，签名/成品宽/消费方才对得上）
+    expect(cellCalls[0]!.args[cellCalls[0]!.args.indexOf('-vf') + 1]).toBe('scale=160:90');
+    expect(cellCalls.some((c) => c.args.join(' ').includes('fps='))).toBe(false);
   });
 
   it('filmstrip：探测显式放宽到 60s（2.1GB 大文件 10s 探不完 → 退化成 fps=1 只覆盖前 12 秒）', async () => {
@@ -117,7 +122,10 @@ describe('ensureDerivedImage', () => {
     const { fn, calls } = execStub(() => ({ write: 'PNG' }));
     const r = await ensureDerivedImage({ kind: 'film', importId: 2, videoPath: 'v.mp4', derivedDir, tempDir, db, doExec: fn, probe: async () => null, resolveFfmpeg: resolveOk });
     expect(r).toMatchObject({ ok: false, code: 'PROBE_FAIL' });
-    if (!r.ok) expect(r.message).toContain('无法生成画轨');
+    // ⚠️ 断言「读不出素材」这个**语义**，不再钉具体措辞（2026-10-03 OCR 审查第 12 轮 medium）：
+    //   probeDurationFor 也服务波形峰值链路，措辞已改为产物中性（原先写「无法生成画轨」会让
+    //   波形失败时报出不相干的产物名）。这里要守住的是「用户被告知素材读不出」而不是「画轨」二字。
+    if (!r.ok) expect(r.message).toContain('素材信息读取失败');
     expect(calls).toHaveLength(0); // 没起 ffmpeg
     expect(existsSync(join(derivedDir, 'film-2.png'))).toBe(false); // 也没落任何图
   });
@@ -145,12 +153,13 @@ describe('ensureDerivedImage', () => {
     const { fn, calls } = execStub(() => ({ write: 'PNG' }));
     const r = await ensureDerivedImage({ kind: 'film', importId: 3, videoPath: 'v.mp4', derivedDir, tempDir, db, doExec: fn, probe: async () => 1290, resolveFfmpeg: resolveOk });
     expect(r).toMatchObject({ ok: true, cached: false });
-    expect(calls).toHaveLength(1); // 没被旧图糊弄过去，真重画了
-    const meta = JSON.parse(readFileSync(join(derivedDir, 'film-3.png.meta'), 'utf8')) as { v: number; sig: string; durationSec: number; vf: string };
-    expect(meta.v).toBe(2);
-    expect(meta.sig).toBe(filmstripShapeSig()); // 形状凭据：格数/宽高/schema/fps 公式都在里面
+    expect(calls).toHaveLength(37); // 36 格 + 1 次 tile；没被旧图糊弄过去，真重画了
+    const meta = JSON.parse(readFileSync(join(derivedDir, 'film-3.png.meta'), 'utf8')) as FilmMeta;
+    expect(meta.v).toBe(FILM_META_V);
+    expect(meta.level).toBe(0);
+    expect(meta.tiles).toBe(36);
+    expect(meta.sig).toBe(filmShapeSig(0, 36)); // 形状凭据：schema/level/格数/格子尺寸都在里面
     expect(meta.durationSec).toBe(1290);
-    expect(meta.vf).toContain('fps=0.009302'); // 记的是实际用的 fps
   });
 
   it('缓存自愈闭环：重画过一次后再请求 → 命中缓存，不再起 ffmpeg、也不再探时长', async () => {
@@ -173,7 +182,7 @@ describe('ensureDerivedImage', () => {
     const { fn, calls } = execStub(() => ({ write: 'PNG' }));
     const r = await ensureDerivedImage({ kind: 'film', importId: 5, videoPath: 'v.mp4', derivedDir, tempDir, db, doExec: fn, probe: async () => 20, resolveFfmpeg: resolveOk });
     expect(r).toMatchObject({ ok: true, cached: false });
-    expect(calls).toHaveLength(1);
+    expect(calls).toHaveLength(37);
   });
 
   it('wave 不需要 meta：老 wave 图（无 meta）仍直接命中，不白跑一次 ffmpeg', async () => {
@@ -186,45 +195,46 @@ describe('ensureDerivedImage', () => {
   });
 
   // —— 审查修复轮 1 important 1：参数比对必须「真的存在」，不是「meta 存在即算数」——
-  // 手写一份「按别的参数画的老图」的 meta（改 tile 数 / 改宽高 / 改 schema / 改 fps 公式），
-  // 每一种都必须被判失效重画。这正是「下一次改公式时老图照样命中」那个 bug 的同一形状。
-  const staleMeta = (over: Record<string, unknown>): string => JSON.stringify({ v: 2, sig: filmstripShapeSig(), durationSec: 1290, vf: filmstripVfFor(1290), generatedAt: '2026-10-01T00:00:00.000Z', ...over });
+  // 手写一份「按别的参数画的老图」的 meta（改档位 / 改格数 / 改格子尺寸 / 改 schema 版本），
+  // 每一种都必须被判失效重画。这正是「下一次改参数时老图照样命中」那个 bug 的同一形状。
+  // Spec B (T2)：meta 形态升到 v3 —— 字段从 (v,sig,durationSec,vf) 变成 (v,level,sig,durationSec,tiles)。
+  const staleMeta = (over: Record<string, unknown>): string => JSON.stringify({ v: FILM_META_V, level: 0, sig: filmShapeSig(0, 36), durationSec: 1290, tiles: 36, generatedAt: '2026-10-01T00:00:00.000Z', ...over });
   const withStaleFilm = (id: number, meta: string): void => {
     mkdirSync(derivedDir, { recursive: true });
     writeFileSync(join(derivedDir, `film-${id}.png`), 'PNG');
     writeFileSync(join(derivedDir, `film-${id}.png.meta`), meta);
   };
 
-  it('改了 tile 数（sig 12→8）→ 老图判失效重画（不靠人记得清缓存）', async () => {
-    withStaleFilm(7, staleMeta({ sig: filmstripShapeSig().replace('tiles=12', 'tiles=8') }));
+  it('改了格数（sig/tiles 36→12）→ 老图判失效重画（不靠人记得清缓存）', async () => {
+    withStaleFilm(7, staleMeta({ sig: filmShapeSig(0, 12), tiles: 12 }));
     const { fn, calls } = execStub(() => ({ write: 'PNG' }));
     const r = await ensureDerivedImage({ kind: 'film', importId: 7, videoPath: 'v.mp4', derivedDir, tempDir, db, doExec: fn, probe: async () => 1290, resolveFfmpeg: resolveOk });
     expect(r).toMatchObject({ ok: true, cached: false });
-    expect(calls).toHaveLength(1);
+    expect(calls).toHaveLength(37);
   });
-  it('改了宽高（sig 1600x90→800x45）→ 老图判失效重画', async () => {
-    withStaleFilm(8, staleMeta({ sig: filmstripShapeSig().replace('size=1600x90', 'size=800x45') }));
+  it('改了格子尺寸（sig cell 160x90→80x45）→ 老图判失效重画', async () => {
+    withStaleFilm(8, staleMeta({ sig: filmShapeSig(0, 36).replace('cell=160x90', 'cell=80x45') }));
     const { fn, calls } = execStub(() => ({ write: 'PNG' }));
     const r = await ensureDerivedImage({ kind: 'film', importId: 8, videoPath: 'v.mp4', derivedDir, tempDir, db, doExec: fn, probe: async () => 1290, resolveFfmpeg: resolveOk });
     expect(r).toMatchObject({ ok: true, cached: false });
-    expect(calls).toHaveLength(1);
+    expect(calls).toHaveLength(37);
   });
-  it('改了 schema 版本（v 2→1）→ 老 meta 一律不认（连同上一轮写的那批 v=1 老 meta）', async () => {
-    withStaleFilm(9, staleMeta({ v: 1 }));
+  it('改了 schema 版本（v 3→2）→ 老 meta 一律不认（连同上一轮写的那批 v=2 老 meta）', async () => {
+    withStaleFilm(9, staleMeta({ v: 2 }));
     const { fn, calls } = execStub(() => ({ write: 'PNG' }));
     const r = await ensureDerivedImage({ kind: 'film', importId: 9, videoPath: 'v.mp4', derivedDir, tempDir, db, doExec: fn, probe: async () => 1290, resolveFfmpeg: resolveOk });
     expect(r).toMatchObject({ ok: true, cached: false });
-    expect(calls).toHaveLength(1);
+    expect(calls).toHaveLength(37);
   });
-  it('改了 fps 公式（老图 vf 是 12/T 算的、当前公式算出来的不一样）→ 判失效重画，且比对不额外探时长', async () => {
-    // 老 vf 假装是「除数 11」那套公式的产物（末格对齐片尾那个约定）；当前公式按 12/T 算 → 逐字对不上
-    withStaleFilm(10, staleMeta({ vf: 'fps=0.008527,scale=-1:90,tile=12x1,scale=1600:90' }));
+  it('改了档位（meta 记 level=1，请求的是 L0）→ 判失效重画，且比对不额外探时长', async () => {
+    // 老 meta 自称是按 L1（12 格）画的，但请求要的是 L0（36 格）→ 档位与格数都对不上
+    withStaleFilm(10, staleMeta({ level: 1, sig: filmShapeSig(1, 12), tiles: 12 }));
     let probeCalls = 0;
     const { fn, calls } = execStub(() => ({ write: 'PNG' }));
     const r = await ensureDerivedImage({ kind: 'film', importId: 10, videoPath: 'v.mp4', derivedDir, tempDir, db, doExec: fn, probe: async () => { probeCalls += 1; return 1290; }, resolveFfmpeg: resolveOk });
     expect(r).toMatchObject({ ok: true, cached: false });
-    expect(calls).toHaveLength(1);
-    expect(probeCalls).toBe(1); // 探一次就够：比对用的是 meta 里记着的时长，不是重新 ffprobe
+    expect(calls).toHaveLength(37);
+    expect(probeCalls).toBe(1); // 探一次就够：比对用的是 meta 里记着的值，不是重新 ffprobe
   });
   it('比对通过的老 meta 仍然命中（别把比对写成「一律重画」——那等于缓存失效）', async () => {
     withStaleFilm(11, staleMeta({}));
@@ -251,7 +261,7 @@ describe('ensureDerivedImage', () => {
     const { fn, calls } = execStub(() => ({ write: 'PNG' }));
     const args = { kind: 'film' as const, importId: 20, videoPath: 'v.mp4', derivedDir, tempDir, db, doExec: fn, probe: async () => 1290, resolveFfmpeg: resolveOk };
     const [a, b] = await Promise.all([ensureDerivedImage(args), ensureDerivedImage(args)]);
-    expect(calls).toHaveLength(1); // 关键断言：没有第二个 ffmpeg
+    expect(calls).toHaveLength(37); // 关键断言：完整跑了一轮（36 格 + tile），没有第二轮
     expect(a).toEqual(b);
     expect(a).toMatchObject({ ok: true, cached: false });
     // 跑完之后 in-flight 表要清空，否则下一次正常请求会拿到上次的旧结果
@@ -278,8 +288,13 @@ describe('ensureDerivedImage', () => {
       ensureDerivedImage({ kind: 'film', importId: 21, videoPath: 'v.mp4', derivedDir, tempDir, db, doExec: fn, probe: async () => 1290, resolveFfmpeg: resolveOk }),
       ensureDerivedImage({ kind: 'film', importId: 22, videoPath: 'v.mp4', derivedDir, tempDir, db, doExec: fn, probe: async () => 1290, resolveFfmpeg: resolveOk }),
     ]);
-    const outs = calls.map((c) => c.args[c.args.length - 1]!);
-    expect(new Set(outs).size).toBe(2);
+    // 只看 tile 拼接产物（每个 importId 恰好一次）：两者必须不同名，否则两个 ffmpeg -y 抢同一个文件
+    const tileOuts = calls.filter((c) => c.args.includes('-start_number')).map((c) => c.args[c.args.length - 1]!);
+    expect(tileOuts).toHaveLength(2);
+    expect(new Set(tileOuts).size).toBe(2);
+    // 逐格的输出路径也两两不同（cellDir 含 importId 与唯一随机段）
+    const cellOuts = calls.filter((c) => c.args.includes('-ss')).map((c) => c.args[c.args.length - 1]!);
+    expect(new Set(cellOuts).size).toBe(cellOuts.length);
   });
   it('落盘自洽：图与 meta 一起到位，temp 里不留残留（否则每次请求都判失效、用户反复白等 52 秒）', async () => {
     const { fn } = execStub(() => ({ write: 'PNG' }));
@@ -348,6 +363,86 @@ describe('ensureDerivedImage', () => {
   });
 });
 
+// —— Spec B T2：L0 总览接管（逐格 seek 生成）——
+// 实测 B1：36 格逐格 seek 共 10.29s，vs fps 滤镜整解码 45–52s（快 4.4–5.1 倍）。
+// 这组测试锁住「逐格 seek 的形态」：36 次抽帧 + 1 次拼接、-ss 在 -i 前、任一格失败即整体失败。
+describe('L0 总览：逐格 seek 生成（实测 B1）', () => {
+  it('36 格 → 调 36 次 cell 抽帧 + 1 次 tile 拼接，共 37 次 doExec（不再是 1 次）', async () => {
+    const { fn, calls } = execStub(() => ({ write: 'PNG' }));
+    const r = await ensureDerivedImage({ kind: 'film', importId: 41, videoPath: 'v.mp4', derivedDir, tempDir, db, doExec: fn, probe: async () => 1290.325333, resolveFfmpeg: resolveOk });
+    expect(r).toMatchObject({ ok: true, cached: false });
+    const cellCalls = calls.filter((c) => c.args.includes('-ss'));
+    const tileCalls = calls.filter((c) => c.args.includes('-start_number'));
+    expect(cellCalls).toHaveLength(36);
+    expect(tileCalls).toHaveLength(1);
+    // -ss 必须在 -i 之前：这是 10.29s 与「整解码 45–52s」差距的全部来源
+    for (const c of cellCalls) expect(c.args.indexOf('-ss')).toBeLessThan(c.args.indexOf('-i'));
+    // 第 1 格是 0，第 2 格落在 1/36 处（1290.325333/36 = 35.8423… → 保留两位 35.84）
+    expect(cellCalls[0]!.args[cellCalls[0]!.args.indexOf('-ss') + 1]).toBe('0');
+    expect(cellCalls[1]!.args[cellCalls[1]!.args.indexOf('-ss') + 1]).toBe('35.84');
+  });
+
+  it('cell 临时文件全部清理（不留 36 个半成品在 temp/）', async () => {
+    const { fn, calls } = execStub(() => ({ write: 'PNG' }));
+    await ensureDerivedImage({ kind: 'film', importId: 42, videoPath: 'v.mp4', derivedDir, tempDir, db, doExec: fn, probe: async () => 1290.325333, resolveFfmpeg: resolveOk });
+    const last = calls[calls.length - 1]!;
+    const cellArg = last.args[last.args.indexOf('-i') + 1]!;
+    const cellDir = cellArg.replace(/\\cell-%02d\.png$/, '');
+    const leftovers = existsSync(cellDir) ? readdirSync(cellDir).filter((f) => f.startsWith('cell-')) : [];
+    expect(leftovers).toHaveLength(0);
+    expect(readdirSync(tempDir)).toHaveLength(0); // temp/ 里整个 cell 目录也没了
+  });
+
+  it('任一格失败 → 整体 FFMPEG_FAIL，不落半张图（不留「有图无凭据」）', async () => {
+    let n = 0;
+    const { fn } = execStub(() => {
+      n += 1;
+      return n === 5 ? { err: Object.assign(new Error('boom'), { code: 1 }), stderr: 'Invalid data found' } : { write: 'PNG' };
+    });
+    const r = await ensureDerivedImage({ kind: 'film', importId: 43, videoPath: 'v.mp4', derivedDir, tempDir, db, doExec: fn, probe: async () => 1290.325333, resolveFfmpeg: resolveOk });
+    expect(r).toMatchObject({ ok: false, code: 'FFMPEG_FAIL' });
+    expect(existsSync(join(derivedDir, 'film-43.png'))).toBe(false);
+    expect(existsSync(join(derivedDir, 'film-43.png.meta'))).toBe(false);
+    expect(readdirSync(tempDir)).toHaveLength(0);
+  });
+
+  it('meta 升到 v3 且带 level=0（老 v2 的图自动判失效）', async () => {
+    const { fn } = execStub(() => ({ write: 'PNG' }));
+    await ensureDerivedImage({ kind: 'film', importId: 44, videoPath: 'v.mp4', derivedDir, tempDir, db, doExec: fn, probe: async () => 200, resolveFfmpeg: resolveOk });
+    const m = JSON.parse(readFileSync(join(derivedDir, 'film-44.png.meta'), 'utf8')) as Record<string, unknown>;
+    expect(m.v).toBe(FILM_META_V);
+    expect(m.level).toBe(0);
+    expect(m.tiles).toBe(36);
+    expect(String(m.sig)).toContain('level=0');
+  });
+
+  it('老 v2 的 meta → 判失效重生成（spec D4 的核心机制）', async () => {
+    mkdirSync(derivedDir, { recursive: true });
+    writeFileSync(join(derivedDir, 'film-45.png'), 'PNG');
+    writeFileSync(join(derivedDir, 'film-45.png.meta'), JSON.stringify({ v: 2, sig: 'v2|tiles=12|size=1600x90|fps=min(12/T,30)', durationSec: 200, vf: 'fps=1.000000,scale=-1:90,tile=12x1,scale=1600:90', generatedAt: '' }));
+    const { fn, calls } = execStub(() => ({ write: 'PNG' }));
+    const r = await ensureDerivedImage({ kind: 'film', importId: 45, videoPath: 'v.mp4', derivedDir, tempDir, db, doExec: fn, probe: async () => 200, resolveFfmpeg: resolveOk });
+    expect(r).toMatchObject({ ok: true, cached: false });
+    expect(calls).toHaveLength(37);
+  });
+});
+
+// 命名契约（spec D1/D4）：文件名是命中判定/生成/清理三处共用的单一来源，各写一份必然漂移。
+describe('derivedFileName 命名契约', () => {
+  it('L0 沿用 legacy 名（URL/文件名不变，向后兼容）', () => {
+    expect(derivedFileName('film', 12)).toBe('film-12.png');
+    expect(derivedFileName('wave', 12)).toBe('wave-12.png');
+  });
+  it('分段图名带 level 与段号', () => {
+    expect(derivedFileName('filmSeg', 12, { level: 1, seg: 3 })).toBe('film-12-L1-3.png');
+    expect(derivedFileName('filmSeg', 12, { level: 2, seg: 0 })).toBe('film-12-L2-0.png');
+  });
+  it('峰值 JSON：L0 不带段号，L1/L2 带段号', () => {
+    expect(derivedFileName('wavePeak', 12, { level: 0 as 1 | 2, seg: 0 })).toBe('wavepeak-12-L0.json');
+    expect(derivedFileName('wavePeak', 12, { level: 1, seg: 3 })).toBe('wavepeak-12-L1-3.json');
+  });
+});
+
 describe('invalidateDerived', () => {
   it('两张图存在 → 删后都不存在；对不存在的调用不抛', () => {
     mkdirSync(derivedDir, { recursive: true });
@@ -367,5 +462,40 @@ describe('invalidateDerived', () => {
     invalidateDerived(derivedDir, 1);
     expect(existsSync(join(derivedDir, 'film-1.png.meta'))).toBe(false);
     expect(existsSync(join(derivedDir, 'wave-1.png.meta'))).toBe(false);
+  });
+
+  // —— Spec B T3：分段图与峰值 JSON 也必须一起清（否则素材换源后，段图凭 meta 自洽会永久命中）——
+  it('全级清扫：L0 + 所有 L1/L2 段 + 峰值 JSON + 各自 meta 一并删，返回清理条数', () => {
+    mkdirSync(derivedDir, { recursive: true });
+    const names = ['film-1.png', 'film-1.png.meta', 'film-1-L1-0.png', 'film-1-L1-0.png.meta', 'film-1-L2-7.png', 'film-1-L2-7.png.meta', 'wavepeak-1-L0.json', 'wavepeak-1-L1-3.json'];
+    for (const n of names) writeFileSync(join(derivedDir, n), 'x');
+    const r = invalidateDerived(derivedDir, 1);
+    expect(r.removed).toBe(names.length);
+    expect(readdirSync(derivedDir)).toHaveLength(0);
+  });
+
+  // ⚠️ spec D4 点名的坑：朴素前缀 `film-1-` 会误伤 `film-11-*` —— 11 号素材的段图被 1 号清掉，
+  // 用户打开 11 号页面只能重新生成几十秒。所以段图前缀必须写成 `film-<id>-L`（带 L）。
+  it('前缀碰撞：清 importId=1 不得误删 importId=11 的任何文件', () => {
+    mkdirSync(derivedDir, { recursive: true });
+    const keep = ['film-11.png', 'film-11.png.meta', 'film-11-L1-0.png', 'film-11-L2-7.png', 'film-11-L2-7.png.meta', 'wavepeak-11-L0.json', 'wavepeak-11-L1-3.json', 'wave-11.png'];
+    for (const n of keep) writeFileSync(join(derivedDir, n), 'x');
+    writeFileSync(join(derivedDir, 'film-1.png'), 'x');
+    writeFileSync(join(derivedDir, 'film-1-L1-0.png'), 'x');
+    const r = invalidateDerived(derivedDir, 1);
+    expect(r.removed).toBe(2);
+    for (const n of keep) expect(existsSync(join(derivedDir, n))).toBe(true);
+  });
+
+  it('同理不受 importId=10/12 影响（`film-1-L` 与 `film-12-L` 是不同前缀）', () => {
+    mkdirSync(derivedDir, { recursive: true });
+    for (const n of ['film-12-L1-0.png', 'film-10-L1-0.png', 'wavepeak-12-L0.json']) writeFileSync(join(derivedDir, n), 'x');
+    invalidateDerived(derivedDir, 1);
+    expect(readdirSync(derivedDir).sort()).toEqual(['film-10-L1-0.png', 'film-12-L1-0.png', 'wavepeak-12-L0.json']);
+  });
+
+  it('目录不存在 → 不抛，返回 removed:0（素材变化时清图不该让主流程挂掉，仓库规则）', () => {
+    expect(() => invalidateDerived(join(root, 'no-such-dir'), 9)).not.toThrow();
+    expect(invalidateDerived(join(root, 'no-such-dir'), 9).removed).toBe(0);
   });
 });

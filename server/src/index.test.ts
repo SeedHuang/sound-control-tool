@@ -203,9 +203,22 @@ describe('createServer(D12 API token)', () => {
 
   // P4-T2 派生图：<img> 同款加不了 header，守卫必须豁免它，由路由内判定接管。
   // 若守卫没豁免，这三种请求都会拿到「缺少或无效的 API token」这一守卫文案 —— 断言 code=UNAUTHORIZED 就证明是路由在答。
+  // ⚠️ 名单必须覆盖**全部**派生图地址（2026-10-03 用户实测「切中景/近景胶片带生成失败」的修复）：
+  //   漏一个，那个地址就会被守卫在路由之前 401 掉 —— 路由内的 query token 判定根本没机会跑，
+  //   症状是「一直失败 + 磁盘零产物」，只看 http 摘要日志只会得到一串 401，定位不到真凶。
+  //   所以这里用**四个地址逐一断言**，新增派生图地址时改了守卫就必须同步改这条用例，否则测试会红。
   it('派生图:守卫豁免——?token=wrong 与无 token 均由路由返回 401 UNAUTHORIZED；豁免不扩散到 /api/media 列表', async () => {
     const s = await createServer({ port: 7372, dbPath: ':memory:', tempDir: path.join(tmp(), 't21') });
-    for (const p of ['/api/media/1/waveform?token=wrong', '/api/media/1/filmstrip?token=wrong', '/api/media/1/waveform']) {
+    for (const p of [
+      '/api/media/1/waveform?token=wrong',
+      '/api/media/1/filmstrip?token=wrong',
+      '/api/media/1/waveform',
+      // Spec B 两个新地址（原来漏在名单外 → 全部 401）
+      '/api/media/1/filmseg?level=1&seg=0&token=wrong',
+      '/api/media/1/filmseg?level=2&seg=0&token=wrong',
+      '/api/media/1/wavepeak?level=1&seg=0&token=wrong',
+      '/api/media/1/wavepeak?level=0&token=wrong',
+    ]) {
       const res = await fetch(`http://127.0.0.1:${s.port}${p}`);
       expect(res.status).toBe(401);
       const body = (await res.json()) as { error?: { code?: string; message?: string } };
@@ -216,6 +229,35 @@ describe('createServer(D12 API token)', () => {
     const listed = await fetch(`http://127.0.0.1:${s.port}/api/media`);
     expect(listed.status).toBe(401);
     expect(((await listed.json()) as { error?: string }).error).toBe('缺少或无效的 API token');
+    await s.close();
+  });
+
+  // ⚠️ 这条是 2026-10-03 真机 401 事故的**直接反面**（high）：
+  //   守卫豁免只测了「错 token 仍由路由答 401」—— 那条在守卫**没**豁免时也一样会绿
+  //   （守卫自己就回 401，只有文案不同才区分得出来，而断言只查了 code）。
+  //   于是「守卫漏了某个地址」这种错**测不出来**：真机上 <img> 请求被守卫吞掉、路由压根没跑，
+  //   而全部单测绿。本条正面断言「**带正确 token 时守卫必须放行到路由**」——
+  //   素材 1 不存在 → 路由会答 404 NOT_FOUND（路由的文案），若守卫提前拦则是 401 守卫文案。
+  //   覆盖全部四个派生图地址：新增地址忘了加进豁免名单，这条立刻红。
+  it('派生图:守卫放行到路由——带正确 token 时得到路由的 404（素材不存在），不是守卫的 401', async () => {
+    const s = await createServer({ port: 7374, dbPath: ':memory:', tempDir: path.join(tmp(), 't22') });
+    for (const p of [
+      '/api/media/999/waveform',
+      '/api/media/999/filmstrip',
+      '/api/media/999/filmseg?level=1&seg=0',
+      '/api/media/999/filmseg?level=2&seg=3',
+      '/api/media/999/wavepeak?level=0',
+      '/api/media/999/wavepeak?level=1&seg=0',
+      '/api/media/999/wavepeak?level=2&seg=7',
+    ]) {
+      // ⚠️ 分隔符必须按「有没有已有 query」选 `?` / `&`：拼成 `...seg=0?token=x` 时第二个 `?`
+      //   不是 query 分隔符，token 会粘进 seg 的值里 → 路由收到空 token → 401（写这条用例时真踩到过）。
+      const url = `http://127.0.0.1:${s.port}${p}${p.includes('?') ? '&' : '?'}token=${s.token}`;
+      const res = await fetch(url);
+      expect(`${p} → ${res.status}`).toBe(`${p} → 404`);
+      const body = (await res.json()) as { error?: { code?: string } };
+      expect(`${p} code=${body.error?.code}`).toBe(`${p} code=NOT_FOUND`);
+    }
     await s.close();
   });
 });
