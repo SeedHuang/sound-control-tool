@@ -260,6 +260,17 @@ describe('createServer(D12 API token)', () => {
     }
     await s.close();
   });
+
+  // 成品波形（音频播放器 Task 2）:与新豁免名单同款正面护栏 —— 新地址忘了加进守卫豁免时这条立刻红。
+  // 带正确 query token、无 header、无 Origin，守卫须放行到路由；音频 1 不存在 → 路由 404 NOT_FOUND，而非守卫 401。
+  it('成品波形:守卫放行到路由——GET /api/audio/1/wavepeak 带正确 query token、无 header/无 Origin → 路由 404（音频不存在），非守卫 401', async () => {
+    const s = await createServer({ port: 7375, dbPath: ':memory:', tempDir: path.join(tmp(), 't23') });
+    const res = await fetch(`http://127.0.0.1:${s.port}/api/audio/1/wavepeak?token=${s.token}`);
+    expect(res.status).toBe(404);
+    const body = (await res.json()) as { error?: { code?: string } };
+    expect(body.error?.code).toBe('NOT_FOUND');
+    await s.close();
+  });
 });
 
 describe('createServer(下载队列兜底)', () => {

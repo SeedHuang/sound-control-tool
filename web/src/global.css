@@ -1,5 +1,118 @@
 /* web/src/global.css
-   2026-09-29:剪辑室「剧集分组」卡片墙的动效。
+   2026-10-07 CP2077 全站改造:新增令牌、字体、扫描线、滚动条、antd 浮层方角化。
+   原有「卡片墙动效」段完整保留(见文件下半部分),本文件同时承担全局样式与动效两职。
+   切角几何的唯一真相源是下面的 --cyber-clip(替代参照项目 system-c-cleaner 的 less 变量 @cyberClip)。 */
+
+/* CP2077 切角几何:左上 + 右下双切角(对应 Figma 卡片造型) */
+:root {
+  --cyber-clip: polygon(12px 0, 100% 0, 100% calc(100% - 12px), calc(100% - 12px) 100%, 0 100%, 0 12px);
+}
+
+/* Rajdhani(OFL 许可,本地打包,离线可用;参照项目同款字体文件)。
+   注意:中文字形不在 Rajdhani 内,由回退栈(Microsoft YaHei / PingFang SC)接管 */
+@font-face {
+  font-family: 'Rajdhani';
+  src: url('./assets/fonts/Rajdhani-Light.ttf') format('truetype');
+  font-weight: 300;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Rajdhani';
+  src: url('./assets/fonts/Rajdhani-Regular.ttf') format('truetype');
+  font-weight: 400;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Rajdhani';
+  src: url('./assets/fonts/Rajdhani-Medium.ttf') format('truetype');
+  font-weight: 500;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Rajdhani';
+  src: url('./assets/fonts/Rajdhani-SemiBold.ttf') format('truetype');
+  font-weight: 600;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Rajdhani';
+  src: url('./assets/fonts/Rajdhani-Bold.ttf') format('truetype');
+  font-weight: 700;
+  font-display: swap;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+body {
+  margin: 0;
+  background: #0e0e17;
+  color: #f0f0f0;
+}
+
+/* 滚动条:方形深灰,hover 红 */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-thumb {
+  background: #2a2a38;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #f75049;
+}
+
+/* 扫描线覆盖层:挂在布局根 .cyber-app 上。pointer-events:none 保证不遮挡交互 */
+.cyber-app {
+  position: relative;
+}
+.cyber-app::after {
+  content: '';
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 9999;
+  background: repeating-linear-gradient(transparent 0 3px, rgba(255, 255, 255, 0.015) 3px 4px);
+}
+
+/* antd 浮层方角化(主题 token 覆盖不到浮层内容盒) */
+.ant-modal .ant-modal-content,
+.ant-modal .ant-modal-header,
+.ant-dropdown-menu,
+.ant-select-dropdown,
+.ant-popover .ant-popover-inner,
+.ant-message-notice-content,
+.ant-tooltip-inner,
+.ant-picker-dropdown .ant-picker-panel-container {
+  border-radius: 0 !important;
+}
+
+/* ---------- 顶栏横向导航(CP2077:选中项红切角) ---------- */
+.cyber-topnav.ant-menu {
+  background: transparent;
+  border-bottom: none;
+}
+.cyber-topnav.ant-menu-horizontal > .ant-menu-item {
+  border-radius: 0;
+}
+.cyber-topnav.ant-menu-horizontal > .ant-menu-item::after {
+  display: none !important;
+}
+.cyber-topnav.ant-menu-horizontal > .ant-menu-item-selected {
+  background: rgba(247, 80, 73, 0.9) !important;
+  clip-path: var(--cyber-clip);
+  color: #fff !important;
+}
+.cyber-topnav-icon.ant-btn {
+  border-radius: 0;
+}
+.cyber-topnav-icon.ant-btn:hover {
+  background: rgba(247, 80, 73, 0.08) !important;
+}
+
+/* ===== 原有动效段(2026-09-29,剪辑室「剧集分组」卡片墙) — 原样保留 =====
    为什么单独开一个 CSS 文件:内联样式表达不了 :hover / :active / @media(不含伪类与媒体查询),
    而这个项目没有引入 styled-components(规则:用了就得单独开 sc.tsx),所以用最朴素的 CSS 类。
    动效口径(emil-design-eng):

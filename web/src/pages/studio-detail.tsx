@@ -22,15 +22,21 @@
 import { Alert, Button, Empty, Input, message, Modal, Progress, Radio, Space, Tag, Tooltip, Typography } from 'antd';
 import { ArrowLeftOutlined, CustomerServiceOutlined, DeleteOutlined, ExportOutlined, FolderOpenOutlined, PlusOutlined, SaveOutlined, StopOutlined } from '@ant-design/icons';
 import { useNavigate, useParams } from '@umijs/max';
-import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type PointerEvent as ReactPointerEvent } from 'react';
+// 「谁在播」的唯一真相 = 单例引擎（spec D4/D15）：顶栏「预览音频」按钮改走它，本页不再自持隐藏播放器与「谁在播」本地副本。
+import { getSnapshot, stop, subscribe, toggle } from '@/audio-player';
+import CyberAudioPlayer from '@/components/CyberAudioPlayer';
 import PageHeader from '@/components/PageHeader';
 import {
-  ApiError, audioFileUrl, deleteAudio, exportWork, filmSegUrl, filmstripUrl, getImport, getSettings, getWork, listMedia,
+  ApiError, audioFileUrl, deleteAudio, exportWork, filmSegUrl, filmstripUrl, getImport, getWork, listMedia,
   listProducts, logFe, mediaFileUrl, putWork, subscribeJob, type AudioRow, type ImportDetail, type WorkDetailDTO,
 } from '@/api';
 import TimelineWave, { FILM_SHEET_W, LEVEL1_MIN_DURATION_SEC, LEVEL2_MIN_DURATION_SEC, LEVEL_SPAN_SEC, segsFor } from '@/components/TimelineWave';
 import { hasDesktopBridge } from '@/desktop';
+import OpenFileDirButton from '@/components/OpenFileDirButton';
 import { openExportDir } from '@/export-dir';
+import { cyberColors, cyberFontStack } from '@/setup/theme';
+import { CyberCard, CyberButton, SectionTitle } from '@/components/cyber';
 
 const IMG_W = 1600;   // 派生图固定宽（D14，服务端按 1600 生成）；此处只当 ResizeObserver 还没量到宽时的兜底
 // ⚠️ 下面两个是**原图像素高**（服务端固定 1600×120 / 1600×90，见 server/src/ffmpeg/derived-args.ts），
@@ -73,26 +79,27 @@ export default function StudioDetailPage() {
 
   // —— 保存/导出接线状态 ——
   const [dirty, setDirty] = useState(false);           // 有未保存改动（离开前提示的依据）
-  const [saveMsg, setSaveMsg] = useState<string | null>(null);
   const [exportMode, setExportMode] = useState<'separate' | 'merge'>('separate');
   const [exportFormat, setExportFormat] = useState<'mp3' | 'm4a' | 'wav'>('mp3');
   // 导出内容三选(2026-10-02 N1 spec D5.1):audio=现状音频;video=视频带音轨;videoAn=视频纯视频。缺省 audio = 音频老路径零回归。
   // exportFormat 刻意是独立 state:切到视频时格式 Radio 隐藏(服务端固定 mp4),切回音频恢复且**保留上次选中值**(不重置)
   const [exportKind, setExportKind] = useState<'audio' | 'video' | 'videoAn'>('audio');
   const [exportPercent, setExportPercent] = useState(0); // job 的 progress 百分比（导出进度条）
-  const [exportMsg, setExportMsg] = useState<string | null>(null);
   const [exporting, setExporting] = useState(false);
+  // 保存/导出的成败反馈**一律走 message toast**（2026-10-07 用户要求）：原来用内嵌 Alert 常驻在设置区，
+  //   占掉一整条、看完也不消失；toast 自动退场。故不再有 saveMsg / exportMsg / exportDir 三个 state。
+  //   「导出到哪了」也不再靠常驻绿条回答 —— 改由成品行的 📂 图标 hover 出**该文件**的完整路径（比一个全局目录更准）。
 
   // —— 工具栏图标化/打开导出目录状态（spec D7/D9/D10/D13）——
   const [saving, setSaving] = useState(false);        // 「保存」按钮 loading：防连点重复 PUT（不改按钮 disabled 语义）
-  const [openingDir, setOpeningDir] = useState(false); // 「打开导出目录」loading：工具栏 📂 与成功绿条按钮**共用**
-  const [exportDir, setExportDir] = useState('');      // output_dir_resolved：绿条展示「导到哪了」（服务端算好的绝对路径）
+  const [openingDir, setOpeningDir] = useState(false); // 「打开导出目录」loading：工具栏 📂（绿条里的按钮已随 Alert 一并去掉）
 
   // —— 成品明细（D16/D17：GET /api/audio?project=<作品id>）——
   const [products, setProducts] = useState<AudioRow[]>([]);
   const [productsErr, setProductsErr] = useState<string | null>(null); // 拉取失败要**看得见**，否则空列表会被误读成「没有成品」
-  const [previewingId, setPreviewingId] = useState<number | null>(null); // 正在试听的成品 id（顶栏「预览音频」按钮）
-  const previewAudioRef = useRef<HTMLAudioElement | null>(null);
+  // 「谁在播」唯一真相 = 单例引擎（spec D4/D15）：删掉本页隐藏的播放器元素与「谁在播」本地副本，
+  // 只读引擎快照 —— 顶栏按钮与列表行共用同一实例，本地副本必然漂移。
+  const player = useSyncExternalStore(subscribe, getSnapshot);
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const trackRef = useRef<HTMLDivElement | null>(null);
@@ -305,14 +312,8 @@ export default function StudioDetailPage() {
       });
   }, [importId]);
 
-  // 挂载时取一次导出目录（spec D13）：绿条要展示「导到哪了」，而前端不知道数据目录，只能问服务端算好的 output_dir_resolved。
-  // 用户可能在别处改了设置，故导出完成时（onDone）再刷一次。
-  useEffect(() => {
-    if (!validId) return;
-    getSettings()
-      .then((s) => setExportDir(s.output_dir_resolved ?? ''))
-      .catch((e: unknown) => logFe('error', `读取导出目录失败: ${e instanceof Error ? e.message : String(e)}`));
-  }, [projectId, validId]);
+  // （原「挂载时取一次导出目录给绿条看」的 useEffect 已删，2026-10-07：绿条改 message toast 后不再展示目录，
+  //   该请求的唯一消费者没了；连带 getSettings 在本文件也不再被使用。）
 
   // 离开未保存提示（覆盖刷新/关闭）：SPA 内导航（返回按钮）不走 beforeunload，故「返回」另用 goBack 拦。
   useEffect(() => {
@@ -328,7 +329,6 @@ export default function StudioDetailPage() {
   const doSave = async (): Promise<void> => {
     if (saving) return; // 连点守卫：第二次进来直接返回（loading 已亮，避免重复 PUT 打架）
     setSaving(true);
-    setSaveMsg(null);
     try {
       const trimmed = nameDraft.trim();
       const r = await putWork(projectId, { name: trimmed === '' ? null : trimmed, segments });
@@ -336,9 +336,9 @@ export default function StudioDetailPage() {
       setNameDraft(r.name ?? ''); // 回填服务端定稿（去空白 / 空名 → null），输入框与库里一致
       setWork((prev) => (prev === null ? prev : { ...prev, name: r.name, updated_at: r.updated_at, segments: r.segments }));
       setDirty(false);
-      setSaveMsg('已保存');
+      message.success('已保存');
     } catch (e) {
-      setSaveMsg(`保存失败：${(e as Error).message}`); // 失败给用户可见文字（apiPut 内部已 logFe）
+      message.error(`保存失败：${(e as Error).message}`, 6); // 失败给用户可见文字（apiPut 内部已 logFe）；6 秒：默认 3 秒对看清失败原因太短
     } finally {
       setSaving(false); // 无论成败都复位，否则按钮永久 loading
     }
@@ -347,8 +347,8 @@ export default function StudioDetailPage() {
   // 导出 = 以**当前界面上的段**为准（D15：不读 DB 作品、不自动保存）；进度走 SSE，终态只发一次 done（C-2）。
   // N1(spec D5.2):导出内容按 exportKind 透传——音频走既有 mp3/m4a/wav;视频恒 mp4(mediaKind='video',videoAn 标记纯视频)
   const doExport = async (): Promise<void> => {
-    if (segments.length === 0) { setExportMsg('先添加至少一个剪辑段'); return; }
-    setExporting(true); setExportPercent(0); setExportMsg(null);
+    if (segments.length === 0) { message.warning('先添加至少一个剪辑段'); return; }
+    setExporting(true); setExportPercent(0);
     try {
       const { jobId } = await exportWork(projectId, {
         mode: exportMode,
@@ -357,45 +357,48 @@ export default function StudioDetailPage() {
         videoAn: exportKind === 'videoAn',
         segments,
       });
+      // 终态只播一条 toast：onDone 与 onStatus(done) 都可能到达（服务端对「订阅前已终态」的补发分支）。
+      //   原来靠 exportMsg 的 prev ?? 去重，现在 message 没有「上一条」可比 → 用闭包标记。
+      let announced = false;
       // subscribeJob 在 status=error/cancelled 时也会回调 onError 兜底，故 onStatus 与 onError 都可能触发；
       //   两处都 off() 关流——重复 close 一个 EventSource 是幂等的，无害。
       const off = subscribeJob(jobId, {
         onProgress: (p) => setExportPercent(Math.round(p.percent)),
         onDone: (d) => {
-          off(); setExporting(false);
+          off(); setExporting(false); announced = true;
           // C-2：separate 多段时终态只发一次 done，带 count → 提示「N 段」，否则笼统提示。
           // N1(spec D5.2):视频导出的 done 也带 count(字段名 audioId 保留 = 成品行 id)→ 判据只看 count,kind 无关
           const n = typeof d.count === 'number' ? d.count : null;
-          // D13：主文案只说段数，不提「剪辑室」——那是下面那句固定说明的措辞，主文案若也提会与之重复、拗口
-          setExportMsg(n !== null ? `已导出 ${n} 段` : '已导出');
+          // D13「导出到哪了」不再靠常驻绿条回答（2026-10-07 改 toast）→ 成品行的 📂 图标 hover 出**该文件**完整路径
+          message.success(n !== null ? `已导出 ${n} 段` : '已导出');
           // 成品明细是**这一页**的产出，出口在这里（作品墙不再承担试听/单条删除，D14/D16）→ 导出完立刻重拉，
           //   否则用户导完还得手动刷新才看得到新成品。
           loadProducts();
-          // 导出完成时刷一次目录：用户可能在别处改了设置，绿条要展示最新落盘位置。
-          // 失败仍保留旧值（background 刷新，弹错会吵用户），但**必须留痕**——静默 catch 违反日志铁律，出问题时无从排查。
-          void getSettings()
-            .then((s) => setExportDir(s.output_dir_resolved ?? ''))
-            .catch((e: unknown) => logFe('error', `导出完成后刷新导出目录失败: ${e instanceof Error ? e.message : String(e)}`));
         },
         // 竞态兜底：服务端对「订阅前已终态」的 job 走补发分支——只发 status{state:'done'}，不发 done 事件
         //   （server/src/ytdlp/ytdlp-routes.ts 的 SSE 路由里那段「已结束的 job 立即补发终态」；找法：搜
         //   `['done', 'error', 'cancelled'].includes(job.status)`，行号会漂移所以不写死）；而 subscribeJob 对
         //   state==='done' 只 es.close()、不回调 onDone（web/src/api.ts 的 subscribeJob）。
-        //   若这里只认 error，此路径下既不复位 exporting 也无成功文案 → 导出按钮永久 loading。
-        //   故补 done 分支复位；用函数式更新 prev ?? … 保证正常路径 onDone 先写的文案不被降级成笼统文案。
+        //   若这里只认 error，此路径下既不复位 exporting 也无成功反馈 → 导出按钮永久 loading。
+        //   故补 done 分支复位；announced 已置位就不重复弹（正常路径 onDone 先弹过 N 段）。
         onStatus: (s) => {
-          if (s.state === 'error') { off(); setExporting(false); setExportMsg(`导出失败：${s.message ?? ''}`); }
-          else if (s.state === 'done') { off(); setExporting(false); setExportMsg((prev) => prev ?? '已导出'); loadProducts(); }
+          // 失败给了 6 秒（默认 3 秒对「要看清失败原因」太短）；成功态用默认值
+          if (s.state === 'error') { off(); setExporting(false); message.error(`导出失败：${s.message ?? ''}`, 6); }
+          else if (s.state === 'done') {
+            off(); setExporting(false);
+            if (!announced) { announced = true; message.success('已导出'); }
+            loadProducts();
+          }
         },
-        onError: (m) => { off(); setExporting(false); setExportMsg(`导出失败：${m}`); },
+        onError: (m) => { off(); setExporting(false); message.error(`导出失败：${m}`, 6); },
       });
     } catch (e) {
       setExporting(false);
-      setExportMsg(`导出失败：${(e as Error).message}`); // 失败给用户可见文字（apiPost 内部已 logFe）
+      message.error(`导出失败：${(e as Error).message}`, 6); // 失败给用户可见文字（apiPost 内部已 logFe）
     }
   };
 
-  // 打开导出目录：工具栏 📂 与导出成功绿条里的按钮**共用同一个动作**（spec D7/D8/D11）；
+  // 打开导出目录：工具栏 📂（spec D7/D8/D11，绿条里的那按钮已随 Alert 去掉）；
   //   openExportDir 内部已完成「无桥降级 / 取目录 / 调系统打开 / logFe」，这里只负责 loading 与用户可见反馈。
   const onOpenExportDir = async (): Promise<void> => {
     setOpeningDir(true);
@@ -419,7 +422,7 @@ export default function StudioDetailPage() {
       onOk: async () => {
         try {
           const r = await deleteAudio(it.id);
-          if (previewingId === it.id) stopPreview();
+          if (player.audioId === it.id) stopPreview(); // 正在播的就是这条 → 停掉（判据来自引擎，不再用本地副本）
           setProducts((prev) => prev.filter((x) => x.id !== it.id)); // 本地移除,不必再拉一次列表
           logFe('info', `删除成品 id=${it.id} deleted=${r.deleted}`);
         } catch (e) {
@@ -809,29 +812,28 @@ export default function StudioDetailPage() {
   // N1(spec D5.3):按钮语义就是"听" → 只数**音频**成品(视频成品不参与);作品只导出过视频时禁用并指向下方列表(视频行可直接播)
   const audioProducts = products.filter((p) => (p.media_kind ?? 'audio') === 'audio');
   const latestProduct = audioProducts[0] ?? null;
-  const previewing = previewingId === null ? null : (products.find((p) => p.id === previewingId) ?? null);
+  // 「正在试听哪条」由引擎派生：引擎的 audioId 命中最新音频成品且正在播 → 显示它；否则无。
+  const previewing = player.audioId === latestProduct?.id && player.playing ? latestProduct : null;
   const previewTip = productsErr !== null
     ? '成品列表读取失败，暂时无法试听'
     : (latestProduct !== null
       ? '试听最新一条成品'
       : (products.length > 0 ? '这个作品只导出过视频，可在下方成品列表直接播放' : '这个作品还没有导出过成品'));
-  const stopPreview = (): void => {
-    const el = previewAudioRef.current;
-    if (el !== null) el.pause();
-    setPreviewingId(null);
-  };
+  const stopPreview = (): void => { stop(); };
   const onPreviewAudio = (): void => {
-    const el = previewAudioRef.current;
     const p = latestProduct;
-    if (el === null || p === null) return;
-    el.src = audioFileUrl(p.id); // 换 src 自动从头播
-    setPreviewingId(p.id);
+    if (p === null) return;
+    toggle(p.id, audioFileUrl(p.id)); // 引擎单实例：同 id 再点即暂停 / 切歌先停旧（spec D4）
     logFe('info', `预览成品音频 id=${p.id} 标题=${p.title}`);
-    void el.play().catch((e: unknown) => {
-      const m = e instanceof Error ? e.message : String(e);
-      logFe('error', `预览成品音频起播失败 id=${p.id}: ${m}`);
-      setPreviewingId(null);
-      message.error(`播放失败：${m}`); // 失败给用户可见文字
+    // 失败可见（终审修复 ①）：起播是异步的（play() 的 Promise），失败写进引擎 state.error，同步 try/catch 抓不到。
+    // 故订阅引擎：本 id 一旦置 error 就弹一条用户可见提示并解绑（与日志并存）；起播成功或被切走也解绑，不泄漏订阅。
+    const off = subscribe(() => {
+      const s = getSnapshot();
+      if (s.audioId !== p.id || s.playing) { off(); return; } // 已切走 / 已起播成功 → 无需提示
+      if (s.error !== null) {
+        message.error(`${s.error}，可在日志页查看原因`);
+        off();
+      }
     });
   };
 
@@ -872,17 +874,17 @@ export default function StudioDetailPage() {
   // —— 整页错误 / 作品已删：给可见文字 + 出口（作品被删时页内已无任何可用操作，必须给回剪辑室的路）——
   if (err !== null) {
     return (
-      <div style={{ padding: 16, display: 'flex', alignItems: 'center', gap: 12 }}>
+      <div style={{ padding: 16, display: 'flex', alignItems: 'center', gap: 12, background: cyberColors.bgLayout }}>
         <Typography.Text type="danger">{err}</Typography.Text>
-        <Button onClick={goBack}>返回剪辑室</Button>
+        <CyberButton onClick={goBack}>返回剪辑室</CyberButton>
       </div>
     );
   }
   if (workMissing) {
     return (
-      <div style={{ padding: 16, display: 'flex', alignItems: 'center', gap: 12 }}>
+      <div style={{ padding: 16, display: 'flex', alignItems: 'center', gap: 12, background: cyberColors.bgLayout }}>
         <Typography.Text type="danger">作品不存在（可能已被删除）</Typography.Text>
-        <Button onClick={() => navigate('/studio')}>返回剪辑室</Button>
+        <CyberButton onClick={() => navigate('/studio')}>返回剪辑室</CyberButton>
       </div>
     );
   }
@@ -918,9 +920,9 @@ export default function StudioDetailPage() {
   const epText = info !== null && Number.isInteger(info.material_entry_index) ? `第 ${info.material_entry_index} 集` : undefined;
 
   return (
-    <div style={{ height: '100%', minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+    <div style={{ height: '100%', minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden', background: cyberColors.bgLayout }}>
       <PageHeader
-        title={info?.title ?? `作品 #${projectIdRaw ?? '?'}`}
+        title={<span style={{ fontFamily: cyberFontStack }}>{info?.title ?? `作品 #${projectIdRaw ?? '?'}`}</span>}
         meta={epText}
         toolbar={(
           <>
@@ -937,17 +939,18 @@ export default function StudioDetailPage() {
               disabled={readOnly}
               style={{ width: 220 }}
             />
-            {/* spec D9/D10：工具栏全部换纯图标，每个都挂中文 Tooltip；只加图标/提示/loading，不改任何 disabled/onClick 语义 */}
-            <Tooltip title={readOnlyMsg ?? (saveMsg !== null && saveMsg.startsWith('保存失败') ? saveMsg : '保存剪辑点')}>
+            {/* spec D9/D10：工具栏全部换纯图标，每个都挂中文 Tooltip；只加图标/提示/loading，不改任何 disabled/onClick 语义。
+                原来提示里会带「保存失败：…」全文，现在失败走 message toast（常驻 tooltip 会一直被那句失败文案占着）。 */}
+            <Tooltip title={readOnlyMsg ?? '保存剪辑点'}>
               {/* 禁用态包一层 span，否则 antd Tooltip 收不到鼠标事件、悬停不出提示（D9 要求提示可查） */}
               <span>
-                <Button type="primary" icon={<SaveOutlined />} loading={saving} disabled={readOnly} onClick={() => void doSave()} />
+                <CyberButton type="primary" icon={<SaveOutlined />} loading={saving} disabled={readOnly} onClick={() => void doSave()} />
               </span>
             </Tooltip>
             {/* N1:导出内容已不止音频(导出区可选视频),固定文案去掉"音频"二字;「以当前界面上的段为准」保留(D15 语义) */}
             <Tooltip title={readOnlyMsg ?? '导出（以当前界面上的段为准）'}>
               <span>
-                <Button icon={<ExportOutlined />} loading={exporting} disabled={readOnly} onClick={() => void doExport()} />
+                <CyberButton icon={<ExportOutlined />} loading={exporting} disabled={readOnly} onClick={() => void doExport()} />
               </span>
             </Tooltip>
             {/* 「打点」是本地编辑的入口，保留（计划工具栏清单漏列了它——去掉就无法新增段，与编辑页功能冲突）。
@@ -956,13 +959,13 @@ export default function StudioDetailPage() {
             <Tooltip title={readOnlyMsg ?? (duration <= 0 ? '视频还没加载出时长，无法打点' : segments.length >= MAX_SEGMENTS ? `最多 ${MAX_SEGMENTS} 段，先删一段` : '在当前播放头打点')}>
               {/* 禁用态必须包一层 span，否则 antd Tooltip 收不到鼠标事件、悬停不出提示（D9 要求提示可查） */}
               <span>
-                <Button icon={<PlusOutlined />} disabled={readOnly || duration <= 0 || segments.length >= MAX_SEGMENTS} onClick={addSegment} />
+                <CyberButton icon={<PlusOutlined />} disabled={readOnly || duration <= 0 || segments.length >= MAX_SEGMENTS} onClick={addSegment} />
               </span>
             </Tooltip>
             {/* 「预览音频」（D16）：试听这个作品最新一条成品；只读态下**仍可用**（成品不依赖素材） */}
             <Tooltip title={previewTip}>
               <span>
-                <Button icon={<CustomerServiceOutlined />} disabled={latestProduct === null || productsErr !== null} onClick={onPreviewAudio} />
+                <CyberButton icon={<CustomerServiceOutlined />} disabled={latestProduct === null || productsErr !== null} onClick={onPreviewAudio} />
               </span>
             </Tooltip>
             {previewing !== null && (
@@ -972,25 +975,33 @@ export default function StudioDetailPage() {
               </>
             )}
             {/* D8：无桥（浏览器直连模式）时禁用，且 Tooltip 要看得出「为什么点不了」——静默无反应比禁用更糟，用户会以为坏了；
-                故文案随 hasDesktopBridge() 切换，与绿条那颗按钮（见下方 exportMsg Alert 的 action）保持一致 */}
+                故文案随 hasDesktopBridge() 切换，与成品行的 📂 保持一致口径（那颗原在绿条 action 里，2026-10-07 绿条改 toast 后撤掉） */}
             <Tooltip title={hasDesktopBridge() ? '打开导出目录' : '仅桌面应用内可用'}>
               {/* 无桥禁用；包 span 让禁用态也能悬停（antd Tooltip 对 disabled 元素不触发鼠标事件） */}
               <span>
-                <Button icon={<FolderOpenOutlined />} loading={openingDir} disabled={!hasDesktopBridge()} onClick={() => void onOpenExportDir()} />
+                <CyberButton icon={<FolderOpenOutlined />} loading={openingDir} disabled={!hasDesktopBridge()} onClick={() => void onOpenExportDir()} />
               </span>
             </Tooltip>
             <Tooltip title={readOnlyMsg ?? '清空所有剪辑点'}>
               <span>
-                <Button danger icon={<DeleteOutlined />} disabled={readOnly || segments.length === 0} onClick={clearAll} />
+                <CyberButton variant="red" icon={<DeleteOutlined />} disabled={readOnly || segments.length === 0} onClick={clearAll} />
               </span>
             </Tooltip>
             <Tooltip title="返回剪辑室">
-              <Button icon={<ArrowLeftOutlined />} onClick={goBack} />
+              <CyberButton icon={<ArrowLeftOutlined />} onClick={goBack} />
             </Tooltip>
           </>
         )}
       />
-      <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: 16, display: 'flex', flexDirection: 'column', gap: 12 }}>
+      {/* scrollbarGutter:'stable' —— 让滚动条**永久预占**那 8px，本容器的可用宽度不再随「有没有滚动条」变化。
+          2026-10-07 修「点保存后整个内容区抖动」：本容器里有好几处**高度由宽度决定**的东西
+          （预览 <video> 的宽高比高度、waveH/filmH 按量到的宽度等比算、长文案换行、flexWrap 行折行），
+          而 trackW 又由 ResizeObserver 量**本容器内**的元素得来 —— 于是
+          「滚动条出现 ⇄ 宽度 −8px ⇄ 内容高度变小 ⇄ 又不溢出 ⇄ 滚动条消失」构成自激环。
+          保存成功后多出一条 Alert 把内容顶到溢出临界点，环就被点着、整个内容区来回抖。
+          预留 gutter 让宽度恒定 = 掐断环的输入。
+          ⚠️ 别删：删了抖动会复现。（全站另有 7 处同款滚动容器，也都加了它 —— 同一个坑。） */}
+      <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', scrollbarGutter: 'stable', padding: 16, display: 'flex', flexDirection: 'column', gap: 12 }}>
         {/* 只读态黄条（D16）：说清「为什么不能编辑」+「还能干什么」；成品明细在下面照常可用。
             触发源只有两个**服务端确认的事实**（资料 404 / 没有素材行），不含 <video> 加载失败。 */}
         {readOnlyMsg !== null && (
@@ -1043,7 +1054,7 @@ export default function StudioDetailPage() {
                 logFe('error', `视频素材加载失败 import=${importId} project=${projectId} mediaErrCode=${code ?? '(none)'} retry=${videoNonce}`);
               }}
               onTimeUpdate={(e) => setCurrent(e.currentTarget.currentTime)}
-              style={{ width: '100%', maxWidth: 720, background: '#000', borderRadius: 8, alignSelf: 'center' }}
+              style={{ width: '100%', maxWidth: 720, background: '#000', borderRadius: 0, alignSelf: 'center' }}
             />
 
             {/* Spec B：缩放档位（离散三档，spec D3 明确不做无级平滑缩放）。
@@ -1077,7 +1088,7 @@ export default function StudioDetailPage() {
                     同源教训：N0 修掉的「时长未知却画出一张标准尺寸的正常图」。 */}
                 <div style={{ position: 'relative', height: RULER_H }}>
                   {Array.from({ length: duration > 0 ? 11 : 0 }, (_v, i) => windowStart + (levelSpan * i) / 10).map((t, i) => (
-                    <span key={i} style={{ position: 'absolute', left: `${timeToPct(t)}%`, fontSize: 11, color: '#999', transform: 'translateX(-50%)' }}>{fmtTime(t)}</span>
+                    <span key={i} style={{ position: 'absolute', left: `${timeToPct(t)}%`, fontSize: 11, color: cyberColors.textMuted, fontFamily: cyberFontStack, transform: 'translateX(-50%)' }}>{fmtTime(t)}</span>
                   ))}
                 </div>
                 {/* 画轨：L0 = 整片一张（URL 与文件名都不变，向后兼容）；L1/L2 = 按可视窗口取段。
@@ -1087,7 +1098,7 @@ export default function StudioDetailPage() {
                     记日志够用；现在 L1/L2 有了斜纹+重试，L0 却没有 → 同一份代码两套失败反馈，用户切回全片
                     只看到一条空黑轨道，连「生成失败」四个字都没有。**失败必须看得见**（spec D5 诚实原则）。 */}
                 {level === 0 ? (
-                  <div style={{ position: 'relative', width: '100%', height: filmH, background: '#111' }}>
+                  <div style={{ position: 'relative', width: '100%', height: filmH, background: cyberColors.bgLayout }}>
                     <img
                       src={filmstripUrl(importId, `${version}-f${filmNonceBySeg.L0 ?? 0}`)}
                       alt="画轨"
@@ -1100,7 +1111,7 @@ export default function StudioDetailPage() {
                         setFilmFailed((p) => ({ ...p, L0: true }));
                         logFe('error', `胶片条加载失败 import=${importId}`);
                       }}
-                      style={{ display: 'block', width: '100%', height: filmH, objectFit: 'contain', background: '#111' }}
+                      style={{ display: 'block', width: '100%', height: filmH, objectFit: 'contain', background: cyberColors.bgLayout }}
                     />
                     {/* L0 失败占位：事件/z-index 与段图占位同款（理由见那里注释①②③）。
                         段键复用 'L0' → 换素材时的清空、以及 filmReady 的判定都无需为它另开一套。 */}
@@ -1128,7 +1139,7 @@ export default function StudioDetailPage() {
                     )}
                   </div>
                 ) : (
-                  <div style={{ position: 'relative', width: '100%', height: filmH, background: '#111', overflow: 'hidden' }}>
+                  <div style={{ position: 'relative', width: '100%', height: filmH, background: cyberColors.bgLayout, overflow: 'hidden' }}>
                     {/* 段图各自按「段起点 - 窗口起点」定位、按段**实际跨度**定宽 —— 段与段之间不留缝也不重叠。
                         objectFit:'fill'：宽度已经按时间比例算好了，再用 contain 会因为原图比例不同而缩出缝。 */}
                     {visibleSegs.map((seg) => {
@@ -1236,15 +1247,15 @@ export default function StudioDetailPage() {
                       style={{
                         position: 'absolute', top: RULER_H, height: filmH + waveH,
                         left: `${timeToPct(visStart)}%`, width: `${((visEnd - visStart) / levelSpan) * 100}%`,
-                        background: 'rgba(22,119,255,0.20)', boxSizing: 'border-box',
-                        border: selected === i ? '2px solid #1677ff' : '1px solid rgba(22,119,255,0.6)',
+                        background: selected === i ? cyberColors.redSoft : cyberColors.cyanSoft, boxSizing: 'border-box',
+                        border: selected === i ? `2px solid ${cyberColors.borderRed}` : `1px solid ${cyberColors.borderCyan}`,
                       }}
                     >
                       {/* 左右 8px 拖柄：按住改起止（区域①，pointerdown 已 stopPropagation，不与定位抢）。
                           只在**段真实端点落在窗口内**时才画 —— 段被窗口裁掉一头时，那个拖柄不在视口里，
                           画在裁剪边界上会让人以为拖柄在段的中间（拖起来才发现改的是别处）。 */}
-                      {visStart === s.start_sec && <div onPointerDown={dragEdge(i, 'start')} style={{ position: 'absolute', left: 0, top: 0, width: 8, height: '100%', cursor: 'ew-resize' }} />}
-                      {visEnd === s.end_sec && <div onPointerDown={dragEdge(i, 'end')} style={{ position: 'absolute', right: 0, top: 0, width: 8, height: '100%', cursor: 'ew-resize' }} />}
+                      {visStart === s.start_sec && <div onPointerDown={dragEdge(i, 'start')} style={{ position: 'absolute', left: 0, top: 0, width: 8, height: '100%', background: cyberColors.cyan, cursor: 'ew-resize' }} />}
+                      {visEnd === s.end_sec && <div onPointerDown={dragEdge(i, 'end')} style={{ position: 'absolute', right: 0, top: 0, width: 8, height: '100%', background: cyberColors.cyan, cursor: 'ew-resize' }} />}
                     </div>
                   );
                 })}
@@ -1252,7 +1263,7 @@ export default function StudioDetailPage() {
                     Spec B：位置按窗口换算；播放头在**窗口外**时不画 —— 换算出来是负百分比或 >100%，
                     画出来就是一条贴在容器边上、骗人的假红线。 */}
                 {duration > 0 && current >= windowStart && current <= windowStart + levelSpan && (
-                  <div style={{ position: 'absolute', top: 0, left: `${timeToPct(current)}%`, width: 2, height: RULER_H + filmH + waveH, background: '#ff4d4f', pointerEvents: 'none' }} />
+                  <div style={{ position: 'absolute', top: 0, left: `${timeToPct(current)}%`, width: 2, height: RULER_H + filmH + waveH, background: cyberColors.red, pointerEvents: 'none' }} />
                 )}
                 {/* 生成中提示(W3/N0 复核遗留)：画轨还没结论就在轨道上给一行小字 —— 空轨道不说话用户只会以为坏了。
                     不做骨架屏(高度已预留)；覆盖层 pointerEvents none，不挡拖动定位；任一段失败即视为「有结论」，提示消失。
@@ -1260,13 +1271,18 @@ export default function StudioDetailPage() {
                     L1/L2 单段 3.38s，见下面按档位给秒数）；② 「错误只走日志」不再成立 —— 本轮给 L0 与 L1/L2 都补了
                     斜纹占位 + 重试，失败是**看得见且可恢复**的（spec D5 诚实原则）。 */}
                 {derivedLoading && (
-                  <div style={{ position: 'absolute', top: RULER_H, left: 0, width: '100%', height: filmH + waveH, display: 'flex', alignItems: 'center', justifyContent: 'center', pointerEvents: 'none' }}>
+                  /* ⚠️ 高度**必须跟着实际挂载的行**算（2026-10-07 修「提示文字压到下面的剪辑点列表上」）：
+                     下面的音轨是 `duration > 0` 才挂载的（见上方 TimelineWave 的守卫），而这里原来无脑加 waveH
+                     → 视频元数据还没就绪（duration 仍为 0）时，本层比轨道实际高度高出一整条音轨
+                     （L0 可达 120px），而轨道层没有裁剪 → 居中那行小字就溢出、画到下面的段列表上。
+                     同一 band 里的段区块 / 播放头都在 `duration > 0` 之下，唯独本层漏了这个一致性。 */
+                  <div style={{ position: 'absolute', top: RULER_H, left: 0, width: '100%', height: filmH + (duration > 0 ? waveH : 0), display: 'flex', alignItems: 'center', justifyContent: 'center', pointerEvents: 'none' }}>
                     {/* 文案只说画轨（2026-10-03 OCR 审查第 3 轮 low）：derivedLoading 现在只跟画轨，
                         波形有自己的加载态 —— 说「画轨/波形」会有一半是假的。
                         ⚠️ 秒数**按档位给**（第 4 轮 medium）：写死「10 秒」在 L0 对（实测 B1 = 10.29s），
                         但 L1/L2 是单段 12 格（实测 B2 = 3.38s）—— 切到中景后仍写「约需 10 秒」是把用户
                         的预期拉长 3 倍。数字取自实测报告 `.superpowers/sdd/2026-10-01-clip-works/ffmpeg-measure-report.md` §B 组。 */}
-                    <Typography.Text type="secondary" style={{ fontSize: 12, background: 'rgba(255,255,255,0.85)', padding: '2px 10px', borderRadius: 4 }}>
+                    <Typography.Text type="secondary" style={{ fontSize: 12, background: cyberColors.bgElevated, padding: '2px 10px', borderRadius: 0, fontFamily: cyberFontStack }}>
                       画轨生成中，大文件约需 {level === 0 ? 10 : 4} 秒…
                     </Typography.Text>
                   </div>
@@ -1286,15 +1302,15 @@ export default function StudioDetailPage() {
                 <div
                   key={i}
                   onClick={() => setSelected(i)}
-                  style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 8px', border: selected === i ? '1px solid #1677ff' : '1px solid #f0f0f0', borderRadius: 6 }}
+                  style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 8px', background: selected === i ? cyberColors.redSoft : 'transparent', border: selected === i ? `1px solid ${cyberColors.borderRed}` : `1px solid ${cyberColors.borderWhite}`, borderRadius: 0 }}
                 >
                   {/* 修复轮 1 Minor 5（deferred，理由见 task-9-report）：这排控件没挂 Tooltip ——
                       给 antd 禁用态控件补提示必须包一层 <span> 垫层，而这一行是 flex 布局，
                       插 span 会改变标签输入框/按钮的排布（属"段列表手感不要动"的范围），故不收。
                       顶部黄条已说明"为什么全灰"，不至于让用户摸不着头脑。 */}
-                  <Tag color="blue" style={{ marginInlineEnd: 0 }}>{i + 1}</Tag>
-                  <Typography.Text>{fmtTime(s.start_sec)} - {fmtTime(s.end_sec)}</Typography.Text>
-                  <Typography.Text type="secondary" style={{ fontSize: 12 }}>时长 {fmtTime(s.end_sec - s.start_sec)}</Typography.Text>
+                  <Tag color="blue" style={{ marginInlineEnd: 0, borderRadius: 0, fontFamily: cyberFontStack }}>{i + 1}</Tag>
+                  <Typography.Text style={{ fontFamily: cyberFontStack, color: cyberColors.cyan }}>{fmtTime(s.start_sec)} - {fmtTime(s.end_sec)}</Typography.Text>
+                  <Typography.Text type="secondary" style={{ fontSize: 12, fontFamily: cyberFontStack, color: cyberColors.cyan }}>时长 {fmtTime(s.end_sec - s.start_sec)}</Typography.Text>
                   <Input size="small" placeholder="标签（可空）" value={s.label ?? ''} maxLength={100} disabled={readOnly} onChange={(e) => setLabel(i, e.target.value)} style={{ maxWidth: 200 }} />
                   <Button size="small" onClick={() => moveSegment(i, -1)} disabled={readOnly || i === 0}>上移</Button>
                   <Button size="small" onClick={() => moveSegment(i, 1)} disabled={readOnly || i === segments.length - 1}>下移</Button>
@@ -1304,7 +1320,7 @@ export default function StudioDetailPage() {
             </div>
           )}
         {/* 导出设置（时间轴下方）：模式 + 格式 + 进度 + 结果提示（保存/导出成败都给可见文字） */}
-        <div style={{ border: '1px solid #f0f0f0', borderRadius: 6, padding: 12, display: 'flex', flexDirection: 'column', gap: 8 }}>
+        <CyberCard contentStyle={{ padding: 12, display: 'flex', flexDirection: 'column', gap: 8 }}>
           <Space wrap>
             <Typography.Text strong>导出</Typography.Text>
             {/* N1(spec D5.1):导出内容三选,标签样式同「导出」。选任一视频项 → 格式 Radio 隐藏(服务端固定 mp4);
@@ -1348,58 +1364,36 @@ export default function StudioDetailPage() {
             <Typography.Text type="secondary" style={{ fontSize: 12 }}>导出的是当前界面上的剪辑段，不会自动保存</Typography.Text>
           </Space>
           {exporting && <Progress percent={exportPercent} />}
-          {saveMsg !== null && <Alert type={saveMsg.startsWith('保存失败') ? 'error' : 'success'} message={saveMsg} showIcon />}
-          {exportMsg !== null && (
-            <Alert
-              type={exportMsg.startsWith('导出失败') ? 'error' : (exportMsg.startsWith('已导出') ? 'success' : 'warning')}
-              showIcon
-              /* 成功绿条（D13）：文案 = 「已导出 N 段」+ 目标目录绝对路径；右侧 action 里给「打开导出目录」按钮 */
-              message={(
-                <span>
-                  {exportMsg}
-                  {exportMsg.startsWith('已导出') && exportDir !== '' && (
-                    <Typography.Text type="secondary" style={{ fontSize: 12 }}>（{exportDir}）</Typography.Text>
-                  )}
-                  {/* D13 要求的固定一句：正面回答本切片存在的根因——用户「导出在哪、找不到」的焦虑；
-                      告诉他产物就在下面的「已导出的成品」里、可直接试听。仅成功态显示，失败/警告态不显示 */}
-                  {exportMsg.startsWith('已导出') && (
-                    <Typography.Text type="secondary" style={{ fontSize: 12 }}>文件已登记到本页下方的「已导出的成品」</Typography.Text>
-                  )}
-                </span>
-              )}
-              action={exportMsg.startsWith('已导出') ? (
-                /* 包 span 让禁用态（浏览器直连模式，D8）也能悬停出提示 */
-                <Tooltip title={hasDesktopBridge() ? '在资源管理器中打开' : '仅桌面应用内可用'}>
-                  <span>
-                    <Button size="small" loading={openingDir} disabled={!hasDesktopBridge()} onClick={() => void onOpenExportDir()}>
-                      打开导出目录
-                    </Button>
-                  </span>
-                </Tooltip>
-              ) : undefined}
-            />
-          )}
-        </div>
+          {/* 保存/导出的反馈已改 message toast（2026-10-07 用户要求），这里不再有常驻 Alert。
+              原绿条还兼着「打开导出目录」按钮 —— 该能力现在有两处入口：工具栏 📂 + 成品行的 📂
+              （后者 hover 出**该文件**的完整路径，比一个全局目录更能回答「这个文件在哪」）。 */}
+        </CyberCard>
 
         {/* 成品明细（D16/D17）：这一页的产出都在这儿 —— 试听 + 单条删除（作品墙不再承担，D14）。
             读的是 GET /api/audio?project=<作品id>，所以只含本作品的成品；导出成功后已重拉一次。 */}
-        <div style={{ border: '1px solid #f0f0f0', borderRadius: 6, padding: 12, display: 'flex', flexDirection: 'column', gap: 8 }}>
+        <CyberCard contentStyle={{ padding: 12, display: 'flex', flexDirection: 'column', gap: 8 }}>
           {/* 计数：拉取失败时不写数字（原来写 products.length 会显示「（0）」，读起来像"你确实没有成品"，真相是"没读到"） */}
-          <Typography.Text strong>{productsErr !== null ? '已导出的成品（数量未知）' : `已导出的成品（${products.length}）`}</Typography.Text>
+          <SectionTitle style={{ fontSize: 16 }}>{productsErr !== null ? '已导出的成品（数量未知）' : `已导出的成品（${products.length}）`}</SectionTitle>
           {productsErr !== null && <Alert type="error" showIcon message={`成品列表读取失败：${productsErr}`} />}
           {products.length === 0 && productsErr === null
             ? <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="这个作品还没有导出过成品" />
             : products.map((it) => (
               <div
                 key={it.id}
-                style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap', padding: '6px 8px', border: '1px solid #f0f0f0', borderRadius: 6 }}
+                style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap', padding: '6px 8px', background: cyberColors.bgLayout, border: `1px solid ${cyberColors.borderWhite}`, borderRadius: 0 }}
               >
-                <Typography.Text strong ellipsis={{ tooltip: it.title }} style={{ flex: '1 1 240px', minWidth: 0 }}>{it.title}</Typography.Text>
-                <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                  {/* 时长用 Number.isFinite 判（不是 !== null）：字段缺失/NaN 时也归到「时长未知」，
-                      免得渲染出「undefined 秒」——同款坑在 material_entry_index 上踩过（见上方 epText） */}
-                  {it.format} · {Number.isFinite(it.duration_sec) ? fmtTime(it.duration_sec as number) : '时长未知'}
-                </Typography.Text>
+                {/* 左侧一列（固定宽）：标题 + 格式·时长。两者同列 → 每行的「mp3 · 07:09」落在同一条竖线上。
+                    之前标签是行里一个独立的裸 flex 项、自己没有宽度，位置由标题的 grow 与播放器**按内容撑出的宽度**
+                    共同决定 → 跨行对不齐、还孤零零浮在中间（2026-10-07 用户反馈）。
+                    标题可截断；标签 flexShrink:0 + 右对齐到本列右缘，各行的时长右边缘也就齐了。 */}
+                <div style={{ flex: '0 0 340px', minWidth: 0, display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <Typography.Text strong ellipsis={{ tooltip: it.title }} style={{ flex: '1 1 auto', minWidth: 0 }}>{it.title}</Typography.Text>
+                  <Typography.Text type="secondary" style={{ fontSize: 12, flexShrink: 0, textAlign: 'right' }}>
+                    {/* 时长用 Number.isFinite 判（不是 !== null）：字段缺失/NaN 时也归到「时长未知」，
+                        免得渲染出「undefined 秒」——同款坑在 material_entry_index 上踩过（见上方 epText） */}
+                    {it.format} · {Number.isFinite(it.duration_sec) ? fmtTime(it.duration_sec as number) : '时长未知'}
+                  </Typography.Text>
+                </div>
                 {/* src 取自 productSrcs（useMemo 钉住）——不能在这里直调 audioFileUrl，它内部会 logFe+POST，
                     而 onTimeUpdate 每秒触发数十次重渲染会把日志环形缓冲刷爆（见 Important 2 修复注释）。
                     N1(spec D5.2):按 media_kind 分流(字段缺失按 'audio' 兜,老服务端混跑防护)——视频行 <video controls
@@ -1412,29 +1406,31 @@ export default function StudioDetailPage() {
                       preload="metadata"
                       src={productSrcs.get(it.id)}
                       onError={() => logFe('error', `成品视频加载失败 id=${it.id} work=${projectId} title=${it.title}`)}
-                      style={{ maxWidth: 320, borderRadius: 6 }}
+                      style={{ maxWidth: 320, borderRadius: 0 }}
                     />
                     {it.height ? <Tag>{it.height}p</Tag> : null}
                   </>
                 ) : (
-                  <audio
-                    controls
-                    src={productSrcs.get(it.id)}
-                    onError={() => logFe('error', `成品音频加载失败 id=${it.id} work=${projectId} title=${it.title}`)}
-                    style={{ flex: '1 1 260px', minWidth: 220 }}
-                  />
+                  // 音频分支换成单例播放器（spec §8.3）：视频分支一字不动。
+                  // src 仍取 productSrcs（useMemo 钉住）——直调 audioFileUrl 会 logFe+POST 刷爆日志（见上方注释）。
+                  // 包一层拿伸张权（组件本身没有 style 入参，包 wrapper 比改组件 API 更干净）：flex:1 → 占满中段
+                  // 剩余宽度，波形才够宽；不包则按内容最小宽收缩、波形被压到极窄（2026-10-07 用户反馈「太窄」）。
+                  <div style={{ flex: '1 1 320px', minWidth: 240 }}>
+                    <CyberAudioPlayer audioId={it.id} src={productSrcs.get(it.id)!} durationHint={it.duration_sec} />
+                  </div>
                 )}
-                <Button size="small" danger onClick={() => removeProduct(it)}>删除</Button>
+                {/* 打开所在目录（2026-10-07 用户要求）：抽成公共件 —— 剪辑室「无作品」列表用的是同一颗，
+                    约束（只接受目录 / 目录由 file_path 现算）与提示文案都写在组件头部 */}
+                <OpenFileDirButton filePath={it.file_path} fileSize={it.file_size} />
+                {/* 删除改纯图标（2026-10-07 用户要求）：文字「删除」换 DeleteOutlined，省出横向空间。
+                    ⚠️ 图标必须挂中文 Tooltip + aria-label（spec D9：图标工具栏要能悬停看出是什么）；
+                    破坏性操作的 Modal.confirm 二次确认在 removeProduct 里，一字未动。 */}
+                <Tooltip title="删除这个成品">
+                  <Button size="small" danger aria-label="删除" icon={<DeleteOutlined />} onClick={() => removeProduct(it)} />
+                </Tooltip>
               </div>
             ))}
-        </div>
-        {/* 隐藏播放器：顶栏「预览音频」按钮控制它（不渲染原生 controls，避免与上面每条的播放器重复） */}
-        <audio
-          ref={previewAudioRef}
-          preload="none"
-          onEnded={() => setPreviewingId(null)}
-          onError={() => { logFe('error', '预览音频元素加载失败'); setPreviewingId(null); }}
-        />
+        </CyberCard>
         {/* 映射口径自陈：让「点哪儿跳哪儿」的换算依据在界面上可见（窄窗下容器宽 < 1600，换算按容器宽） */}
         <Typography.Text type="secondary" style={{ fontSize: 12 }}>
           时间轴宽度 {trackW}px · 图固定 1600 宽（点或拖动的位置都按容器宽度换算成时间；按住拖动可连续定位，段两端 8px 是拖边微调）

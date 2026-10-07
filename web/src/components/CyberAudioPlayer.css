@@ -1,0 +1,29 @@
+/* CP2077 音频播放器外壳。切角沿用全局 --cyber-clip（global.css 已定义）。
+   为什么单独开 CSS：本组件有 :hover / ::after 等伪类，内联 style 表达不了；
+   项目不允许 styled-components（规则：用了就得单独开 sc.tsx），所以用最朴素的类。 */
+.cap-row { display: flex; align-items: center; gap: 9px; height: 42px; min-width: 0; }
+.cap-play.ant-btn {
+  clip-path: var(--cyber-clip); border: none; border-radius: 0;
+  width: 28px; height: 28px; min-width: 28px; padding: 0;
+  background: rgba(94, 246, 255, 0.9); position: relative; flex-shrink: 0;
+}
+/* ::after 做 1px 内缩的深底 = 「青描边空心块」效果（外层主色露 1px 当描边，照抄 CyberCard 手法） */
+.cap-play.ant-btn::after {
+  content: ''; position: absolute; inset: 1px; clip-path: var(--cyber-clip);
+  background: rgba(0, 0, 0, 0.75); transition: background 0.15s;
+}
+.cap-play.ant-btn:hover::after { background: rgba(94, 246, 255, 0.18); }
+.cap-play.ant-btn > span { position: relative; z-index: 1; display: flex; }
+.cap-time { color: #5EF6FF; font-weight: 600; white-space: nowrap; letter-spacing: 0.02em; flex-shrink: 0; }
+.cap-sep { width: 1px; height: 18px; background: rgba(255, 255, 255, 0.12); flex-shrink: 0; }
+.cap-icon.ant-btn { color: rgba(255, 255, 255, 0.5); border-radius: 0; flex-shrink: 0; }
+.cap-icon.ant-btn:hover { color: #5EF6FF; background: rgba(247, 80, 73, 0.08); }
+.cap-icon-cap.ant-btn { color: rgba(255, 255, 255, 0.4); font-size: 12px; font-weight: 600; }
+/* 静音态：喇叭整体变暗（与工具栏总开关同一份状态，这里只负责视觉降级） */
+.cap-muted .cap-icon.ant-btn { color: rgba(255, 255, 255, 0.4); }
+/* 轻提示：贴在播放器上方，不占布局、不拦点击（pointer-events:none），3 秒后由 JS 移除 */
+.cap-hint {
+  position: absolute; left: 0; bottom: 100%; margin-bottom: 4px;
+  background: rgba(22, 22, 22, 0.96); border: 1px solid rgba(247, 80, 73, 0.5);
+  color: #F0F0F0; font-size: 11px; padding: 3px 8px; white-space: nowrap; pointer-events: none;
+}

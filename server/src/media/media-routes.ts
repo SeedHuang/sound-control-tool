@@ -29,7 +29,8 @@ const MEDIA_MIME: Record<string, string> = { mp4: 'video/mp4', webm: 'video/webm
  * 0.1/0.2/0.3/0.4/0.5/0.8/1.0/1.5 秒八档**全部正常出 PNG**（tile 在 EOF 会冲刷不满的 tile），
  * 写「不足 1 秒也会失败」是把用户引向一个不存在的病因。
  */
-const DERIVED_FAIL: Record<'NO_FFMPEG' | 'FFMPEG_FAIL' | 'PROBE_FAIL' | 'SRC_CHANGED' | 'LEVEL_UNAVAILABLE' | 'SEGMENT_NOT_FOUND', { status: number; next: string }> = {
+// export(2026-10-07 修复轮 1):成品波形路由(ytdlp-routes.ts)复用同一张失败码映射表,避免同组 code 两套映射
+export const DERIVED_FAIL: Record<'NO_FFMPEG' | 'FFMPEG_FAIL' | 'PROBE_FAIL' | 'SRC_CHANGED' | 'LEVEL_UNAVAILABLE' | 'SEGMENT_NOT_FOUND', { status: number; next: string }> = {
   NO_FFMPEG: { status: 500, next: '到设置页检查 ffmpeg 路径（ffprobe 需与 ffmpeg 同目录）' },
   FFMPEG_FAIL: { status: 500, next: '到设置页检查 ffmpeg 配置；素材已损坏或磁盘写入失败也会走到这里，详见日志页' },
   PROBE_FAIL: { status: 422, next: '删除该素材后重新下载完整视频；若重下后仍失败，见日志页排查环境原因' },

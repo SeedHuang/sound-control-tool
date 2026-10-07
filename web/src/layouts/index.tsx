@@ -10,6 +10,10 @@ import { useEffect, useState } from 'react';
 import LogsButton from '@/components/LogsButton';
 import TaskDrawer from '@/components/TaskDrawer';
 import { onOpenDownloader } from '@/desktop';
+// 引擎持久化状态（总开关 + 音量）在布局层初始化，见下方 useEffect 注释（修复：深链详情页也会读到用户设置）
+import { initFromSettings } from '@/audio-player';
+import { cyberColors } from '@/setup/theme';
+import { CyberDivider } from '@/components/cyber';
 import '@/global.css'; // 卡片墙动效等全局样式(显式引入,不依赖框架的全局样式约定)
 
 const NAV_ITEMS = [
@@ -28,6 +32,10 @@ export default function GlobalLayout() {
   // 托盘菜单「显示下载器」→ 打开抽屉(spec D14)。订阅一次即可(布局不随路由卸载);
   // 返回的取消订阅函数直接作为 cleanup,避免热更新/卸载后句柄残留。无桌面桥时返回空函数,浏览器模式无副作用。
   useEffect(() => onOpenDownloader(() => setDrawerOpen(true)), []);
+  // 引擎的持久化状态（全局声音开关 + 音量）在**布局层**读入一次：布局对所有路由只挂载一次（含深链/刷新到作品详情页），
+  // 这样播放器不会停留在默认的 muted:true / volume:0.8，而与用户已保存的设置一致。
+  // 空依赖 + 只调一次 —— 引擎自身会去重，本处不做重复读。
+  useEffect(() => { initFromSettings(); }, []);
   // 子路由也要高亮父项:`/studio/12` 必须让"剪辑室"亮起来(否则详情页看不出自己在哪个板块)。
   // 首页用精确匹配,避免它把任何路径都吃掉。
   const selected =
@@ -35,7 +43,7 @@ export default function GlobalLayout() {
   return (
     /* App 壳(2026-09-29 用户拍板:整页不准滚 body)——根节点锁死 100vh、overflow hidden;
        顶栏固定一行,内容区占满剩余高度、超出自己滚。各页在内容区内自管滚动。 */
-    <div style={{ height: '100vh', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+    <div className="cyber-app" style={{ height: '100vh', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
       {/* 顶栏:菜单占左侧,日志按钮收右侧;flexShrink 0 保证高度永不被压缩 */}
       <div
         style={{
@@ -44,12 +52,12 @@ export default function GlobalLayout() {
           alignItems: 'center',
           gap: 8,
           paddingInline: 16,
-          background: '#fff',
-          borderBottom: '1px solid rgba(5, 5, 5, 0.06)',
+          background: cyberColors.bgLayout,
         }}
       >
         {/* Menu 底边框移到外层 div,否则按钮下方会断线 */}
         <Menu
+          className="cyber-topnav"
           mode="horizontal"
           selectedKeys={[selected]}
           items={NAV_ITEMS}
@@ -58,11 +66,13 @@ export default function GlobalLayout() {
         />
         {/* 任务入口(spec D11):徽标显示在途总数,点击开全局抽屉;放在日志按钮左侧 */}
         <Badge count={activeCount} size="small">
-          <Button type="text" icon={<DownloadOutlined />} onClick={() => setDrawerOpen(true)} />
+          <Button className="cyber-topnav-icon" type="text" icon={<DownloadOutlined />} onClick={() => setDrawerOpen(true)} />
         </Badge>
         {/* 日志按钮全局唯一,从三个页面收拢到此 */}
         <LogsButton />
       </div>
+      {/* 顶栏与内容区之间的赛博分隔线(红切角),承担原 borderBottom 的分隔职责 */}
+      <CyberDivider style={{ flexShrink: 0 }} />
       {/* 内容区(spec m2-workspace D3):这里**不再滚**——滚动交给每个页面自己的容器。
           留 overflow:hidden 是为了把"页面超出"这件事挡在内容区里,不让它顶到 body。
           minHeight 0 是 flex 子项允许收缩的关键,少了它子页面的 height:100% 会失效。 */}

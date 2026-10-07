@@ -1,7 +1,7 @@
 // server/src/ytdlp/ytdlp-routes.ts(Task 5:download 路由 + 两段式入库;Task 6 续 SSE/cancel/retry)
 import type { FastifyInstance } from 'fastify';
 import { execFile } from 'node:child_process';
-import { createReadStream, existsSync, mkdirSync, statSync } from 'node:fs';
+import { createReadStream, existsSync, mkdirSync, rmSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import type { DB } from '../db/index.js';
 import { isAllowedOrigin, isAllowedLocalOrigin, isLocalPageReferer } from '../http/cors.js';
@@ -26,6 +26,10 @@ import { createSourceVideosRepo } from '../db/repo/source-videos.js';
 import { createClipProjectsRepo } from '../db/repo/clip-projects.js';
 import { deleteVideoFiles, placeVideo } from '../media/media-files.js';
 import { derivedDirFor, invalidateDerived } from '../media/derived-images.js';
+// 失败码 → { 状态码, 下一步提示 } 单一来源表(media-routes.ts):成品波形路由复用同一张表,不再自写一套映射(修复轮 1)
+import { DERIVED_FAIL } from '../media/media-routes.js';
+// CP2077 音频播放器 Task 2(2026-10-07):成品波形峰值(音频播放器用,整条不分档)
+import { ensureAudioWavePeaks } from '../media/wave-peaks.js';
 // F11(2026-10-04):取消导出时杀掉正在跑的 ffmpeg 子进程(它不在 DownloadManager 的登记表里,见 cancel 路由)
 import { killExportProcess } from '../ffmpeg/export-processes.js';
 // SSE 事件桥(2026-09-29 抽到 job-events.ts):下载路由与媒体剪辑路由共用,连接表/节流状态都在那边
@@ -945,6 +949,45 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
     });
   });
 
+  // CP2077 音频播放器 Task 2(2026-10-07):成品波形峰值(音频播放器用)——整条、不分档。
+  // 鉴权照抄同文件 `/api/audio/:id/file` 的三件套(query token / localhost origin / 本机 referer)。
+  //
+  // 失败提示的**成品语境覆盖**(终审修复 ②):DERIVED_FAIL 是素材链路的表,其 PROBE_FAIL/FFMPEG_FAIL 的 next
+  // 里含「素材/完整视频/重新下载」——对**音频成品**是误导(成品不能"重新下载",只能重新导出)。
+  // 只覆盖「音频链路真正会返回的码」(ensureAudioWavePeaks 只产 NO_FFMPEG / PROBE_FAIL / FFMPEG_FAIL);
+  // 不覆盖 SRC_CHANGED —— 成品链路**有意不做**落盘前换源复核,该码不会被返回(内容不可变,无换源场景)。
+  const AUDIO_WAVE_FAIL_NEXT: Partial<Record<keyof typeof DERIVED_FAIL, string>> = {
+    PROBE_FAIL: '成品信息读取失败：可在作品里重新导出该成品',
+    FFMPEG_FAIL: '到设置页检查 ffmpeg 配置；成品文件损坏或磁盘写入失败也会走到这里，详见日志页',
+  };
+  app.get('/api/audio/:id/wavepeak', async (req, reply) => {
+    const id = Number((req.params as { id: string }).id);
+    const q = (req.query ?? {}) as { token?: string };
+    const origin = typeof req.headers.origin === 'string' ? req.headers.origin : '';
+    if (q.token !== token && !isAllowedLocalOrigin(origin) && !isLocalPageReferer(req.headers.referer)) {
+      pushLog('error', 'media', `成品波形 401 id=${id} origin=${origin || '(none)'} token=${q.token ? 'present' : 'missing'}`);
+      return reply.code(401).send({ ok: false, error: { code: 'UNAUTHORIZED', message: 'token 无效', next: '' } });
+    }
+    if (!Number.isInteger(id) || id <= 0) return reply.code(404).send({ ok: false, error: { code: 'NOT_FOUND', message: '音频不存在', next: '' } });
+    const item = audioRepo.get(id);
+    if (!item) return reply.code(404).send({ ok: false, error: { code: 'NOT_FOUND', message: '音频不存在', next: '' } });
+    if (!existsSync(item.file_path)) return reply.code(404).send({ ok: false, error: { code: 'FILE_MISSING', message: '文件已丢失', next: '' } });
+    const r = await ensureAudioWavePeaks({
+      audioId: id, audioPath: item.file_path,
+      derivedDir: derivedDirFor(deps.mediaDir), tempDir: deps.tempDir, db,
+      durationSec: item.duration_sec ?? undefined,
+    });
+    if (!r.ok) {
+      const f = DERIVED_FAIL[r.code]; // 单一来源表(media-routes.ts):状态码同组同口径
+      // next 用成品语境覆盖(见上方 AUDIO_WAVE_FAIL_NEXT):避免"重新下载视频"这类对成品不适用的指引
+      const next = AUDIO_WAVE_FAIL_NEXT[r.code] ?? f.next;
+      pushLog('error', 'media', `成品波形失败 id=${id} code=${r.code} msg=${r.message}`);
+      return reply.code(f.status).send({ ok: false, error: { code: r.code, message: r.message, next } });
+    }
+    reply.header('content-type', 'application/json; charset=utf-8').header('cache-control', 'no-store');
+    return reply.send(r.data);
+  });
+
   // 2026-09-29 新增:DELETE /api/audio/:id —— 同时删 DB 行 + 磁盘文件
   // 设计:删文件失败(ENOENT/权限)不让接口失败,只 log——DB 行已删就达到用户"删了"的语义
   // (audio-files.ts 内部 try/catch 兜住,这里只看 DB 行删除结果)
@@ -956,6 +999,12 @@ export function registerYtdlpRoutes(app: FastifyInstance, deps: YtdlpDeps): void
     if (!before) return reply.code(404).send({ ok: false, error: { code: 'NOT_FOUND', message: '音频不存在', next: '' } });
     const fileResult = deleteAudioFile(id, audioRepo); // 先删文件(DB 行还在时按 file_path 读得到路径)
     audioRepo.delete(id); // 再删 DB 行
+    // 波形缓存随成品一起清:删失败不让接口失败(DB 行删了即达「删了」语义)
+    try {
+      rmSync(join(derivedDirFor(deps.mediaDir), `waveaudio-${id}.json`), { force: true });
+    } catch (e) {
+      pushLog('info', 'audio.delete', `清成品波形缓存失败 id=${id}: ${(e as Error).message}`);
+    }
     pushLog('info', 'audio.delete', `id=${id} deleted=${fileResult.deleted} path=${fileResult.path ?? '(none)'}`);
     return { ok: true, deleted: fileResult.deleted };
   });

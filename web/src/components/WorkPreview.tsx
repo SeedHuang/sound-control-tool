@@ -6,6 +6,10 @@
 //   ③ 起播被拒要回退静音再试,最终失败也只记 debug —— hover 是个"随手"操作,不能弹错误框
 import { useEffect, useRef, useState } from 'react';
 import { audioFileUrl, logFe, mediaFileUrl, type WorkSummaryDTO } from '@/api';
+// 跨源互斥注册表（T3）：把自己的"暂停"登记进去，引擎起播时才能停到我；本卡起播前也先停掉别的源。
+import { registerSource, silenceOthers } from '@/silence';
+import { cyberColors } from '@/setup/theme';
+import { CyberCard } from './cyber';
 
 // 模块级:全页面同一时刻唯一在播的预览元素(纪律①)。跨卡片共享 → 必须放模块作用域,不能放组件 state。
 let currentEl: HTMLMediaElement | null = null;
@@ -59,6 +63,13 @@ export default function WorkPreview({ work, active, muted }: Props): JSX.Element
     }
     currentEl = el;
 
+    // 跨源互斥闭环(T3 遗留):把自己的"暂停"登记进 @/silence 注册表,并在起播前先停掉别的源。
+    // 为什么:pauseFn 当 self 传给 silenceOthers(不误伤自己);登记之后,引擎起播时的 silenceOthers 才能停到我 ——
+    // 于是「点列表播放器 → hover 预览会停」成立;本卡起播时先停注册表里的其它源(其它源 → 本卡的互斥)。
+    const pauseFn = (): void => { try { el.pause(); } catch { /* 元素已卸载,忽略 */ } };
+    const off = registerSource(pauseFn);
+    silenceOthers(pauseFn);
+
     const startSec = segStart ?? 0;
     // 停止点:有剪辑点 → 段尾;无剪辑点的视频(素材或视频成品) → 开头 5 秒;音频成品 → null(跟随鼠标离开,不主动停)
     const stopSec: number | null = segEnd !== null ? segEnd : (isVideo || productIsVideo ? 5 : null);
@@ -91,6 +102,7 @@ export default function WorkPreview({ work, active, muted }: Props): JSX.Element
 
     // 移开/卸载:停 + 回起点 + 解绑,不留解码器与连接(纪律②)
     return () => {
+      off(); // 卸载即注销:别让注册表留着已销毁元素的 pause 引用
       el.removeEventListener('loadedmetadata', seekToStart);
       el.removeEventListener('timeupdate', onTimeUpdate);
       try { el.pause(); el.currentTime = startSec; } catch { /* 元素已销毁,忽略 */ }
@@ -146,10 +158,10 @@ export default function WorkPreview({ work, active, muted }: Props): JSX.Element
   if (media === null) return null; // 两者都没有 → 只剩封面
 
   return (
-    <>
+    <CyberCard variant="cyan" style={{ position: 'absolute', inset: 0 }}>
       {media}
       {/* 细进度条:静音时只有音频的卡看不出变化,靠它表示"正在预览"(spec §0.5) */}
-      <div ref={barRef} style={{ position: 'absolute', left: 0, bottom: 0, height: 3, width: 0, background: '#1677ff', transition: 'width 120ms linear' }} />
-    </>
+      <div ref={barRef} style={{ position: 'absolute', left: 0, bottom: 0, height: 3, width: 0, background: cyberColors.cyan, transition: 'width 120ms linear' }} />
+    </CyberCard>
   );
 }

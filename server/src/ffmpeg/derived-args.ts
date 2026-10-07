@@ -372,3 +372,37 @@ export function wavePeakArgs(videoPath: string, seg: { t0: number; span: number 
   );
   return args;
 }
+
+/**
+ * 成品波形（音频播放器用）的目标点数：不论成品多长都画这么多点，保证波形密度稳定。
+ * 为什么不能用素材链路的 WAVE_NSAMPLES[0]=48000：那是「约 1 点/秒」，
+ * 21 分钟的片子合适，但一条 10 秒的成品只能得到 10 个点 —— 画不出波形。
+ */
+export const AUDIO_WAVE_TARGET_POINTS = 1200;
+
+/**
+ * `audioWaveNsamples` 的**取样规则版本号**（spec §6.2 签名形如 `...|n=<nsamples 推导规则版本>`，这里落到 `nf=`）。
+ * ⚠️ 改 `audioWaveNsamples` 的反推公式（系数 48000 / 取整方式 / 夹取范围）时**必须把这个版本号 +1**：
+ *    这类改动**不体现在 points**（点数恒为 1200），旧缓存的 sig 会与新 sig 逐字相同 → 被判新鲜继续用，
+ *    而实际点密度与 `stepSec = durationSec / points.length` 已与新公式错位（波形与时长对不上）。
+ *    这是与 FILMSTAMP_SIG_V 同类的「缓存版本号」弱点 —— 靠注释规约守住。
+ */
+export const AUDIO_WAVE_NSAMPLES_V = 1;
+
+/** 成品波形形状签名：schema 版本 + 目标点数 + 取样规则版本。改点数或改取样公式即自动判老缓存失效。 */
+export function waveaudioShapeSig(): string {
+  return `v${FILM_META_V}|points=${AUDIO_WAVE_TARGET_POINTS}|nf=${AUDIO_WAVE_NSAMPLES_V}`;
+}
+
+/**
+ * 成品波形的 asetnsamples 窗口：按目标点数反推（时长越短窗口越小）。
+ * 夹在 [1, 48000]：极小片段不至窗口 0（除零/空产物），超长片段不超过素材链路的窗口上界。
+ * 时长非法 → 抛错（与 filmstripVfFor 同口径：宁可明确失败，不可静默出一张骗人的图）。
+ */
+export function audioWaveNsamples(durationSec: number): number {
+  if (!Number.isFinite(durationSec) || durationSec <= 0) {
+    throw new RangeError(`audioWaveNsamples 需要已知的正时长（收到 ${String(durationSec)}）`);
+  }
+  const n = Math.round((durationSec * 48000) / AUDIO_WAVE_TARGET_POINTS);
+  return Math.min(48000, Math.max(1, n));
+}

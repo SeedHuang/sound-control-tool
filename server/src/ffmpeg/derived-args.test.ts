@@ -2,12 +2,13 @@ import { readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
+  AUDIO_WAVE_TARGET_POINTS,
   DERIVED_FILM_H, DERIVED_FILM_TILES, DERIVED_FILM_W,
   FILM_CELL_H, FILM_CELL_PATTERN, FILM_CELL_W, FILM_LEVEL_SPAN_SEC, FILM_LEVEL_TILES, FILM_META_V, FILM_SHEET_W, FILM_TOTAL_TILES, LEVEL2_MIN_DURATION_SEC,
   WAVE_NSAMPLES, WAVE_POINTS_PER_SEG,
-  buildFilmstripArgs, buildWaveformArgs, filmCellName, filmstripShapeSig, filmstripVfFor,
+  audioWaveNsamples, buildFilmstripArgs, buildWaveformArgs, filmCellName, filmstripShapeSig, filmstripVfFor,
   filmCellArgs, filmShapeSig, filmTileArgs, levelSpanSec, sampleTimes, segmentCount, segmentSpan, tilesFor,
-  wavePeakArgs, waveShapeSig,
+  wavePeakArgs, waveShapeSig, waveaudioShapeSig,
 } from './derived-args.js';
 
 describe('buildWaveformArgs(波形底图参数)', () => {
@@ -346,5 +347,22 @@ describe('波形峰值参数（实测 B3b/B3c；严禁字面 reset=44100 全键�
       expect(args[args.indexOf('-af') + 1]).toContain('reset=1');
       expect(args.join(' ')).not.toContain('reset=44100');
     }
+  });
+});
+
+describe('成品波形参数（音频播放器用）', () => {
+  it('audioWaveNsamples：按时长反推窗口，恒落在 [1,48000]', () => {
+    expect(audioWaveNsamples(30)).toBe(1200);   // 30*48000/1200
+    expect(audioWaveNsamples(10)).toBe(400);
+    expect(audioWaveNsamples(3600)).toBe(48000); // 超长夹到上界
+    expect(audioWaveNsamples(0.1)).toBe(4);      // 极短仍有窗口
+  });
+  it('audioWaveNsamples：非正/非法时长抛错（不得静默退化）', () => {
+    expect(() => audioWaveNsamples(0)).toThrow();
+    expect(() => audioWaveNsamples(Number.NaN)).toThrow();
+  });
+  it('waveaudioShapeSig：含 schema 版本与目标点数（改点数 → 签名变 → 老缓存失效）', () => {
+    expect(waveaudioShapeSig()).toContain(`v${FILM_META_V}`);
+    expect(waveaudioShapeSig()).toContain(`points=${AUDIO_WAVE_TARGET_POINTS}`);
   });
 });

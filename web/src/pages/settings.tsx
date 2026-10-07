@@ -1,7 +1,12 @@
-import { Alert, Button, Card, Descriptions, Input, Modal, Space, Spin, Tooltip, Typography, message } from 'antd';
+// web/src/pages/settings.tsx
+// 2026-10-07 CP2077 换肤:所有 antd <Card> 换 CyberCard、卡片标题换 SectionTitle、
+// 动作按钮换 CyberButton(危险操作「清空所有日志」用 variant="red")。
+// 表单控件/字段/布局/事件/破坏性二次确认全部原样保留,仅动外观。
+import { Alert, Descriptions, Input, Modal, Space, Spin, Tooltip, Typography, message } from 'antd';
 import { useEffect, useState } from 'react';
 import { ApiError, apiGet, apiPort, clearServerLogs, getCookieStatus, getSettings, logFe, putSettings, saveCookie, type CookieStatus } from '@/api';
 import { hasDesktopBridge, pickDirectory } from '@/desktop';
+import { CyberButton, CyberCard, SectionTitle } from '@/components/cyber';
 
 interface BinProbe {
   path: string | null;
@@ -14,35 +19,45 @@ interface BinsResult {
 
 function BinCard({ title, bin, loading }: { title: string; bin: BinProbe | null; loading: boolean }) {
   // loading 由父组件显式传入(仅请求进行中为 true),不再由 bin === null 推导
-  if (loading) return <Card title={title} loading style={{ marginBottom: 16 }} />;
+  if (loading) {
+    return (
+      <CyberCard style={{ marginBottom: 16 }}>
+        <SectionTitle style={{ marginBottom: 12 }}>{title}</SectionTitle>
+        <Spin />
+      </CyberCard>
+    );
+  }
   if (!bin) {
     return (
-      <Card title={title} style={{ marginBottom: 16 }}>
+      <CyberCard style={{ marginBottom: 16 }}>
+        <SectionTitle style={{ marginBottom: 12 }}>{title}</SectionTitle>
         <Alert type="error" showIcon message="暂无数据" description="探测未成功。请确认本地服务可用后点击「重新探测」。" />
-      </Card>
+      </CyberCard>
     );
   }
   if (bin.path === null) {
     return (
-      <Card title={title} style={{ marginBottom: 16 }}>
+      <CyberCard style={{ marginBottom: 16 }}>
+        <SectionTitle style={{ marginBottom: 12 }}>{title}</SectionTitle>
         <Alert
           type="error"
           showIcon
           message="未检测到"
           description="影响:下载、剪辑等相关功能不可用。请确认已安装并加入 PATH,或在设置中指定完整路径。"
         />
-      </Card>
+      </CyberCard>
     );
   }
   return (
-    <Card title={title} style={{ marginBottom: 16 }}>
+    <CyberCard style={{ marginBottom: 16 }}>
+      <SectionTitle style={{ marginBottom: 12 }}>{title}</SectionTitle>
       <Descriptions size="small" column={1}>
         <Descriptions.Item label="路径">{bin.path}</Descriptions.Item>
         <Descriptions.Item label="版本">
           {bin.version ?? <Typography.Text type="danger">已找到但版本探测失败</Typography.Text>}
         </Descriptions.Item>
       </Descriptions>
-    </Card>
+    </CyberCard>
   );
 }
 
@@ -64,7 +79,8 @@ function HealthCard() {
   // 按真实字段判定,而非拿到响应就无条件印成功
   const ok = health !== null && health.ok === true && health.sqlite !== null;
   return (
-    <Card title="服务状态" style={{ marginBottom: 16 }}>
+    <CyberCard style={{ marginBottom: 16 }}>
+      <SectionTitle style={{ marginBottom: 12 }}>服务状态</SectionTitle>
       {error !== null && <Alert type="error" showIcon message="无法连接本地服务" description={error} />}
       {error === null && health === null && <Spin />}
       {error === null && health !== null && ok && (
@@ -78,7 +94,7 @@ function HealthCard() {
           description={`health.ok=${String(health.ok)}, sqlite=${String(health.sqlite)}`}
         />
       )}
-    </Card>
+    </CyberCard>
   );
 }
 
@@ -146,7 +162,8 @@ function CookieCard() {
   };
 
   return (
-    <Card title="B 站 Cookie" style={{ marginBottom: 16 }}>
+    <CyberCard style={{ marginBottom: 16 }}>
+      <SectionTitle style={{ marginBottom: 12 }}>B 站 Cookie</SectionTitle>
       <Typography.Paragraph type="secondary">
         {cookieStatusText(status)}
       </Typography.Paragraph>
@@ -156,10 +173,10 @@ function CookieCard() {
         placeholder={COOKIE_PLACEHOLDER}
         onChange={(e) => setContent(e.target.value)}
       />
-      <Button type="primary" style={{ marginTop: 12 }} loading={saving} disabled={content.trim().length === 0} onClick={save}>
+      <CyberButton style={{ marginTop: 12 }} loading={saving} disabled={content.trim().length === 0} onClick={save}>
         保存 Cookie
-      </Button>
-    </Card>
+      </CyberButton>
+    </CyberCard>
   );
 }
 
@@ -189,14 +206,15 @@ function LogsCard() {
     });
   };
   return (
-    <Card title="日志" style={{ marginBottom: 16 }}>
+    <CyberCard style={{ marginBottom: 16 }}>
+      <SectionTitle style={{ marginBottom: 12 }}>日志</SectionTitle>
       <Typography.Paragraph type="secondary">
         清空后端内存日志,并删除已按天/小时落盘的日志文件。看日志请点右上角「日志」按钮。
       </Typography.Paragraph>
-      <Button danger loading={clearing} onClick={confirmClear}>
+      <CyberButton variant="red" loading={clearing} onClick={confirmClear}>
         清空所有日志
-      </Button>
-    </Card>
+      </CyberButton>
+    </CyberCard>
   );
 }
 
@@ -204,13 +222,14 @@ function LogsCard() {
  *  且新版本改过表结构 —— 旧版本打不开升级后的库。这两件事用户不知道会误删备份 / 误降级,设置页补一句。 */
 function DatabaseCard() {
   return (
-    <Card title="数据与备份" style={{ marginBottom: 16 }}>
+    <CyberCard style={{ marginBottom: 16 }}>
+      <SectionTitle style={{ marginBottom: 12 }}>数据与备份</SectionTitle>
       <Typography.Paragraph type="secondary" style={{ marginBottom: 0 }}>
         升级后首次启动,若数据库需要迁移(如旧版本的剪辑数据),会自动在数据库同目录生成一份
         sct.db.bak-日期时间 备份文件(只生成一次,日志里有完整路径)。新版本改过数据库结构,旧版本打不开升级后的库
         —— 确认新版本一切正常之前,请保留这份备份。
       </Typography.Paragraph>
-    </Card>
+    </CyberCard>
   );
 }
 
@@ -252,23 +271,28 @@ function ExportDirCard() {
   };
 
   return (
-    <Card title="导出目录" style={{ marginBottom: 16 }} loading={loading}>
-      {err !== null && <Alert type="error" showIcon message="读取设置失败" description={err} style={{ marginBottom: 12 }} />}
-      <Space.Compact style={{ width: '100%' }}>
-        <Input
-          value={value}
-          placeholder="留空 = 用应用数据目录"
-          onChange={(e) => setValue(e.target.value)}
-        />
-        <Tooltip title={bridge ? '选择文件夹' : '仅桌面应用内可用'}>
-          <span><Button loading={picking} disabled={!bridge} onClick={() => void browse()}>浏览…</Button></span>
-        </Tooltip>
-        <Button type="primary" loading={saving} onClick={save}>保存</Button>
-      </Space.Compact>
-      <Typography.Paragraph type="secondary" style={{ marginTop: 8, marginBottom: 0 }}>
-        导出产物会直接写入这个目录（剪辑室里照样能看到、能试听）。留空时默认：{resolved || '（读取中）'}
-      </Typography.Paragraph>
-    </Card>
+    <CyberCard style={{ marginBottom: 16 }}>
+      <SectionTitle style={{ marginBottom: 12 }}>导出目录</SectionTitle>
+      {loading ? <Spin /> : (
+        <>
+          {err !== null && <Alert type="error" showIcon message="读取设置失败" description={err} style={{ marginBottom: 12 }} />}
+          <Space.Compact style={{ width: '100%' }}>
+            <Input
+              value={value}
+              placeholder="留空 = 用应用数据目录"
+              onChange={(e) => setValue(e.target.value)}
+            />
+            <Tooltip title={bridge ? '选择文件夹' : '仅桌面应用内可用'}>
+              <span><CyberButton loading={picking} disabled={!bridge} onClick={() => void browse()}>浏览…</CyberButton></span>
+            </Tooltip>
+            <CyberButton loading={saving} onClick={save}>保存</CyberButton>
+          </Space.Compact>
+          <Typography.Paragraph type="secondary" style={{ marginTop: 8, marginBottom: 0 }}>
+            导出产物会直接写入这个目录（剪辑室里照样能看到、能试听）。留空时默认：{resolved || '（读取中）'}
+          </Typography.Paragraph>
+        </>
+      )}
+    </CyberCard>
   );
 }
 
@@ -304,24 +328,29 @@ function DownloadCard() {
       .finally(() => setSaving(false));
   };
   return (
-    <Card title="下载" style={{ marginBottom: 16 }} loading={loading}>
-      {err !== null && <Alert type="error" showIcon message="读取设置失败" description={err} style={{ marginBottom: 12 }} />}
-      <Space direction="vertical" style={{ width: '100%' }}>
-        <div>
-          <Typography.Text>同时下载数（1–5）</Typography.Text>
-          <Input value={limit} onChange={(e) => setLimit(e.target.value)} style={{ width: 120 }} />
-        </div>
-        <div>
-          <Typography.Text>请求间隔秒数（0–10，0 = 不间隔；对合集批量最有效）</Typography.Text>
-          <Input value={sleep} onChange={(e) => setSleep(e.target.value)} style={{ width: 120 }} />
-        </div>
-        <div>
-          <Typography.Text>限速（留空 = 不限；如 500K / 1.5M）</Typography.Text>
-          <Input value={rate} onChange={(e) => setRate(e.target.value)} style={{ width: 160 }} placeholder="留空 = 不限" />
-        </div>
-        <Button type="primary" loading={saving} onClick={save}>保存</Button>
-      </Space>
-    </Card>
+    <CyberCard style={{ marginBottom: 16 }}>
+      <SectionTitle style={{ marginBottom: 12 }}>下载</SectionTitle>
+      {loading ? <Spin /> : (
+        <>
+          {err !== null && <Alert type="error" showIcon message="读取设置失败" description={err} style={{ marginBottom: 12 }} />}
+          <Space direction="vertical" style={{ width: '100%' }}>
+            <div>
+              <Typography.Text>同时下载数（1–5）</Typography.Text>
+              <Input value={limit} onChange={(e) => setLimit(e.target.value)} style={{ width: 120 }} />
+            </div>
+            <div>
+              <Typography.Text>请求间隔秒数（0–10，0 = 不间隔；对合集批量最有效）</Typography.Text>
+              <Input value={sleep} onChange={(e) => setSleep(e.target.value)} style={{ width: 120 }} />
+            </div>
+            <div>
+              <Typography.Text>限速（留空 = 不限；如 500K / 1.5M）</Typography.Text>
+              <Input value={rate} onChange={(e) => setRate(e.target.value)} style={{ width: 160 }} placeholder="留空 = 不限" />
+            </div>
+            <CyberButton loading={saving} onClick={save}>保存</CyberButton>
+          </Space>
+        </>
+      )}
+    </CyberCard>
   );
 }
 
@@ -356,7 +385,7 @@ export default function SettingsPage() {
 
   return (
     /* 设置页自管滚动(spec D3):锁死高度 + 自己滚,不再依赖布局的内容区 */
-    <div style={{ boxSizing: 'border-box', height: '100%', minHeight: 0, overflowY: 'auto', padding: 16 }}>
+    <div style={{ boxSizing: 'border-box', height: '100%', minHeight: 0, overflowY: 'auto', scrollbarGutter: 'stable', padding: 16 }}>
       {error && (
         <Alert
           type="error"
@@ -369,12 +398,12 @@ export default function SettingsPage() {
       <HealthCard />
       <DownloadCard />
       <ExportDirCard />
-      <Card style={{ marginBottom: 16 }}>
+      <CyberCard style={{ marginBottom: 16 }}>
         <Typography.Text>API 端口:{apiPort()}</Typography.Text>
-        <Button style={{ float: 'right' }} loading={probing} onClick={() => void probe()}>
+        <CyberButton style={{ float: 'right' }} loading={probing} onClick={() => void probe()}>
           重新探测
-        </Button>
-      </Card>
+        </CyberButton>
+      </CyberCard>
       <BinCard title="yt-dlp" bin={bins?.ytdlp ?? null} loading={loading} />
       <BinCard title="ffmpeg" bin={bins?.ffmpeg ?? null} loading={loading} />
       <CookieCard />

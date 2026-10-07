@@ -14,6 +14,8 @@ import { createJobsRepo } from '../db/repo/jobs.js';
 import { createAudioItemsRepo } from '../db/repo/audio-items.js';
 import { createSourceVideosRepo } from '../db/repo/source-videos.js';
 import { createClipProjectsRepo } from '../db/repo/clip-projects.js';
+import { derivedDirFor } from '../media/derived-images.js';
+import { ensureAudioWavePeaks } from '../media/wave-peaks.js';
 import { getLogs, registerRequestLogging } from '../logs.js';
 import { createSettingsRepo } from '../db/repo/settings.js';
 import { createImportsRepo } from '../db/repo/imports.js';
@@ -33,6 +35,21 @@ vi.mock('./parse.js', async (importOriginal) => {
 // bili-login 在线校验 mock(不发真网;cookie 校验逻辑本身在 bili-login 单测/真机验证覆盖)
 vi.mock('./bili-login.js', () => ({
   validateBiliLogin: vi.fn(async () => ({ requestOk: true, isLogin: true, uname: '测试号' })),
+}));
+
+// CP2077 音频播放器 Task 2(2026-10-07):成品波形链路桩 —— 本文件只验**路由层**(状态码 / 鉴权 / 删除清理),
+// 峰值生成逻辑由 wave-peaks.test.ts 覆盖,这里不跑真 ffmpeg。桩顺带把 `waveaudio-<id>.json` 落到 derivedDir,
+// 使「删成品 → 缓存文件一并清掉」这条断言真的能验到东西(否则缓存文件从不落盘,断言恒真=没验到)。
+// 注:本文件不触达素材链路,故只需 ensureAudioWavePeaks 一个键。
+vi.mock('../media/wave-peaks.js', () => ({
+  ensureAudioWavePeaks: vi.fn(async (o: { audioId: number; derivedDir: string }) => {
+    const { mkdirSync, writeFileSync } = await import('node:fs');
+    const { join: joinPath } = await import('node:path');
+    const data = { v: 3, sig: 'x', level: 0, seg: 0, t0: 0, stepSec: 0.1, points: [-20] };
+    mkdirSync(o.derivedDir, { recursive: true });
+    writeFileSync(joinPath(o.derivedDir, `waveaudio-${o.audioId}.json`), JSON.stringify(data), 'utf8');
+    return { ok: true, data, cached: false };
+  }),
 }));
 
 let db: DB;
@@ -1492,5 +1509,72 @@ describe('/api/imports 派生列(has_video/has_project/segment_count/material_en
     const body = (await app.inject({ method: 'GET', url: '/api/imports' })).json() as { imports: Array<{ id: number; has_project: boolean; segment_count: number; work_count: number }> };
     expect(body.imports.filter((r) => r.id === imp)).toHaveLength(1); // 不因多作品被复制成多行
     expect(body.imports.find((r) => r.id === imp)).toMatchObject({ has_project: true, segment_count: 3, work_count: 2 });
+  });
+});
+
+// ---- CP2077 音频播放器 Task 2(2026-10-07):成品波形 GET /api/audio/:id/wavepeak + 删除时清缓存 ----
+/** 派生目录:mediaDir = <tempDir>/media → derivedDirFor 取同级的 derived */
+function derivedDirOf(): string {
+  return derivedDirFor(mediaDir);
+}
+let seedWaveSeq = 0;
+/** 照抄本文件既有造成品写法:写一个真实临时音频文件 + insert 一行 audio_items(能过路由的 existsSync 关卡) */
+function seedAudioForWave(): number {
+  const filePath = join(tempDir, `wave-seed-${seedWaveSeq++}.mp3`);
+  writeFileSync(filePath, 'abc');
+  return createAudioItemsRepo(db).create({ title: '波形成品', source_type: 'edit', source_url: '', file_path: filePath, format: 'mp3', duration_sec: 1, file_size: 3 });
+}
+describe('GET /api/audio/:id/wavepeak（成品波形）', () => {
+  it('非正整数 id → 404', async () => {
+    makeApp('yt-dlp', 'tok2');
+    expect((await app.inject({ method: 'GET', url: '/api/audio/abc/wavepeak?token=tok2' })).statusCode).toBe(404);
+    expect((await app.inject({ method: 'GET', url: '/api/audio/0/wavepeak?token=tok2' })).statusCode).toBe(404);
+  });
+  it('成品不存在 → 404', async () => {
+    makeApp('yt-dlp', 'tok2');
+    expect((await app.inject({ method: 'GET', url: '/api/audio/999/wavepeak?token=tok2' })).statusCode).toBe(404);
+  });
+  it('外站来源 + 无合法 token → 401', async () => {
+    makeApp('yt-dlp', 'tok2');
+    const id = seedAudioForWave();
+    const res = await app.inject({ method: 'GET', url: `/api/audio/${id}/wavepeak`, headers: { origin: 'https://evil.example' } });
+    expect(res.statusCode).toBe(401);
+  });
+  it('本机 referer 放行且成功 → 200 application/json', async () => {
+    makeApp('yt-dlp', 'tok2');
+    const id = seedAudioForWave();
+    const res = await app.inject({ method: 'GET', url: `/api/audio/${id}/wavepeak`, headers: { referer: 'http://localhost:8000/' } });
+    expect(res.statusCode).toBe(200);
+    expect(res.headers['content-type']).toContain('application/json');
+  });
+  it('删除成品 → 波形缓存文件一并清掉', async () => {
+    makeApp('yt-dlp', 'tok2');
+    const id = seedAudioForWave();
+    await app.inject({ method: 'GET', url: `/api/audio/${id}/wavepeak?token=tok2` });
+    // 修复轮 1:先断言缓存**真的落盘** —— 否则 GET 分支被改坏(桩不再落盘)时,末尾的 false 断言会「假真」通过
+    expect(existsSync(join(derivedDirOf(), `waveaudio-${id}.json`))).toBe(true);
+    await app.inject({ method: 'DELETE', url: `/api/audio/${id}?token=tok2` });
+    expect(existsSync(join(derivedDirOf(), `waveaudio-${id}.json`))).toBe(false);
+  });
+});
+
+// 修复轮 1:失败码 → 状态码映射(复用 media-routes.ts 的 DERIVED_FAIL 单一来源表,不再自写一套)。
+// 桩按用例返回对应 { ok:false, code };断言路由查表得到的状态码 —— 覆盖映射表两侧(500 / 422)。
+describe('GET /api/audio/:id/wavepeak（失败码 → 状态码映射）', () => {
+  async function failCase(code: 'NO_FFMPEG' | 'FFMPEG_FAIL' | 'PROBE_FAIL'): Promise<{ statusCode: number; code?: string }> {
+    makeApp('yt-dlp', 'tok2');
+    const id = seedAudioForWave();
+    vi.mocked(ensureAudioWavePeaks).mockResolvedValueOnce({ ok: false, code, message: `mock ${code}` });
+    const res = await app.inject({ method: 'GET', url: `/api/audio/${id}/wavepeak?token=tok2` });
+    return { statusCode: res.statusCode, code: (res.json() as { error?: { code?: string } }).error?.code };
+  }
+  it('NO_FFMPEG → 500', async () => {
+    expect(await failCase('NO_FFMPEG')).toEqual({ statusCode: 500, code: 'NO_FFMPEG' });
+  });
+  it('FFMPEG_FAIL → 500', async () => {
+    expect(await failCase('FFMPEG_FAIL')).toEqual({ statusCode: 500, code: 'FFMPEG_FAIL' });
+  });
+  it('PROBE_FAIL → 422', async () => {
+    expect(await failCase('PROBE_FAIL')).toEqual({ statusCode: 422, code: 'PROBE_FAIL' });
   });
 });

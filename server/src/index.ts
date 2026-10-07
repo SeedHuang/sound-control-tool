@@ -200,6 +200,9 @@ export async function createServer(opts: CreateServerOpts): Promise<{
       //   query token / Origin / Referer 三件套判定**根本没机会跑**，症状是「一直失败 + 磁盘零产物」。
       //   判据：凡是用 <img>/<video> 直接取 URL 的地址，都要在这名单里；走 fetch 的（能带 header）不受此限。
       if (/^\/api\/media\/\d+\/(waveform|filmstrip|filmseg|wavepeak)$/.test(pathname)) return;
+      // 成品波形（音频播放器 Task 2）：与派生图同属「加不了 header」一类 —— 前端 fetch 走 query token，
+      // 生产 file:// 下 Origin 为 null，不豁免就会被守卫拦在路由之前 401（2026-10-03 事故同款）。
+      if (/^\/api\/audio\/\d+\/wavepeak$/.test(pathname)) return;
       const origin = req.headers.origin;
       if (typeof origin === 'string' && isAllowedLocalOrigin(origin)) return; // dev 浏览器豁免(D12)
       if (req.headers['x-sct-token'] !== token) {

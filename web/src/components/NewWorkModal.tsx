@@ -6,6 +6,8 @@ import { Alert, Button, Empty, Modal, Spin, Typography, message } from 'antd';
 import { useNavigate } from '@umijs/max';
 import { useEffect, useRef, useState } from 'react';
 import { createWork, coverUrl, listImports, logFe, type ImportSource } from '@/api';
+import { CyberButton } from '@/components/cyber';
+import { cyberColors } from '@/setup/theme';
 import SiteLogo, { siteColor } from './SiteLogo';
 
 export interface NewWorkModalProps {
@@ -29,9 +31,9 @@ function ImportRow({ imp, creating, disabled, onCreate }: {
   const ep = Number.isInteger(imp.material_entry_index) ? (imp.material_entry_index as number) : null;
 
   return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '10px 0', borderBottom: '1px solid rgba(5,5,5,0.06)' }}>
+    <div style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '10px 0', borderBottom: `1px solid ${cyberColors.borderWhite}` }}>
       {/* 封面:有来源记录就试取图,取不到回退品牌纯色底 + SiteLogo(与作品卡 WorkCard 同款口径) */}
-      <div style={{ width: 96, flexShrink: 0, aspectRatio: '16 / 9', borderRadius: 6, background: tint.bg, overflow: 'hidden' }}>
+      <div style={{ width: 96, flexShrink: 0, aspectRatio: '16 / 9', borderRadius: 0, background: tint.bg, overflow: 'hidden' }}>
         {!coverBroken ? (
           <img
             src={coverUrl(imp.id)}
@@ -52,9 +54,9 @@ function ImportRow({ imp, creating, disabled, onCreate }: {
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>素材：第 {ep} 集</Typography.Text>
         )}
       </div>
-      <Button type="primary" loading={creating} disabled={disabled && !creating} onClick={() => onCreate(imp)}>
+      <CyberButton variant="cyan" loading={creating} disabled={disabled && !creating} onClick={() => onCreate(imp)}>
         用这个剪辑
-      </Button>
+      </CyberButton>
     </div>
   );
 }
@@ -150,11 +152,11 @@ export default function NewWorkModal({ open, onClose, onCreated }: NewWorkModalP
       {loading && <div style={{ textAlign: 'center', padding: '24px 0' }}><Spin /></div>}
       {!loading && list.length === 0 && error === null && (
         <Empty description="还没有可剪的视频素材">
-          <Button type="primary" onClick={onGoLibrary}>去资料库下载</Button>
+          <CyberButton variant="cyan" onClick={onGoLibrary}>去资料库下载</CyberButton>
         </Empty>
       )}
       {!loading && list.length > 0 && (
-        <div style={{ maxHeight: 360, overflowY: 'auto', paddingRight: 4 }}>
+        <div style={{ maxHeight: 360, overflowY: 'auto', scrollbarGutter: 'stable', paddingRight: 4 }}>
           {list.map((imp) => (
             <ImportRow
               key={imp.id}

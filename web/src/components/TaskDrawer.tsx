@@ -5,6 +5,7 @@
 import { Alert, Button, Drawer, Empty, Progress, Space, Tag, Typography, message } from 'antd';
 import { useEffect, useRef, useState } from 'react';
 import { cancelJob, listActiveJobs, logFe, type ActiveJob, type DownloadBatch } from '@/api';
+import { cyberColors } from '@/setup/theme';
 
 interface TaskDrawerProps {
   open: boolean;
@@ -109,7 +110,7 @@ export default function TaskDrawer({ open, onClose, onCountChange }: TaskDrawerP
   const renderItem = (j: ActiveJob): JSX.Element => (
     <div
       key={j.id}
-      style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 0', borderBottom: '1px solid rgba(5,5,5,0.06)' }}
+      style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 0', borderBottom: `1px solid ${cyberColors.borderWhite}` }}
     >
       <Tag color={kindColor(j.kind)} style={{ marginInlineEnd: 0 }}>
         {kindLabel(j.kind)}
@@ -118,8 +119,14 @@ export default function TaskDrawer({ open, onClose, onCountChange }: TaskDrawerP
         <Typography.Text ellipsis style={{ display: 'block' }}>
           {j.subtitle !== null ? `${j.title} · ${j.subtitle}` : j.title}
         </Typography.Text>
-        {/* 排队中(未起进程)进度必为 0,用 normal;进行中用 active(条纹动画)一眼区分两态 */}
-        <Progress percent={j.progress} size="small" status={j.status === 'running' ? 'active' : 'normal'} />
+        {/* 排队中(未起进程)进度必为 0,用 normal;进行中用 active(条纹动画)一眼区分两态。
+            进度条颜色按状态取语义色(CP2077):进行中青、排队中弱化 */}
+        <Progress
+          percent={j.progress}
+          size="small"
+          strokeColor={j.status === 'running' ? cyberColors.cyan : cyberColors.textMuted}
+          status={j.status === 'running' ? 'active' : 'normal'}
+        />
       </div>
       <Button size="small" danger loading={cancelling === j.id} onClick={() => onCancel(j.id)}>
         取消

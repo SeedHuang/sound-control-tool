@@ -15,7 +15,7 @@ import { join } from 'node:path';
 import type { DB } from '../db/index.js';
 import { pushLog } from '../logs.js';
 import type { probeDuration } from '../ytdlp/ffprobe.js';
-import { FILM_META_V, RMS_METADATA_KEY, WAVE_NSAMPLES, checkLevelAvailable, segmentCount, segmentSpan, wavePeakArgs, waveShapeSig, type FilmLevel } from '../ffmpeg/derived-args.js';
+import { FILM_META_V, RMS_METADATA_KEY, WAVE_NSAMPLES, audioWaveNsamples, checkLevelAvailable, segmentCount, segmentSpan, wavePeakArgs, waveShapeSig, waveaudioShapeSig, type FilmLevel } from '../ffmpeg/derived-args.js';
 import { classifySrcChange, derivedFileName, probeDurationFor, srcIdentityOf, tail, type ExecLike, type FilmSegRef } from './derived-images.js';
 import { resolveFfmpegPath } from './ffmpeg-path.js';
 
@@ -48,11 +48,11 @@ export function parseRmsStderr(stderr: string): number[] {
   return out;
 }
 
-/** 拼凭据 JSON。v 与 sig 由本函数填（调用方只给"这张图是什么"的部分）。 */
-export function buildWavePeakJson(d: { level: FilmLevel; seg: number; t0: number; stepSec: number; points: number[] }): string {
+/** 拼凭据 JSON。v 由本函数填；sig 缺省按 level 推（素材链路），成品链路显式传 waveaudioShapeSig()。 */
+export function buildWavePeakJson(d: { level: FilmLevel; seg: number; t0: number; stepSec: number; points: number[]; sig?: string }): string {
   return JSON.stringify({
     v: FILM_META_V,
-    sig: waveShapeSig(d.level),
+    sig: d.sig ?? waveShapeSig(d.level),
     level: d.level,
     seg: d.seg,
     t0: d.t0,
@@ -222,5 +222,107 @@ export async function ensureWavePeaks(o: {
     return { ok: false, code: 'FFMPEG_FAIL', message: `波形峰值落盘失败：${msg}` };
   }
   pushLog('info', 'media', `波形峰值生成完成 import=${o.importId} L${o.level}-${o.seg} points=${points.length} stepSec=${stepSec.toFixed(5)} bytes=${statSync(dest).size}`);
+  return { ok: true, data: JSON.parse(json) as WavePeakData, cached: false };
+}
+
+/** 成品波形的产物名（局部助手）：不与 derivedFileName 的派生图 kind 体系混编 ——
+ *  它是 JSON 且寻址键是 audioId（素材链路用 importId），混进去会让 DerivedKind 长出无用的分支。 */
+const audioWaveFileName = (audioId: number): string => `waveaudio-${audioId}.json`;
+
+/** 命中判定：口径照抄 readPeakIfFresh（文件存在 + 非空 + v 对 + sig 逐字同 + points 非空）。 */
+function readAudioPeakIfFresh(path: string): WavePeakData | null {
+  try {
+    if (statSync(path).size <= 0) return null;
+    const o = JSON.parse(readFileSync(path, 'utf8')) as Partial<WavePeakData>;
+    if (o === null || typeof o !== 'object') return null;
+    if (o.v !== FILM_META_V) return null;
+    if (o.sig !== waveaudioShapeSig()) return null;
+    if (typeof o.t0 !== 'number' || typeof o.stepSec !== 'number') return null;
+    if (!Array.isArray(o.points) || o.points.length === 0) return null;
+    if (!o.points.every((p) => typeof p === 'number')) return null;
+    return o as WavePeakData;
+  } catch { return null; }
+}
+
+/**
+ * 生成（或命中）**成品**的波形峰值（音频播放器用，整条不分档）。
+ *
+ * 与素材链路 `ensureWavePeaks` 的两处根本差异（见 spec §6.1）：
+ *   ① 寻址键是 audioId（产物 `waveaudio-<id>.json`），不共用 `wavepeak-<importId>` 命名空间（会撞名）；
+ *   ② 取样窗口按时长反推（`audioWaveNsamples`），保证短成品也有 ~1200 点。
+ *
+ * **不做落盘前素材身份复核**：成品内容不可变（重导出会得到新的 audioId），
+ * 不存在「同一 key 指向新内容」的换源场景，故无需 classifySrcChange —— 不是漏做。
+ */
+export async function ensureAudioWavePeaks(o: {
+  audioId: number; audioPath: string; derivedDir: string; tempDir: string; db: DB;
+  /** 成品时长（来自 audio_items.duration_sec）；不传则内部 `probeDurationFor`（原样透传 code） */
+  durationSec?: number;
+  probe?: typeof probeDuration;
+  doExec?: ExecLike; resolveFfmpeg?: (db: DB) => Promise<string | null>;
+}): Promise<WavePeakResult> {
+  const dest = join(o.derivedDir, audioWaveFileName(o.audioId));
+  const hit = readAudioPeakIfFresh(dest);
+  if (hit !== null) {
+    pushLog('debug', 'media', `成品波形命中缓存 audio=${o.audioId} points=${hit.points.length}`);
+    return { ok: true, data: hit, cached: true };
+  }
+  const resolve = o.resolveFfmpeg ?? resolveFfmpegPath;
+  const bin = await resolve(o.db);
+  if (bin === null) {
+    pushLog('error', 'media', `成品波形失败：ffmpeg 未找到 audio=${o.audioId}`);
+    return { ok: false, code: 'NO_FFMPEG', message: 'ffmpeg 未找到或未配置：请到设置页配置 ffmpeg 路径' };
+  }
+  let durationSec: number;
+  if (o.durationSec !== undefined) {
+    if (!Number.isFinite(o.durationSec) || o.durationSec <= 0) {
+      pushLog('error', 'media', `成品波形失败：调用方传入的时长非法 audio=${o.audioId} duration=${String(o.durationSec)}`);
+      return { ok: false, code: 'PROBE_FAIL', message: '成品信息读取失败，无法生成波形：时长非法' };
+    }
+    durationSec = o.durationSec;
+  } else {
+    const pr = await probeDurationFor({ db: o.db, videoPath: o.audioPath, ffmpegPath: bin, probe: o.probe });
+    if (!pr.ok) {
+      pushLog('error', 'media', `成品波形失败：${pr.code} audio=${o.audioId} msg=${pr.message}`);
+      return { ok: false, code: pr.code, message: pr.message };
+    }
+    durationSec = pr.durationSec;
+  }
+  const n = audioWaveNsamples(durationSec);
+  const args = wavePeakArgs(o.audioPath, null, n); // null = 整条，不加 -ss/-t
+  pushLog('info', 'media', `成品波形生成开始 audio=${o.audioId} dur=${durationSec.toFixed(2)}s n=${n}`);
+  const doExec = o.doExec ?? execFile;
+  const run = await new Promise<{ ok: boolean; stderr: string }>((resolveRun) => {
+    doExec(bin, args, { timeout: 120_000, windowsHide: true, maxBuffer: 8 * 1024 * 1024 }, (err, _stdout, stderr) => {
+      if (err) {
+        const e = err as NodeJS.ErrnoException;
+        pushLog('error', 'media', `成品波形 ffmpeg 失败 audio=${o.audioId} code=${e.code ?? '?'} stderr=${tail(stderr ?? '')}`);
+        resolveRun({ ok: false, stderr: stderr ?? '' });
+        return;
+      }
+      resolveRun({ ok: true, stderr: stderr ?? '' });
+    });
+  });
+  if (!run.ok) return { ok: false, code: 'FFMPEG_FAIL', message: `波形提取失败：${tail(run.stderr)}` };
+  const points = parseRmsStderr(run.stderr);
+  if (points.length === 0) {
+    pushLog('error', 'media', `成品波形失败：stderr 无 RMS 行 audio=${o.audioId} stderr=${tail(run.stderr)}`);
+    return { ok: false, code: 'FFMPEG_FAIL', message: '波形提取失败：ffmpeg 未输出音频统计（成品可能没有音轨）' };
+  }
+  const stepSec = durationSec / points.length; // 用实际点数反推（同素材链路口径）
+  const json = buildWavePeakJson({ level: 0, seg: 0, t0: 0, stepSec, points, sig: waveaudioShapeSig() });
+  const uniq = `${Date.now()}-${randomBytes(4).toString('hex')}`;
+  const tmp = join(o.tempDir, `waveaudio-${o.audioId}-${uniq}.json`);
+  try {
+    mkdirSync(o.derivedDir, { recursive: true });
+    writeFileSync(tmp, json, 'utf8');
+    renameSync(tmp, dest);
+  } catch (e) {
+    try { rmSync(tmp, { force: true }); } catch { /* 尽力清理 */ }
+    const msg = e instanceof Error ? e.message : String(e);
+    pushLog('error', 'media', `成品波形落盘失败 audio=${o.audioId}: ${msg}`);
+    return { ok: false, code: 'FFMPEG_FAIL', message: `波形落盘失败：${msg}` };
+  }
+  pushLog('info', 'media', `成品波形生成完成 audio=${o.audioId} points=${points.length} stepSec=${stepSec.toFixed(5)}`);
   return { ok: true, data: JSON.parse(json) as WavePeakData, cached: false };
 }

@@ -1,6 +1,6 @@
 // web/src/pages/library.tsx(资料库 2026-09-30:Task 7 收敛为纯视频下载——产物类型 Radio/音频格式 Radio/音频批量下载流已移除,音频一律从剪辑获得,spec D4 修订;服务端 produce='audio' 管线保留休眠)
 // 左列表持久化(imported_sources 表,parse 成功自动落库);点来源直接看缓存集数,不重新解析
-import { Alert, Badge, Button, Card, Empty, Input, Modal, Progress, Radio, Space, Spin, Tag, Tooltip, Typography, message } from 'antd';
+import { Alert, Badge, Button, Empty, Input, Modal, Progress, Radio, Space, Spin, Tag, Tooltip, Typography, message } from 'antd';
 // 工具栏图标(spec D3/D4):原视频页/下载/删除来源;@ant-design/icons 是既有依赖,不新增包
 // T8 新增「剪辑」剪刀 icon(spec clip-works D15:用当前这份资料直接开一个作品)
 import { DeleteOutlined, DownloadOutlined, LinkOutlined, ScissorOutlined } from '@ant-design/icons';
@@ -9,6 +9,8 @@ import { useNavigate, useSearchParams } from '@umijs/max';
 import { cancelJob, coverUrl, createWork, deleteImport, getFormats, getImport, listImports, listMedia, logFe, mediaFileUrl, parseUrl, startDownload, subscribeJob, type ImportDetail, type ImportSource, type MediaItem } from '@/api';
 import PageHeader from '@/components/PageHeader';
 import SiteLogo from '@/components/SiteLogo';
+import { CyberButton, CyberCard, SectionTitle } from '@/components/cyber';
+import { cyberColors, cyberFontStack } from '@/setup/theme';
 
 // 常见档位表(spec D6a,Task 4):探测回来的是"编码高度",往往不规整(B 站实测 1056/704/470),
 // 直接显示会变成「1056p」看着像坏了。这里只归一**标签**,Radio 的 value 仍用实测值——
@@ -336,18 +338,18 @@ export default function LibraryPage() {
        详情栏内部再纵向排布「页面头 + 内容」——页面头降为右栏头部,不再横跨左列表上方 */
     <div style={{ display: 'flex', height: '100%', minHeight: 0, overflow: 'hidden' }}>
       {/* 左:导入来源列表(持久化;项 = 站点 logo + 标题 + 条目数徽标) */}
-        <div style={{ width: 240, flexShrink: 0, borderRight: '1px solid #f0f0f0', display: 'flex', flexDirection: 'column' }}>
-          <Button type="primary" onClick={() => { setUrl(''); setError(null); setModalOpen(true); }} style={{ margin: 8 }}>+ 新导入</Button>
-          <div style={{ overflowY: 'auto', flex: 1, minHeight: 0 }}>
+        <div style={{ width: 240, flexShrink: 0, borderRight: `1px solid ${cyberColors.borderWhite}`, display: 'flex', flexDirection: 'column' }}>
+          <CyberButton variant="red" onClick={() => { setUrl(''); setError(null); setModalOpen(true); }} style={{ margin: 8 }}>+ 新导入</CyberButton>
+          <div style={{ overflowY: 'auto', scrollbarGutter: 'stable', flex: 1, minHeight: 0 }}>
             {imports.map((it) => (
               <div
                 key={it.id}
                 onClick={() => selectSource(it.id)}
-                style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', cursor: 'pointer', background: selectedId === it.id ? '#e6f4ff' : 'transparent' }}
+                style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', cursor: 'pointer', background: selectedId === it.id ? cyberColors.redSoft : 'transparent' }}
               >
                 <SiteLogo site={it.site} />
                 <Typography.Text ellipsis style={{ flex: 1 }} title={it.title}>{it.title}</Typography.Text>
-                <Badge count={it.entry_count} overflowCount={999} color="#1677ff" />
+                <Badge count={it.entry_count} overflowCount={999} color={cyberColors.cyan} />
               </div>
             ))}
             {imports.length === 0 && <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无导入" style={{ marginTop: 40 }} />}
@@ -464,10 +466,9 @@ export default function LibraryPage() {
           {error !== null && <Alert type="error" showIcon message={error} style={{ marginBottom: 12, flexShrink: 0 }} />}
           {detail === null && error === null && <Empty description="从左侧选择一个来源,或点「+ 新导入」" style={{ marginTop: 80 }} />}
           {detail !== null && (
-            <Card
-              title={null}   /* 标题已抬到页面头(D2),卡里不再重复;下载/删除来源在页面头工具栏 */
+            <CyberCard
               style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}
-              styles={{ body: { flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' } }}
+              contentStyle={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}
             >
               {/* 封面/视频共用位(Task 9):解析后=封面,下载后同一位变视频预览,填掉主内容区的空白。
                   无素材 → 封面 <img>(onError 回退灰底+SiteLogo+引导文案);有素材 → <video controls>(封面退居 poster)。
@@ -478,7 +479,7 @@ export default function LibraryPage() {
                   不保证重新拉流)。 */}
               {detail !== null && (currentMaterial === undefined || videoFailed) && (
                 coverFailed ? (
-                  <div style={{ width: '100%', aspectRatio: '16 / 9', borderRadius: 8, background: '#fafafa', border: '1px dashed #d9d9d9', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 8, flexShrink: 0 }}>
+                  <div style={{ width: '100%', aspectRatio: '16 / 9', background: cyberColors.bgElevated, border: `1px dashed ${cyberColors.borderWhite}`, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 8, flexShrink: 0 }}>
                     <SiteLogo site={detail.site} size={32} />
                     <Typography.Text type="secondary">下载后此处显示视频预览</Typography.Text>
                   </div>
@@ -487,7 +488,7 @@ export default function LibraryPage() {
                     src={coverUrl(detail.id)}
                     alt={detail.title}
                     onError={() => { setCoverFailed(true); logFe('debug', `library cover onError import=${detail.id} → 回退灰底引导`); }}
-                    style={{ width: '100%', aspectRatio: '16 / 9', objectFit: 'cover', borderRadius: 8, display: 'block', background: '#000', flexShrink: 0 }}
+                    style={{ width: '100%', aspectRatio: '16 / 9', objectFit: 'cover', display: 'block', background: '#000', flexShrink: 0 }}
                   />
                 )
               )}
@@ -498,17 +499,17 @@ export default function LibraryPage() {
                   src={`${mediaFileUrl(detail.id)}&v=${encodeURIComponent(currentMaterial.created_at)}-${mediaRev}`}
                   poster={coverUrl(detail.id)}
                   onError={() => { setVideoFailed(true); setError('视频素材文件已丢失，请重新下载'); logFe('error', `library video onError import=${detail.id} → 回退封面态`); }}
-                  style={{ width: '100%', aspectRatio: '16 / 9', background: '#000', borderRadius: 8, flexShrink: 0 }}
+                  style={{ width: '100%', aspectRatio: '16 / 9', background: '#000', flexShrink: 0 }}
                 />
               )}
               {/* 集数区 = 卡内唯一滚动区:标题固定在上,格子网格在本区内滚 */}
               {/* 单选网格(2026-09-30 Task 4+5 方案 A):一次只选一集,点卡片=选中,下载按钮提交选中集。
-                  容器视觉沿用 auto-fit 网格;选中=蓝框(#1677ff)+蓝底(#e6f4ff);
+                  容器视觉沿用 auto-fit 网格;选中=青框(cyberColors.cyan)+青底(cyberColors.cyanSoft);
                   当前素材所在集显示 D20「当前素材」标记;kind='single' 不渲染网格(档位+下载直下) */}
               {detail.kind === 'playlist' && detail.entries !== null && (
                 <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0, marginTop: 12 }}>
-                  <Typography.Title level={5} style={{ marginTop: 0, flexShrink: 0 }}>集数({detail.entries.length})</Typography.Title>
-                  <div style={{ display: 'block', width: '100%', flex: 1, minHeight: 0, overflowY: 'auto', paddingRight: 4 }}>
+                  <SectionTitle style={{ flexShrink: 0 }}>集数({detail.entries.length})</SectionTitle>
+                  <div style={{ display: 'block', width: '100%', flex: 1, minHeight: 0, overflowY: 'auto', scrollbarGutter: 'stable', paddingRight: 4 }}>
                     <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 8, width: '100%' }}>
                       {detail.entries.map((e) => {
                         const selected = videoSelectedIndex === e.index;
@@ -523,10 +524,9 @@ export default function LibraryPage() {
                             onKeyDown={(ev) => { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); onEntryClick(e.index); } }}
                             style={{
                               minWidth: 0,
-                              border: selected ? '1px solid #1677ff' : '1px solid #f0f0f0',
-                              borderRadius: 8,
+                              border: `1px solid ${selected ? cyberColors.cyan : cyberColors.borderWhite}`,
                               padding: '6px 10px',
-                              background: selected ? '#e6f4ff' : 'transparent',
+                              background: selected ? cyberColors.cyanSoft : 'transparent',
                               cursor: 'pointer',
                             }}
                           >
@@ -541,7 +541,7 @@ export default function LibraryPage() {
               )}
               {jobId !== null && done === null && (
                 <div style={{ marginTop: 16, flexShrink: 0 }}>
-                  {/* 两段式进度条(2026-09-29 用户拍板):① 下载(蓝) ② 登记素材(绿)。
+                  {/* 两段式进度条(2026-09-29 用户拍板):① 下载(青) ② 登记素材(绿)。
                       为什么必须分段:下载字节跑完 ≠ 素材已登记完——后端还要 ffprobe 测时长、改名、写库(实测约 4 秒),
                       这段没有可上报的百分比,所以第二段用 antd 的 active 动画表示「正在进行中」(不是假进度)。
                       之前只有一根条:它停在 100% 而库里还是空的,用户以为下好了就切走(真实踩的坑)。
@@ -550,7 +550,7 @@ export default function LibraryPage() {
                     <Progress
                       percent={percent}
                       showInfo={false}
-                      strokeColor="#1677ff"
+                      strokeColor={cyberColors.cyan}
                       strokeLinecap="butt"
                       status={phase === 'download' ? 'active' : undefined}
                       style={{ flex: 1, marginBottom: 0 }}
@@ -558,7 +558,7 @@ export default function LibraryPage() {
                     <Progress
                       percent={phase === 'ingest' ? 100 : 0}
                       showInfo={false}
-                      strokeColor="#52c41a"
+                      strokeColor={cyberColors.green}
                       strokeLinecap="butt"
                       status={phase === 'ingest' ? 'active' : undefined}
                       style={{ flex: 1, marginBottom: 0 }}
@@ -566,10 +566,10 @@ export default function LibraryPage() {
                   </div>
                   <Space size={12} style={{ marginTop: 4 }}>
                     <Typography.Text style={{ fontSize: 12 }}>
-                      <span style={{ color: '#1677ff' }}>① 下载</span> {phase === 'download' ? `${percent}%` : '完成'}
+                      <span style={{ color: cyberColors.cyan }}>① 下载</span> <span style={{ fontFamily: cyberFontStack, color: cyberColors.cyan }}>{phase === 'download' ? `${percent}%` : '完成'}</span>
                     </Typography.Text>
                     <Typography.Text style={{ fontSize: 12 }}>
-                      <span style={{ color: '#52c41a' }}>② 登记素材</span> {phase === 'ingest' ? '中…(正在登记视频素材,稍等)' : '待开始'}
+                      <span style={{ color: cyberColors.green }}>② 登记素材</span> {phase === 'ingest' ? '中…(正在登记视频素材,稍等)' : '待开始'}
                     </Typography.Text>
                   </Space>
                   <div style={{ marginTop: 8 }}>
@@ -578,7 +578,7 @@ export default function LibraryPage() {
                 </div>
               )}
               {done !== null && <Alert type="success" showIcon message={done} style={{ marginTop: 16, flexShrink: 0 }} />}
-            </Card>
+            </CyberCard>
           )}
         </div>
       </div>
@@ -587,7 +587,7 @@ export default function LibraryPage() {
       <Modal title="新导入" open={modalOpen} footer={null} onCancel={() => { setModalOpen(false); setError(null); }}>
         <Space.Compact style={{ width: '100%' }}>
           <Input autoFocus value={url} placeholder="粘贴 B 站 / YouTube 视频链接" onChange={(e) => setUrl(e.target.value)} onPressEnter={() => void onParseInModal()} />
-          <Button type="primary" onClick={() => void onParseInModal()} loading={parsing}>解析</Button>
+          <CyberButton variant="red" onClick={() => void onParseInModal()} loading={parsing}>解析</CyberButton>
         </Space.Compact>
         {parsing && <Spin style={{ marginTop: 12 }} />}
         {error !== null && <Alert type="error" showIcon message={error} style={{ marginTop: 12 }} />}

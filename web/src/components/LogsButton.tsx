@@ -4,13 +4,18 @@
 import { Button, Drawer, Empty, Space, Switch, Typography } from 'antd';
 import { useCallback, useEffect, useState, type CSSProperties } from 'react';
 import { fetchLogs, getFeLogs, type LogRow } from '@/api';
+import { cyberColors } from '@/setup/theme';
 
 // 等宽日志块:日志是给排查用的,字体一乱时间戳就没法对齐
 const preStyle: CSSProperties = {
   margin: 0,
   maxHeight: 320,
   overflow: 'auto',
-  background: '#f6f6f6',
+  // 与全站滚动容器同款：永久预占滚动条槽，防「滚动条占位 ⇄ 宽度 ⇄ 高度」自激抖动（详见 studio-detail.tsx 同款注释）
+  scrollbarGutter: 'stable',
+  background: cyberColors.bgLayout,
+  color: cyberColors.textPrimary,
+  border: `1px solid ${cyberColors.borderWhite}`,
   padding: 8,
   fontSize: 12,
   lineHeight: 1.6,
@@ -30,12 +35,22 @@ function levelLabel(level: LogRow['level']): string {
   return '信息';
 }
 
-/** 渲染"时间 [级别] 消息"一行一条,最新的在最上(打开先看到刚发生的) */
-function renderRows(rows: LogRow[]): string {
+/** 级别 → 语义色(CP2077):错误红 / 信息青 / 调试弱化 */
+const LEVEL_COLOR: Record<LogRow['level'], string> = {
+  error: cyberColors.red,
+  info: cyberColors.cyan,
+  debug: cyberColors.textMuted,
+};
+
+/** 渲染"时间 [级别] 消息"一行一条,最新的在最上(打开先看到刚发生的);整行按级别上色 */
+function renderRows(rows: LogRow[]): JSX.Element[] {
   return [...rows]
     .reverse()
-    .map((r) => `${r.ts} [${levelLabel(r.level)}] ${r.message}`)
-    .join('\n');
+    .map((r, i) => (
+      <div key={`${r.ts}-${i}`} style={{ color: LEVEL_COLOR[r.level] }}>
+        {`${r.ts} [${levelLabel(r.level)}] ${r.message}`}
+      </div>
+    ));
 }
 
 /** 面板默认视角 = 隐藏调试:SSE open / audioFileUrl 这类每屏好几条,不折叠会把真正要看的信息挤走 */
@@ -73,7 +88,7 @@ export default function LogsButton() {
 
   return (
     <>
-      <Button type="primary" onClick={() => setOpen(true)}>
+      <Button type="primary" className="cyber-topnav-icon" onClick={() => setOpen(true)}>
         日志
       </Button>
       <Drawer title="诊断日志" width={560} open={open} onClose={() => setOpen(false)}>

@@ -214,6 +214,14 @@ export function wavePeakUrl(importId: number, level: 0 | 1 | 2, seg: number, rev
   return `${API_BASE}/api/media/${importId}/wavepeak?level=${level}${segPart}&token=${encodeURIComponent(token ?? '')}&rev=${encodeURIComponent(String(rev))}`;
 }
 
+/** 成品波形峰值（整条、不分档、无 rev）：成品内容不可变（重导出得到新 id），无需 cache-buster；服务端回 no-store。
+ *  为什么不像 wavePeakUrl 带 rev：素材的 rev 是给「同一 importId 被换源」用的；成品 id 唯一、内容不可变，恒定 rev 只是死参数。
+ *  这里同样**不写日志**（同 waveformUrl 段说明）：一屏多条播放器，逐条 logFe 会把日志面板刷爆。 */
+export function audioWavepeakUrl(audioId: number): string {
+  const token = apiToken();
+  return `${API_BASE}/api/audio/${audioId}/wavepeak?token=${encodeURIComponent(token ?? '')}`;
+}
+
 export async function deleteMedia(importId: number): Promise<{ ok: boolean; deleted: number }> {
   logFe('info', `deleteMedia import=${importId}`);
   return apiDelete<{ ok: boolean; deleted: number }>(`/api/media/${importId}`);
@@ -352,6 +360,10 @@ export interface AudioRow {
   media_kind?: 'audio' | 'video';  // 展示层分流 <audio>/<video> 的唯一依据
   width?: number | null;           // 视频宽(像素);音频/未知 → null
   height?: number | null;          // 视频高(像素) → 成品行分辨率徽标(如 2160p)
+  // 2026-10-07 成品行「打开目录」+ hover 文件信息用。服务端 /api/audio 本来就把整行原样回传
+  //   （audio-items 的 SELECT_COLS 含这两列），这里只是把类型补齐；可选 = 老服务端混跑兜底。
+  file_path?: string;              // 产物绝对路径
+  file_size?: number | null;       // 产物字节数;未知 → null
 }
 
 export function audioFileUrl(id: number): string {

@@ -12,6 +12,14 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Typography } from 'antd';
 import { logFe, wavePeakUrl } from '@/api';
 
+// Canvas 不走 CSS，颜色在此以常量声明（值同 cyberColors，改主题时同步此处）。
+// 只有本文件真正用到的三项：背景 / 波形 / 失败占位（本组件无网格线与独立静音基线绘制）
+const WAVE_COLORS = {
+  bg: '#0E0E17',
+  wave: '#5EF6FF',
+  placeholder: 'rgba(247, 80, 73, 0.35)',
+} as const;
+
 /** 峰值 JSON 的七字段契约（与 server 的 WavePeakData 一致）。 */
 export type WavePeaks = {
   v: number; sig: string; level: 0 | 1 | 2; seg: number; t0: number; stepSec: number; points: number[];
@@ -146,11 +154,11 @@ export default function TimelineWave(props: {
     if (g === null) return;
     g.setTransform(dpr, 0, 0, dpr, 0, 0);
     g.clearRect(0, 0, w, h);
-    g.fillStyle = '#0b1220'; g.fillRect(0, 0, w, h);
+    g.fillStyle = WAVE_COLORS.bg; g.fillRect(0, 0, w, h);
     if (segs === null || segs.length === 0) return;
     const mid = h / 2;
     const span = Math.max(0.001, props.windowSpan);
-    g.strokeStyle = '#22d3ee'; g.lineWidth = 1;
+    g.strokeStyle = WAVE_COLORS.wave; g.lineWidth = 1;
     for (let px = 0; px < w; px += 1) {
       const ta = props.windowStart + (px / w) * span;
       const tb = props.windowStart + ((px + 1) / w) * span;
@@ -223,7 +231,9 @@ export default function TimelineWave(props: {
           //   z-index 只负责盖住上方那层定位层（不让它挡住重试），不改变事件归属。
           pointerEvents: 'none',
           height: props.height, display: 'flex', alignItems: 'center', justifyContent: 'center',
-          background: 'repeating-linear-gradient(45deg,#1a202c,#1a202c 8px,#232b3b 8px,#232b3b 16px)',
+          // 斜纹失败占位：主斜纹用占位红，底纹用深底（原两档深灰 #1a202c / #232b3b → 令牌色；
+          // 45° / 8px / 16px 的斜纹几何保持不变）
+          background: `repeating-linear-gradient(45deg,${WAVE_COLORS.placeholder},${WAVE_COLORS.placeholder} 8px,${WAVE_COLORS.bg} 8px,${WAVE_COLORS.bg} 16px)`,
         }}
       >
         <Typography.Text type="secondary" style={{ fontSize: 12, pointerEvents: 'none' }}>

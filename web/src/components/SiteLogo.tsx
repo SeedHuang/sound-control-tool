@@ -1,3 +1,5 @@
+import { cyberColors } from '@/setup/theme';
+
 // web/src/components/SiteLogo.tsx(来源站点 logo:内置官方品牌矢量路径,不联网拉图标)
 // 2026-09-29 用户反馈「现在的 logo 不是真的 logo,太敷衍了」——原来是自己手画的方块/圆点,
 // 现在换成各平台官方品牌标记(SVG 矢量路径,取自 Simple Icons 的 B 站 / YouTube 品牌标),
@@ -20,7 +22,7 @@ const BRANDS: Record<string, { label: string; color: string; path: string }> = {
 export function siteColor(site: string): { fg: string; bg: string } {
   const brand = BRANDS[site];
   if (brand) return { fg: brand.color, bg: `${brand.color}14` }; // 8 位 hex 的末两位是 alpha(约 8%)
-  return { fg: '#8c8c8c', bg: '#fafafa' };
+  return { fg: '#8c8c8c', bg: cyberColors.bgElevated };
 }
 
 export default function SiteLogo({ site, size = 16 }: { site: string; size?: number }) {

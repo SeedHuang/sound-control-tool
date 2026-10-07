@@ -7,14 +7,21 @@
 import { Button, Empty, Input, Modal, Tag, Tooltip, Typography } from 'antd';
 import { DeleteOutlined, MutedOutlined, PlusOutlined, SearchOutlined, SoundOutlined } from '@ant-design/icons';
 import { useNavigate } from '@umijs/max';
-import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore, type ReactNode } from 'react';
 import {
-  apiGet, audioFileUrl, coverUrl, deleteAudio, deleteWork, getPreviewMuted, listWorks, logFe, onAudioChanged,
-  setPreviewMuted, type AudioRow, type WorkSummaryDTO,
+  apiGet, audioFileUrl, coverUrl, deleteAudio, deleteWork, listWorks, logFe, onAudioChanged,
+  type AudioRow, type WorkSummaryDTO,
 } from '@/api';
+// 声音开关的唯一真相 = 单例引擎（spec D15）：本页不再自持 muted、也不再直调 getPreviewMuted/setPreviewMuted，
+// 一律经引擎的 subscribe/getSnapshot 读写 —— 两份真相必然漂移。
+import { getSnapshot, subscribe, toggleMute } from '@/audio-player';
+import CyberAudioPlayer from '@/components/CyberAudioPlayer';
 import NewWorkModal from '@/components/NewWorkModal';
+import OpenFileDirButton from '@/components/OpenFileDirButton';
 import SiteLogo, { siteColor } from '@/components/SiteLogo';
 import WorkPreview, { unlockAudio } from '@/components/WorkPreview';
+import { CyberButton, CyberCard, SectionTitle } from '@/components/cyber';
+import { cyberColors, cyberFontStack } from '@/setup/theme';
 
 const BATCH = 20;                // 每批渲染 20 条(spec D13):服务端一次性返回全部,前端分批渲染
 const CARD_MIN_WIDTH = 190;
@@ -81,8 +88,9 @@ function WorkCard({ work, muted, onOpen, onDelete }: {
       }}
       onMouseEnter={enter}
       onMouseLeave={leave}
-      style={{ border: '1px solid #f0f0f0', borderRadius: 10, background: '#fff', overflow: 'hidden', cursor: 'pointer', display: 'flex', flexDirection: 'column' }}
+      style={{ cursor: 'pointer', minWidth: 0 }}
     >
+      <CyberCard variant="cyan" style={{ height: '100%' }} contentStyle={{ padding: 0, display: 'flex', flexDirection: 'column', minWidth: 0, overflow: 'hidden' }}>
       <div style={{ position: 'relative', aspectRatio: '16 / 9', background: tint.bg, overflow: 'hidden' }}>
         {/* 封面:有来源记录就试取图(onError 回退纯色底)。**刻意不用 has_cover 当渲染开关** ——
             那样"还没抓过图"的来源永远没机会触发服务端抓取(见 api.ts 的同类说明)。 */}
@@ -112,9 +120,10 @@ function WorkCard({ work, muted, onOpen, onDelete }: {
         <Typography.Text type="secondary" ellipsis={{ tooltip: work.source?.title ?? '' }} style={{ fontSize: 12, minWidth: 0 }}>
           {work.source?.title ?? '（资料已删除）'}
         </Typography.Text>
-        <Typography.Text type="secondary" style={{ fontSize: 12 }}>{summary}</Typography.Text>
+        <Typography.Text style={{ fontSize: 12, fontFamily: cyberFontStack, color: cyberColors.cyan }}>{summary}</Typography.Text>
         <Typography.Text type="secondary" style={{ fontSize: 12 }}>最近编辑 {work.updated_at}</Typography.Text>
       </div>
+      </CyberCard>
     </div>
   );
 }
@@ -126,8 +135,10 @@ export default function StudioPage(): JSX.Element {
   const [error, setError] = useState<string | null>(null);
   const [query, setQuery] = useState('');
   const [shown, setShown] = useState(BATCH);                // 已渲染条数
-  const [muted, setMuted] = useState(true);                 // 默认静音(spec D12);初值由 getPreviewMuted 拉取后覆盖
   const [newOpen, setNewOpen] = useState(false);             // 「新建作品」弹层开关(T8)
+  // 声音开关（现在是**全局总开关**，spec D15）：状态唯一真相 = 引擎。本页只读它的快照，不再自持 muted 副本。
+  const player = useSyncExternalStore(subscribe, getSnapshot);
+  const muted = player.muted;
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const sentinelRef = useRef<HTMLDivElement | null>(null);
   // 卡片网格本体:补偿时要用它的**实测内容宽**反解列数(auto-fill 的列数只由宽度决定)
@@ -172,7 +183,6 @@ export default function StudioPage(): JSX.Element {
       void apiGet<AudioRow[]>('/api/audio')
         .then((rows) => setOrphans(rows.filter((r) => r.source_type === 'edit' && r.source_work_id == null)))
         .catch((e: Error) => logFe('error', `拉取无作品成品失败(不影响作品墙): ${e.message}`));
-      void getPreviewMuted().then(setMuted).catch((e: Error) => logFe('error', `读取预览声音设置失败: ${e.message}`));
     };
     load();
     // 三个既有重拉时机(别丢):① 下载/导出完成后的进程内通知;② 窗口重新可见;③ 窗口重新获得焦点
@@ -182,6 +192,9 @@ export default function StudioPage(): JSX.Element {
     window.addEventListener('focus', load);
     return () => { off(); document.removeEventListener('visibilitychange', onVisible); window.removeEventListener('focus', load); };
   }, []);
+
+  // 引擎持久化状态（总开关 + 音量）的初始化已上移到全局布局（layouts/index.tsx）——布局对所有路由只挂载一次，
+  // 深链/刷新到其它页面也会读到用户设置。本页不再调 initFromSettings（避免重复）；此后开关全走引擎，本页只读快照。
 
   // 滚动位置补偿（2026-10-02 N3 改：按**实际行数**补，不再按"条数 × 固定行高"）。
   // 旧算法两处不准：① 网格是 auto-fill 多列，插 K 条约下移 K/列数 行，按每条 210px 累加会**过量下移**；
@@ -221,11 +234,10 @@ export default function StudioPage(): JSX.Element {
     return () => io.disconnect();
   }, [visible.length]);
 
-  const onToggleMute = async (): Promise<void> => {
+  const onToggleMute = (): void => {
     const next = !muted;
-    setMuted(next);
-    if (!next) unlockAudio(); // 打开声音那一下是唯一可靠的用户手势 → 拿它做一次解锁尝试(见 WorkPreview)
-    try { await setPreviewMuted(next); } catch (e) { logFe('error', `保存预览声音设置失败: ${(e as Error).message}`); }
+    toggleMute();              // 引擎改状态并落盘（内部已调 setPreviewMuted，spec D15）
+    if (!next) unlockAudio(); // 打开声音那一下仍是唯一可靠的用户手势 → 保留既有解锁尝试(见 WorkPreview)
   };
 
   // 删除作品:本仓铁律——破坏性操作必须二次确认。文案要说清「删的是哪个作品(带名)」+「连带删什么(条数)+不可恢复」
@@ -317,18 +329,33 @@ export default function StudioPage(): JSX.Element {
           整块不出现。它是防"数据静默消失"的网:万一日后又有代码路径产出无作品成品,用户仍能看见、试听、单条删。 */}
       {orphans.length > 0 && (
         <div style={{ marginTop: 24 }}>
-          <Typography.Title level={5}>无作品（{orphans.length}）</Typography.Title>
+          <SectionTitle style={{ marginBottom: 12 }}>无作品（{orphans.length}）</SectionTitle>
           {orphans.map((it) => (
             <div
               key={it.id}
-              style={{ border: '1px solid #f0f0f0', borderRadius: 8, padding: '10px 14px', marginBottom: 8, display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}
+              style={{ border: `1px solid ${cyberColors.borderWhite}`, padding: '10px 14px', marginBottom: 8, display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}
             >
-              <Typography.Text strong ellipsis={{ tooltip: it.title }} style={{ flex: '1 1 240px', minWidth: 0 }}>{it.title}</Typography.Text>
-              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                {it.format} · {it.duration_sec ? formatDuration(it.duration_sec) : '时长未知'}
-              </Typography.Text>
-              <audio controls src={audioFileUrl(it.id)} style={{ flex: '1 1 260px', minWidth: 220 }} />
-              <Button danger size="small" onClick={() => onDeleteOrphan(it)}>删除</Button>
+              {/* 左侧一列（固定宽）：标题 + 格式·时长 —— 与作品详情页成品行同款布局，
+                  让每行的「mp3 · 07:09」落在同一条竖线上（理由详见 studio-detail.tsx 同款注释）。 */}
+              <div style={{ flex: '0 0 340px', minWidth: 0, display: 'flex', alignItems: 'center', gap: 8 }}>
+                <Typography.Text strong ellipsis={{ tooltip: it.title }} style={{ flex: '1 1 auto', minWidth: 0 }}>{it.title}</Typography.Text>
+                <Typography.Text type="secondary" style={{ fontSize: 12, flexShrink: 0, textAlign: 'right' }}>
+                  {it.format} · {it.duration_sec ? formatDuration(it.duration_sec) : '时长未知'}
+                </Typography.Text>
+              </div>
+              {/* 播放器包一层拿伸张权（组件本身没有 style 入参，包 wrapper 比改组件 API 更干净）：
+                  flex:1 → 占满中段剩余宽度，波形才够宽；不包则按内容最小宽收缩、波形被压到极窄。 */}
+              <div style={{ flex: '1 1 320px', minWidth: 240 }}>
+                <CyberAudioPlayer audioId={it.id} src={audioFileUrl(it.id)} durationHint={it.duration_sec} />
+              </div>
+              {/* 打开所在目录（2026-10-07 用户要求，与作品详情页成品行**同一个组件**，别再把逻辑抄一份进来） */}
+              <OpenFileDirButton filePath={it.file_path} fileSize={it.file_size} />
+              {/* 删除改纯图标（2026-10-07 用户要求）：文字「删除」换 DeleteOutlined，省出横向空间。
+                  ⚠️ 图标必须挂中文 Tooltip + aria-label（spec D9：图标工具栏要能悬停看出是什么）；
+                  破坏性操作的 Modal.confirm 二次确认在 onDeleteOrphan 里，一字未动。 */}
+              <Tooltip title="删除这个成品">
+                <Button danger size="small" aria-label="删除" icon={<DeleteOutlined />} onClick={() => onDeleteOrphan(it)} />
+              </Tooltip>
             </div>
           ))}
         </div>
@@ -341,9 +368,9 @@ export default function StudioPage(): JSX.Element {
       {/* 头:toolbar —— 新建作品 / 搜索 / 声音开关 / 计数 */}
       <div style={{ flexShrink: 0, display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
         {/* 「新建作品」按钮(T8):打开弹层列「可剪的资料」;选中创建成功后直接进编辑页 */}
-        <Button type="primary" icon={<PlusOutlined />} onClick={() => { logFe('info', '点「新建作品」打开弹层'); setNewOpen(true); }}>
+        <CyberButton variant="red" icon={<PlusOutlined />} onClick={() => { logFe('info', '点「新建作品」打开弹层'); setNewOpen(true); }}>
           新建作品
-        </Button>
+        </CyberButton>
         <Input
           allowClear
           prefix={<SearchOutlined />}
@@ -352,14 +379,14 @@ export default function StudioPage(): JSX.Element {
           onChange={(e) => { setQuery(e.target.value); setShown(BATCH); }} // 过滤变化 → 渲染批数回到第一批
           style={{ flex: '0 1 320px', minWidth: 180, maxWidth: 420 }}
         />
-        <Tooltip title={`预览声音：${muted ? '关' : '开'}`}>
+        <Tooltip title={`声音：${muted ? '关' : '开'}`}>
           <Button
             aria-label="预览声音开关"
             icon={muted ? <MutedOutlined /> : <SoundOutlined />}
             onClick={() => void onToggleMute()}
           />
         </Tooltip>
-        <Typography.Text type="secondary" style={{ marginInlineStart: 'auto' }}>共 {visible.length} 个作品</Typography.Text>
+        <Typography.Text style={{ marginInlineStart: 'auto', fontFamily: cyberFontStack, color: cyberColors.cyan }}>共 {visible.length} 个作品</Typography.Text>
       </div>
 
       {/* 身:自己滚(上下自适应)。paddingTop 12:overflow 容器按 padding box 裁切,不留空间的话
@@ -367,7 +394,7 @@ export default function StudioPage(): JSX.Element {
       <div
         ref={scrollRef}
         className="sct-view-enter"
-        style={{ boxSizing: 'border-box', flex: 1, minHeight: 0, overflowY: 'auto', paddingRight: 4, paddingTop: 12 }}
+        style={{ boxSizing: 'border-box', flex: 1, minHeight: 0, overflowY: 'auto', scrollbarGutter: 'stable', paddingRight: 4, paddingTop: 12 }}
       >
         {body}
       </div>

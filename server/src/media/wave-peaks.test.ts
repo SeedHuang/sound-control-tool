@@ -8,7 +8,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { openDatabase, type DB } from '../db/index.js';
 import { WAVE_NSAMPLES } from '../ffmpeg/derived-args.js';
 import type { ExecLike } from './derived-images.js';
-import { buildWavePeakJson, ensureWavePeaks, parseRmsStderr } from './wave-peaks.js';
+import { buildWavePeakJson, ensureAudioWavePeaks, ensureWavePeaks, parseRmsStderr } from './wave-peaks.js';
 
 let root: string;
 let derivedDir: string;
@@ -227,5 +227,48 @@ describe('ensureWavePeaks（生成 + 缓存）', () => {
     await ensureWavePeaks({ level: 1, seg: 1, importId: 11, videoPath: 'v.mp4', derivedDir, tempDir, db, durationSec: LONG, doExec: fn, resolveFfmpeg: resolveOk });
     expect(existsSync(join(derivedDir, 'wavepeak-11-L1-1.json'))).toBe(true);
     expect(readdirSync(tempDir)).toHaveLength(0);
+  });
+});
+
+describe('ensureAudioWavePeaks（成品波形）', () => {
+  it('生成：产物名 waveaudio-<id>.json，points 来自 stderr，stepSec 用实际点数反推', async () => {
+    const fn = execStderrStub(rmsStderr([-20, -30, -25]));
+    const r = await ensureAudioWavePeaks({
+      audioId: 7, audioPath: 'a.mp3', derivedDir, tempDir, db, durationSec: 30,
+      doExec: fn.fn, resolveFfmpeg: resolveOk,
+    });
+    expect(r.ok).toBe(true);
+    expect(existsSync(join(derivedDir, 'waveaudio-7.json'))).toBe(true);
+    if (r.ok) {
+      expect(r.data.points).toEqual([-20, -30, -25]);
+      expect(r.data.stepSec).toBeCloseTo(30 / 3);
+    }
+  });
+  it('命中缓存：第二次不调 ffmpeg', async () => {
+    const first = execStderrStub(rmsStderr([-20, -30]));
+    await ensureAudioWavePeaks({ audioId: 8, audioPath: 'a.mp3', derivedDir, tempDir, db, durationSec: 30, doExec: first.fn, resolveFfmpeg: resolveOk });
+    const second = execStderrStub(rmsStderr([-20, -30]));
+    const r = await ensureAudioWavePeaks({ audioId: 8, audioPath: 'a.mp3', derivedDir, tempDir, db, durationSec: 30, doExec: second.fn, resolveFfmpeg: resolveOk });
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.cached).toBe(true);
+    expect(second.calls).toHaveLength(0); // 命中缓存一次 ffmpeg 都不跑
+  });
+  it('没有 RMS 行 → 明确失败，不落空 JSON（诚实原则）', async () => {
+    const fn = execStderrStub('frame:0 pts:0\n'); // 无 RMS 行
+    const r = await ensureAudioWavePeaks({ audioId: 9, audioPath: 'a.mp3', derivedDir, tempDir, db, durationSec: 30, doExec: fn.fn, resolveFfmpeg: resolveOk });
+    expect(r.ok).toBe(false);
+    expect(existsSync(join(derivedDir, 'waveaudio-9.json'))).toBe(false);
+  });
+  it('时长非法 → PROBE_FAIL，不出产物', async () => {
+    const fn = execStderrStub(rmsStderr([-20]));
+    const r = await ensureAudioWavePeaks({ audioId: 10, audioPath: 'a.mp3', derivedDir, tempDir, db, durationSec: 0, doExec: fn.fn, resolveFfmpeg: resolveOk });
+    expect(r.ok).toBe(false);
+    expect(existsSync(join(derivedDir, 'waveaudio-10.json'))).toBe(false);
+  });
+  it('ffmpeg 未找到 → NO_FFMPEG（该去设置页，不误导）', async () => {
+    const fn = execStderrStub(rmsStderr([-20]));
+    const r = await ensureAudioWavePeaks({ audioId: 11, audioPath: 'a.mp3', derivedDir, tempDir, db, durationSec: 30, doExec: fn.fn, resolveFfmpeg: async () => null });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.code).toBe('NO_FFMPEG');
   });
 });
