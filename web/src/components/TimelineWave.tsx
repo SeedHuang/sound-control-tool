@@ -242,6 +242,10 @@ export default function TimelineWave(props: {
             <Typography.Link
               // 只拦这一颗链接：不让它冒到轨道层变成「点重试却 seek 了视频」
               onPointerDown={(e) => e.stopPropagation()}
+              // ⚠️ 双击也要拦（2026-10-09 审查第 5 轮 low）：轨道层新加了「双击打点」，
+              //   而事件冒泡与 pointer-events 无关 → 双击这颗链接会冒上去凭空加一段。
+              //   与 studio-detail.tsx 里画轨/段图两处重试链接同款，三处缺一不可。
+              onDoubleClick={(e) => e.stopPropagation()}
               onClick={(e) => { e.stopPropagation(); props.onRetry?.(); }}
               style={{ marginLeft: 8, pointerEvents: 'auto' }}
             >重试</Typography.Link>

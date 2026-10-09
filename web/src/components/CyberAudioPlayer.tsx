@@ -22,7 +22,10 @@ import './CyberAudioPlayer.css';
 /** 倍速循环档（spec D12）：点击在四档间循环。 */
 const RATES = [0.5, 1, 1.5, 2];
 
-/** 秒 → `m:ss`（spec §9 时间码格式）。自己写：项目无日期/时长工具库，引依赖不值得。 */
+/** 秒 → `m:ss`（spec §9 时间码格式）。自己写：项目无日期/时长工具库，引依赖不值得。
+ *  ⚠️ **与 @/time 的 fmtTime 刻意保持两份**（2026-10-09 审查第 3 轮取证结论）：
+ *   这里分钟**不**补零（`1:05`），@/time 的是 `mm:ss`（`01:05`），两者是不同规格而非重复实现 ——
+ *   合并会把播放器时间码的既有显示改掉。别把它当重复代码合进 @/time。 */
 function fmtTime(s: number): string {
   const total = Math.max(0, Math.floor(Number.isFinite(s) ? s : 0));
   const m = Math.floor(total / 60);

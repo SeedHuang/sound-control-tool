@@ -9,6 +9,9 @@ import { cyberColors, cyberFontStack } from '@/setup/theme';
 export interface PageHeaderProps {
   /** 左侧小图标(平台 logo);没有就留空 */
   icon?: ReactNode;
+  /** 标题左侧插槽(返回按钮等)。2026-10-09 新增:与 icon 分开——icon 的语义是「平台 logo」
+   *  (资料库传 SiteLogo),塞返回按钮会污染那个语义。默认不渲染,故资料库不受影响。 */
+  leading?: ReactNode;
   /** 主标题(来源名 / 页面名) */
   title: ReactNode;
   /** 标题右侧的元信息(时长、集数、第几集…) */
@@ -22,7 +25,7 @@ export interface PageHeaderProps {
   titleMaxWidth?: number;
 }
 
-export default function PageHeader({ icon, title, meta, toolbar, toolbarInline = false, titleMaxWidth }: PageHeaderProps) {
+export default function PageHeader({ icon, leading, title, meta, toolbar, toolbarInline = false, titleMaxWidth }: PageHeaderProps) {
   const toolbarRow = (
     <div
       style={{
@@ -50,6 +53,7 @@ export default function PageHeader({ icon, title, meta, toolbar, toolbarInline =
     >
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
         {icon}
+        {leading}
         <div
           style={{
             // 同排时用 maxWidth 限宽而非 flex:1 —— flex:1 会把标题区撑到满格,右侧按钮就没位置了

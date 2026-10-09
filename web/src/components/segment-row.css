@@ -1,0 +1,28 @@
+/* 段列表行：固定列宽 + 自适应标签框（spec D8）。
+   为什么必须固定宽度：原来「时间段」「时长」都是「按内容撑宽」的裸 flex 项，
+   每行宽度不同 → 跨行对不齐（2026-10-09 用户反馈图 9）。
+   ⚠️ 宽度用 flex:0 0 Npx 而非 width —— 单纯 width 在 flex 容器里会被 flex-shrink 压掉。 */
+
+.sr-handle {
+  flex: 0 0 24px; display: flex; align-items: center; justify-content: center;
+  cursor: grab; color: rgba(255, 255, 255, 0.4); user-select: none;
+  /* ⚠️ touch-action:none —— 别删（2026-10-09 审查第 2 轮 medium）。
+     缺它时触屏上的竖向拖动会被浏览器判成页面滚动接管 → 发 pointercancel → 拖拽**静默取消**
+     （用户看到的是「按住没反应」）。本仓已为同款坑留过两处注释：studio-detail.tsx 轨道层的
+     touchAction:'none' 与 PlayerWaveform.tsx:260。段行把手在同一个可滚动内容容器内，是第三处。 */
+  touch-action: none;
+}
+.sr-handle:active { cursor: grabbing; }
+/* 拖拽中（isDragging 由组件内 useSortable 直接给出，2026-10-09 审查第 2 轮 —— 此前父组件恒传 false，本规则是死路径）：
+   行内其它交互元素不许再吃指针事件，否则拖行时会顺手触发它们。 */
+.sr-row.is-dragging { opacity: 0.6; }
+.sr-row.is-dragging .sr-no-drag { pointer-events: none; }
+
+.sr-handle.sr-disabled { cursor: not-allowed; opacity: 0.4; }
+
+.sr-index { flex: 0 0 48px; }
+.sr-span { flex: 0 0 150px; }
+.sr-dur  { flex: 0 0 90px; }
+.sr-del  { flex: 0 0 36px; }
+/* 标签框吃掉剩余空间；min-width:0 是它能被压缩的前提 */
+.sr-label { flex: 1 1 auto; min-width: 0; }
