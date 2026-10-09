@@ -174,6 +174,11 @@ async function openWindow(mode: 'dev' | 'file', apiPort: number, apiToken: strin
   mainWindow = new BrowserWindow({
     width: 1200,
     height: 800,
+    // 2026-10-07 用户要求去掉顶部 File/Edit 那一行:本项目**没有**任何自定义 applicationMenu,
+    //   那行是 Electron 内置默认菜单(新建/复制/粘贴/缩放/退出),里面没有本项目要的功能,纯占一整行。
+    //   选 autoHideMenuBar 而非 Menu.setApplicationMenu(null):按 Alt 仍能临时唤出菜单,不把退路堵死
+    //   (设 null 是彻底移除,用户日后想用「开发者工具/重载」就没了)。
+    autoHideMenuBar: true,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,

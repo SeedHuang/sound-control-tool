@@ -1,0 +1,64 @@
+/* EditableTitle：作品名「文本 ⇄ 输入框」内联编辑 + 保存动画。
+   为什么单独开 CSS：本组件有 :hover / @keyframes / clip-path，内联 style 表达不了；
+   项目不用 styled-components（CyberAudioPlayer 同一口径），故用最朴素的类。 */
+
+/* —— 文本态 —— */
+.et-text { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
+.et-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.et-label-empty { color: rgba(255, 255, 255, 0.4); }
+/* 编辑图标：常驻（低透明度）而非仅 hover 才出现 —— 目标是「一眼看出这里能改」，
+   hover 只是把它点亮，不承担「告知」这个职责。 */
+.et-edit.ant-btn {
+  flex-shrink: 0; width: 20px; height: 20px; min-width: 20px; padding: 0;
+  border: none; background: transparent; color: rgba(255, 255, 255, 0.4);
+  transition: color 0.15s, background 0.15s;
+}
+.et-edit.ant-btn:hover { color: #5EF6FF; background: rgba(94, 246, 255, 0.1); }
+
+/* —— 输入态 ——
+   宽度必须**小于**文本态的 maxWidth（EditableTitle.tsx 里 maxWidth 默认 560）：
+   文本是「看名字」，编辑框是「改名字」，后者要能完整显示前者才看得清自己在改什么。
+   反过来（输入框更宽）会让标题区在两种形态间「缩水」，用户觉得标题被吃掉了。 */
+.et-input.ant-input { width: 460px; height: 28px; font-family: 'Rajdhani', sans-serif; }
+.et-input .ant-input-suffix { margin-inline-start: 8px; }
+
+/* —— 保存动画「扫描光带」（方案 A）——
+   三段时序：idle 暗轨道 → saving 光带左右扫 + 轨道填实 → done 横线淡出、原地收成对勾。
+   为什么不是 spinner：保存是一次几十到几百毫秒的确定动作，转圈读作「还在等」，
+   光带扫过再落勾读作「写进去了」，且横向贴边不占方块空间。
+
+   ⚠️ 动画**不进 prefers-reduced-motion 媒体查询**（2026-10-09 修：用户实机反馈「没有动」）。
+   原来的写法把关键帧放在 no-preference 里、只把终值放在外面，于是系统开启「减少动画」时
+   整段动画被跳过 → 只剩瞬间填满的横线和瞬间出现的勾，两下硬贴在一起（用户反馈第 4 条）。
+   本组件的动效是**保存反馈本身**（不是装饰），关掉它等于关掉反馈，故无条件启用；
+   时长由 JS 保证（EditableTitle.tsx 的 MIN_* 常量），不依赖 CSS 动画时长。 */
+.et-save { position: relative; display: inline-block; width: 56px; height: 20px; flex: 0 0 56px; }
+.et-save-track {
+  position: absolute; left: 0; top: 8px; width: 56px; height: 4px;
+  background: rgba(255, 255, 255, 0.12); overflow: hidden;
+}
+.et-save-fill {
+  position: absolute; inset: 0; background: #5EF6FF;
+  transform: scaleX(0); transform-origin: left center;
+}
+.et-save-scan { position: absolute; left: 0; top: 8px; width: 14px; height: 4px; background: #5EF6FF; opacity: 0; }
+.et-save-check { position: absolute; left: 20px; top: 2px; width: 16px; height: 16px; color: #5EF6FF; opacity: 0; }
+.et-save-check path {
+  fill: none; stroke: currentColor; stroke-width: 2.5; stroke-linecap: round; stroke-linejoin: round;
+  stroke-dasharray: 18; stroke-dashoffset: 18;
+}
+.et-save.is-saving .et-save-fill { animation: et-fill 0.5s cubic-bezier(0.3, 0, 0.4, 1) forwards; }
+/* 光带：0.2s 去 + 0.2s 回 = **0.4s 一个往返**。
+   saving 窗口 800ms（EditableTitle.tsx 的 MIN_SAVING_MS）= 2 个整周期 → 收回输入框时光带
+   正好停在左端起点，不会「扫到一半被硬切」。⚠️ 这两个数必须成倍数关系，改一个就要同时改另一个。 */
+.et-save.is-saving .et-save-scan { animation: et-sweep 0.2s cubic-bezier(0.45, 0, 0.55, 1) infinite alternate; }
+/* done：横线**先淡出**再落勾 —— 两者同框硬贴是最刺眼的问题（用户反馈第 4 条）。
+   淡出 0.14s 留一个「轨道消失」的过渡，勾的描线 0.3s 才开始，看不到叠影。 */
+.et-save.is-done .et-save-track { animation: et-out 0.14s ease forwards; }
+.et-save.is-done .et-save-check { animation: et-check-in 0.3s ease 0.14s forwards; }
+@keyframes et-fill { from { transform: scaleX(0); } to { transform: scaleX(1); } }
+@keyframes et-sweep { from { transform: translateX(0); } to { transform: translateX(42px); } }
+@keyframes et-out { to { opacity: 0; } }
+@keyframes et-check-in { from { opacity: 0; } to { opacity: 1; } }
+@keyframes et-draw { to { stroke-dashoffset: 0; } }
+.et-save.is-done .et-save-check path { animation: et-draw 0.3s ease 0.2s forwards; }

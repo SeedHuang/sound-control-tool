@@ -21,6 +21,7 @@
 //   否则会多出内边距那几像素、外框出现多余滚动条（2026-09-29 实测坑，studio.tsx 顶部同样记着）。
 import { Alert, Button, Empty, Input, message, Modal, Progress, Radio, Space, Tag, Tooltip, Typography } from 'antd';
 import { ArrowLeftOutlined, CustomerServiceOutlined, DeleteOutlined, ExportOutlined, FolderOpenOutlined, PlusOutlined, SaveOutlined, StopOutlined } from '@ant-design/icons';
+import EditableTitle from '@/components/EditableTitle';
 import { useNavigate, useParams } from '@umijs/max';
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type PointerEvent as ReactPointerEvent } from 'react';
 // 「谁在播」的唯一真相 = 单例引擎（spec D4/D15）：顶栏「预览音频」按钮改走它，本页不再自持隐藏播放器与「谁在播」本地副本。
@@ -60,7 +61,7 @@ export default function StudioDetailPage() {
   const navigate = useNavigate();
 
   const [work, setWork] = useState<WorkDetailDTO | null>(null); // 作品（作品名 + 段的唯一真相）
-  const [nameDraft, setNameDraft] = useState('');              // 顶栏作品名输入框的草稿
+  
   const [workMissing, setWorkMissing] = useState(false);        // getWork 回 null = 作品已被删除
   const [info, setInfo] = useState<ImportDetail | null>(null); // 资料（预览/派生图/标题/集号的来源）
   const [sourceMissing, setSourceMissing] = useState(false);    // 资料查不到（404）→ 只读态
@@ -252,7 +253,6 @@ export default function StudioDetailPage() {
           return;
         }
         setWork(w);
-        setNameDraft(w.name ?? '');
         setSegments(w.segments.map((s) => ({ start_sec: s.start_sec, end_sec: s.end_sec, label: s.label ?? null })));
         setDirty(false);
         // 换作品要重置素材侧的态：上一件的只读原因不能粘到新的一件上
@@ -323,24 +323,38 @@ export default function StudioDetailPage() {
     return () => window.removeEventListener('beforeunload', h);
   }, [dirty]);
 
-  // 保存 = 全量替换（D18）：PUT { name, segments }；用服务端返回的作品回填（服务端定的 sort_order 顺序即新顺序）。
-  // 作品名取**输入框草稿**（D16：不再拿资料标题当作品名）；空白串 → null（服务端同一口径）。
-  // 回填**不置脏**（这正是「已保存」的状态）。
+  // 保存剪辑点 = 全量替换（D18）**但只提交段**：PUT 的 name 传「已存的作品名」原值，
+  //   不传草稿 —— 否则用户在名字框里打了字没提交就被这次保存顺手带走（2026-10-09 用户要求两笔保存分开）。
+  //   服务端 name 口径不变（空白串 → null），回填**不置脏**（这正是「已保存」的状态）。
   const doSave = async (): Promise<void> => {
     if (saving) return; // 连点守卫：第二次进来直接返回（loading 已亮，避免重复 PUT 打架）
     setSaving(true);
     try {
-      const trimmed = nameDraft.trim();
-      const r = await putWork(projectId, { name: trimmed === '' ? null : trimmed, segments });
+      const r = await putWork(projectId, { name: work?.name ?? null, segments });
       setSegments(r.segments.map((s) => ({ start_sec: s.start_sec, end_sec: s.end_sec, label: s.label ?? null })));
-      setNameDraft(r.name ?? ''); // 回填服务端定稿（去空白 / 空名 → null），输入框与库里一致
       setWork((prev) => (prev === null ? prev : { ...prev, name: r.name, updated_at: r.updated_at, segments: r.segments }));
       setDirty(false);
-      message.success('已保存');
+      message.success('剪辑点已保存');
     } catch (e) {
       message.error(`保存失败：${(e as Error).message}`, 6); // 失败给用户可见文字（apiPut 内部已 logFe）；6 秒：默认 3 秒对看清失败原因太短
     } finally {
       setSaving(false); // 无论成败都复位，否则按钮永久 loading
+    }
+  };
+
+  // 保存作品名 = **只提交名字**：segments 传「库里已存的那批」（work.segments），不传编辑中的 segments。
+  //   这是本次拆分的核心：改个名字不该把用户还没保存的剪辑点一起写进去（反过来也一样）。
+  //   失败时把错误抛给 EditableTitle —— 它据此**不收回输入框**，用户的字留在里面可改完重试。
+  const doSaveName = async (next: string | null): Promise<void> => {
+    try {
+      const r = await putWork(projectId, {
+        name: next,
+        segments: (work?.segments ?? []).map((s) => ({ start_sec: s.start_sec, end_sec: s.end_sec, label: s.label ?? null })),
+      });
+      setWork((prev) => (prev === null ? prev : { ...prev, name: r.name, updated_at: r.updated_at }));
+    } catch (e) {
+      message.error(`改名失败：${(e as Error).message}`, 6);
+      throw e; // 往上传：EditableTitle 靠这个 reject 决定「留在编辑态」
     }
   };
 
@@ -921,26 +935,28 @@ export default function StudioDetailPage() {
 
   return (
     <div style={{ height: '100%', minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden', background: cyberColors.bgLayout }}>
+      {/* 标题**就是作品名**（2026-10-09 用户要求：原来显示资料标题，与「作品」语义不符 ——
+            作品是 1 资料 N 件，标题该是这件作品自己的名字）。
+            双击或点铅笔 → 输入框；回车/失焦 → 只提交名字（doSaveName 不带剪辑点）；
+            右侧「扫描光带」动画与失败留字都在 EditableTitle 内，这里只给数据与提交函数。
+            toolbarInline：按钮栏与标题并成一行（第二行整个消失）。 */}
       <PageHeader
-        title={<span style={{ fontFamily: cyberFontStack }}>{info?.title ?? `作品 #${projectIdRaw ?? '?'}`}</span>}
+        title={(
+          <EditableTitle
+            value={work?.name ?? null}
+            placeholder={`作品 #${projectIdRaw ?? '?'}`}
+            disabled={readOnly}
+            maxWidth={560}
+            onSave={doSaveName}
+          />
+        )}
         meta={epText}
+        toolbarInline
+        titleMaxWidth={620}
         toolbar={(
           <>
-            {/* 作品名（D16）：顶栏可编辑。**不再拿资料标题当作品名** —— 作品是 1 资料 N 件，名字得是作品自己的。
-                onChange 置脏（打字就脏，"打完字直接按 F5"也拦得住）。
-                onBlur 也要兜（输入法回车等不一定触发 change），但**只在真的与已存值不同时**才置脏 ——
-                否则"点进输入框什么都没改又点出来"会留下一个假的未保存标记，离开时弹一个假的确认框。 */}
-            <Typography.Text type="secondary" style={{ fontSize: 12, flexShrink: 0 }}>作品名</Typography.Text>
-            <Input
-              value={nameDraft}
-              onChange={(e) => { setNameDraft(e.target.value); setDirty(true); }}
-              onBlur={() => { if (nameDraft.trim() !== (work?.name ?? '').trim()) setDirty(true); }}
-              placeholder="给这个作品起个名"
-              disabled={readOnly}
-              style={{ width: 220 }}
-            />
             {/* spec D9/D10：工具栏全部换纯图标，每个都挂中文 Tooltip；只加图标/提示/loading，不改任何 disabled/onClick 语义。
-                原来提示里会带「保存失败：…」全文，现在失败走 message toast（常驻 tooltip 会一直被那句失败文案占着）。 */}
+                原来提示里会带「保存失败：…」全文，现在失败走 message toast（常驻 tooltip 会被那句失败文案占着）。 */}
             <Tooltip title={readOnlyMsg ?? '保存剪辑点'}>
               {/* 禁用态包一层 span，否则 antd Tooltip 收不到鼠标事件、悬停不出提示（D9 要求提示可查） */}
               <span>
