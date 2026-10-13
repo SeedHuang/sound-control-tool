@@ -67,6 +67,18 @@
 .cyber-btn-red.ant-btn:hover::after {
   background: rgba(247, 80, 73, 0.45);
 }
+/* 「已开启」状态（2026-10-13，剪辑页循环播放开关）。
+   ⚠️ **必须覆盖 ::after 而不是只改按钮本身** —— 用户真正看到的是切角内层（背景 rgba(0,0,0,0.75)，
+   盖在 antd type="primary" 的背景之上）。只给按钮加背景/换 type 的话，切角内层不变 → 两态看起来一样
+   （用户实测报「点了看不出开没开」）。
+   为什么用青色而不是红色：本页红色 = 危险/删除（段列表删除键、保存旁的删除键都是红的），用红色表示「开启」会冲突。 */
+.cyber-btn.is-loop-on.ant-btn::after {
+  background: rgba(94, 246, 255, 0.34);
+  box-shadow: inset 0 0 12px rgba(94, 246, 255, 0.55);
+}
+.cyber-btn.is-loop-on.ant-btn {
+  background: rgba(94, 246, 255, 1);
+}
 .cyber-btn.ant-btn-disabled,
 .cyber-btn.ant-btn[disabled] {
   opacity: 0.45;

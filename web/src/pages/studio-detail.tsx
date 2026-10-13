@@ -342,6 +342,9 @@ export default function StudioDetailPage() {
         }
         setWork(w);
         setSegments(w.segments.map((s) => ({ start_sec: s.start_sec, end_sec: s.end_sec, label: s.label ?? null })));
+        // ⚠️ 换作品要重置行 id 数组（2026-10-13 第 3 轮）：否则新作品的段沿用上一个作品的 id，
+        //   且旧 id 与新内容错位 → 行 key 复用错位。清空后由 rowIds 的对齐逻辑按新长度重填。
+        rowIdsRef.current = [];
         // ⚠️ 半成品必须一并清掉（2026-10-13）：它不在 segments 里，不随 setSegments 走。
         //   不清 → 上一个作品的半成品起点会漏到这一个作品的轨道上（换作品后凭空多一条虚线块）。
         setPendingStart(null);
@@ -701,6 +704,8 @@ export default function StudioDetailPage() {
     logFe('info', `打点 project=${projectId} import=${importId} ${start.toFixed(2)}-${end.toFixed(2)}s 共 ${segments.length + 1} 段`);
   };
   const removeSegment = (i: number): void => {
+    // ⚠️ 同步搬 rowIdsRef：中段删除必须按同一下标 splice，否则尾部截断会把 id 错位到别的行（→ 误重挂）。
+    rowIdsRef.current.splice(i, 1);
     setSegs((prev) => prev.filter((_, k) => k !== i)); // 走 setSegs → 置脏
     setSelected(null);
     logFe('info', `删除剪辑点 project=${projectId} 第 ${i + 1} 段`);
@@ -1041,53 +1046,20 @@ export default function StudioDetailPage() {
  *   segKey 上方的踩坑记录：带数组下标会让放下瞬间多播一遍交换动画）。改它会牵动整个排序链路。
  *   所以另建一份**只给 React key 用**的 id。
  *
- * 实现：指纹只取**标签**（不含 start/end —— 那是会变的；也不含下标 i —— 排序会变），
- *   指纹 → 尚未领用的 id 队列。每次渲染按顺序领 id、把没领完的归还，
- *   于是「改时间 / 排序 / 删除 / 新增」下同一段拿到的 id 都不变（已用 node 模拟验证过这 6 种场景）。
- * ⚠️ 为什么不加进 EditSeg：那会牵连 PUT 保存格式（见 SortableSegmentRow 的注释），id 只该活在渲染期。
+ * 实现（2026-10-13 第 3 轮重写）：id 存在 rowIdsRef 数组里，**只在结构变动时更新**——
+ *   增行（尾部 append）/ 删行（removeSegment 里 splice(i,1)）/ 重排（onDragEnd 里 arrayMove）/ 换作品（清空重填）。
+ *   改时间、改标签等**字段编辑不动 id**（length 不变 → 这里不重算）。
+ * ⚠️ 上一版（第 1 轮）用「标签指纹 + 池」推 id：**标签是可编辑字段**，每敲一个字符指纹就变 → 换池 → 换 id
+ *   → 整行重挂 → 输入框失焦（正是本功能要修的毛病）。见 problems.md 第 2 轮 bug·high。
+ * ⚠️ 为什么不加进 EditSeg：那会牵连 PUT 保存格式，id 只该活在渲染期。
  */
-const rowIdsRef = useRef(new Map<string, string[]>());
+const rowIdsRef = useRef<string[]>([]);
 const nextRowIdRef = useRef(0);
-/** 与 segments 等长的稳定 id 数组。用 useMemo 保证一次渲染内算一次（它在 JSX 里被逐行消费）。 */
-const rowIds = useMemo(() => {
-  const table = rowIdsRef.current;
-  const want = segments.map((s) => s.label ?? '');
-  const out: (string | null)[] = want.map((f) => {
-    const pool = table.get(f);
-    if (pool === undefined || pool.length === 0) return null;
-    return pool.shift() as string;
-  });
-  // 缺的现分配
-  for (let i = 0; i < out.length; i++) {
-    if (out[i] === null) {
-      out[i] = `row-${nextRowIdRef.current}`;
-      nextRowIdRef.current += 1;
-    }
-  }
-  // 归还剩余，供下次渲染按指纹领用（池子里未被本次领用的保留）
-  for (const [f, pool] of table) {
-    const rest = pool.filter((id) => !out.includes(id));
-    if (rest.length === 0) table.delete(f);
-    else table.set(f, rest);
-  }
-  // 本次领用的按指纹收集（保持行序）后一次放回各自池子末尾，下次同指纹的行接着领。
-  // ⚠️ 不能边遍历边 set 覆盖：那样每个指纹只会留下「最后一个领用的 id」，
-  //    同指纹多行（如多个 label=null 的段，指纹全 ''）下次渲染领到的 id 集合全变 →
-  //    React key 每次渲染都不同 → 整行销毁重建 → ▴ 输入框重新聚焦 / draft 丢失复发
-  //    （2026-10-13 review-code-to-death bug·high 实测，已用 node 模拟验证 6 场景中的「多段同指纹」）。
-  const usedByFingerprint = new Map<string, string[]>();
-  for (let i = 0; i < out.length; i++) {
-    const f = want[i] as string;
-    const arr = usedByFingerprint.get(f) ?? [];
-    arr.push(out[i] as string);
-    usedByFingerprint.set(f, arr);
-  }
-  for (const [f, used] of usedByFingerprint) {
-    const pool = table.get(f) ?? [];
-    table.set(f, [...pool, ...used]);
-  }
-  return out as string[];
-}, [segments]);
+const makeRowId = (): string => `row-${nextRowIdRef.current++}`;
+// 与 segments 对齐：尾部新增的行补 id、尾部删掉的行截断；中段删除 / 重排由各自的 handler 显式搬（见下）。
+const rowIds = rowIdsRef.current;
+while (rowIds.length < segments.length) rowIds.push(makeRowId());
+if (rowIds.length > segments.length) rowIds.length = segments.length;
 
   // 取第 i 段的 dnd-kit id。**三处（items / React key / onDragEnd 反查）都必须走它**。
   //   为什么多这一层：segOccurrence[i] 在 noUncheckedIndexedAccess 下是 number | undefined
@@ -1177,6 +1149,9 @@ const rowIds = useMemo(() => {
     const nextArr = arrayMove(segments, from, to);
     const nextIds = idsOf(nextArr);
     const changed = diffIndexBySwap(prevIds, nextIds);
+    // ⚠️ 同步搬 rowIdsRef（与 segments 同序）：重排不改 length，靠尾部截断 detection 抓不到，
+    //   必须在这里按同一 from/to arrayMove，否则行 id 与内容错位（→ 拖完行误重挂、输入框失焦）。
+    rowIdsRef.current = arrayMove(rowIdsRef.current, from, to);
     setSegs(() => nextArr);
     // spec D9「选中改为拖拽结束后才结算」：selected 存的是**下标**，arrayMove 之后同一个下标指向的是**另一段**，
     //   不结算就会「高亮乱跳」（spec D9 明令要避免的那种）。故选回**刚拖的那一行**（换位后的 to）。
