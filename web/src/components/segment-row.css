@@ -21,11 +21,42 @@
 .sr-handle.sr-disabled { cursor: not-allowed; opacity: 0.4; }
 
 .sr-index { flex: 0 0 48px; }
-.sr-span { flex: 0 0 150px; }
+/* ⚠️ .sr-span 已删（2026-10-13）：原来的纯文本时间段列被两个可编辑时间框（.sr-time-box）取代。
+   留死规则会让下一个人以为还有东西在用它。 */
 .sr-dur  { flex: 0 0 90px; }
+.sr-play { flex: 0 0 36px; }
 .sr-del  { flex: 0 0 36px; }
 /* 标签框吃掉剩余空间；min-width:0 是它能被压缩的前提 */
 .sr-label { flex: 1 1 auto; min-width: 0; }
+
+/* ---- 起止时间框（2026-10-13 spec §4.2）：输入框 + 上下按钮 ----
+   为什么定死宽度：Input 默认按内容撑，每行数字位数不一时跨行会对不齐 ——
+   与本文件头部「为什么必须固定宽度」是同一个理由。
+   148px 能放下 "01:23.456"（9 字符）且留出余量（2026-10-13 review documentation·low：注释原写 108px 与实现不符）。 */
+.sr-time-box { flex: 0 0 148px; }
+.sr-time {
+  flex: 1 1 auto; min-width: 0;
+  font-family: 'Rajdhani', monospace; font-size: 12px;
+}
+/* 中间的箭头连接符 */
+.sr-time-sep { flex: 0 0 14px; text-align: center; color: rgba(255, 255, 255, 0.45); }
+/* 上下步进按钮：16 毫秒一步。
+   ⚠️ touch-action:none —— 别删（同 .sr-handle 的理由：触屏拖动会被判成页面滚动接管）。
+   ⚠️ 用原生 <button> 而非 antd Button：步进控件要「窄且高密」，antd Button 有自己的 padding/圆角，
+   在 20px 高的行里塞不下两个，且它对 disabled 的样式覆盖也会多一层。 */
+.sr-time-step { flex: 0 0 14px; display: flex; }
+.sr-time-step-btn {
+  width: 14px; height: 20px; padding: 0; border: 1px solid rgba(255, 255, 255, 0.18);
+  background: rgba(255, 255, 255, 0.04); color: #5EF6FF; cursor: pointer;
+  font-size: 8px; line-height: 1; display: flex; align-items: center; justify-content: center;
+  touch-action: none;
+}
+.sr-time-step-btn:hover:not(:disabled) { background: rgba(94, 246, 255, 0.16); }
+.sr-time-step-btn:disabled { cursor: not-allowed; opacity: 0.4; }
+
+/* 正在播放的段：青色描边。与「选中」的红色底（行内 style 给出）区分开，
+   两个状态可以同时存在（选中 + 正在播）。 */
+.sr-row.is-playing { box-shadow: inset 0 0 0 1px rgba(94, 246, 255, 0.6); }
 
 /* ---- 序号框（.sr-no）：段序变化时唯一的动画主体（2026-10-09 用户定案）----
    为什么自己写而不用 antd <Tag>：色散要叠「红/蓝/本体」三层，Tag 的内部结构不由我们控制。

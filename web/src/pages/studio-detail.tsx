@@ -22,7 +22,7 @@
 import { Alert, Badge, Button, Drawer, Empty, message, Modal, Progress, Space, Tag, Tooltip, Typography } from 'antd';
 import { DndContext, KeyboardSensor, PointerSensor, closestCenter, useSensor, useSensors, type DragEndEvent, type Modifier } from '@dnd-kit/core';
 import { SortableContext, arrayMove, sortableKeyboardCoordinates, verticalListSortingStrategy } from '@dnd-kit/sortable';
-import { ArrowLeftOutlined, DeleteOutlined, ExportOutlined, FolderOpenOutlined, InboxOutlined, PlusOutlined, SaveOutlined } from '@ant-design/icons';
+import { ArrowLeftOutlined, DeleteOutlined, ExportOutlined, FolderOpenOutlined, InboxOutlined, PlusOutlined, RetweetOutlined, SaveOutlined } from '@ant-design/icons';
 import EditableTitle from '@/components/EditableTitle';
 import ExportSettingsModal from '@/components/ExportSettingsModal';
 import { useNavigate, useParams } from '@umijs/max';
@@ -52,6 +52,19 @@ const WAVE_H = 120;   // 波形原图高（D14）
 const FILM_H = 90;    // 胶片条原图高（D14）
 const RULER_H = 20;   // 时间尺行高（段区块与播放头都要给它让位）
 const MAX_SEGMENTS = 50; // 段数上限（与服务端校验一致，D18）；超了就不给打点，免得保存时才被拒
+const MIN_SEG_SEC = 0.1; // 段的最短长度。与 addSegment(:589) 和服务端 parseSegments 同口径，改一处必须三处一起看
+const SEG_GRID_SEC = 0.016; // 吸附网格 16 毫秒。列表上下按钮与轨道拖拽共用，保证两边产出同一批数值
+/**
+ * 最短段长在**网格上**的格数：6 格 = 0.096 秒。
+ * ⚠️ 为什么不是 MIN_SEG_SEC / SEG_GRID_SEC = 6.25 格（2026-10-13 实测踩到）：
+ *   「最短 0.1 秒」与「值恒在 16ms 网格上」这两条要求**在数学上不兼容** —— 0.1 不是 0.016 的整数倍，
+ *   取整成 6 格则实际最短 0.096 秒（略小于 0.1，仍满足服务端 start < end）；
+ *   若强行让边界落在 0.1 上（边界 = otherEnd ± 0.1），那个边界就不在网格上，
+ *   无论怎么夹都产不出同时满足两条的值 —— 实测过「夹两次」等三版写法，网格判定全破。
+ *   故：**网格是硬约束（必须成立），最短长度是软约束（取不小于下限的最小格数）**。
+ *   0.096 与 0.1 的差 4 毫秒用户感知不到，而「拖出来的值与上下按钮加减出来的值是同一批数」必须成立。
+ */
+const MIN_SEG_GRID = 6;
 
 /** 编辑期段（未保存）：只有起止与标签，无 id / sort_order —— 保存时按数组顺序定 sort_order（T6） */
 interface EditSeg { start_sec: number; end_sec: number; label: string | null }
@@ -59,6 +72,40 @@ interface EditSeg { start_sec: number; end_sec: number; label: string | null }
 // fmtTime 已提到 @/time（全站唯一定义，2026-10-09 审查第 3 轮）：原先这里与 SortableSegmentRow 各写一份，
 //   两份在同一屏显示（轨道刻度 vs 段列表），漂移就会让「列表时间与轨道刻度对不上」。
 const clamp = (v: number, lo: number, hi: number): number => Math.min(Math.max(v, lo), hi);
+
+/**
+ * 秒 → 吸附到 16 毫秒网格。
+ * 为什么必须吸附：轨道拖边产出的值若不吸附（如 12.3456），与列表上下按钮（±0.016）产出的值
+ * 属于两套数，同一个段在两边改几次后会越差越远。
+ */
+const snapToGrid = (t: number): number => Math.round(t / SEG_GRID_SEC) * SEG_GRID_SEC;
+
+/**
+ * 改段起止时间的**唯一**判定处：吸附网格 → 夹进 [0, duration] → 保证两端至少差最短段长。
+ *
+ * ⚠️ 为什么只有这一份：改时间的入口有三个（轨道拖边、列表框里敲数字、上下按钮），
+ *   三处各判一次必然漂移 —— 本仓已为同类教训留过注释（addBlockReason :1065-1081 曾有三份判定互相矛盾）。
+ *   列表编辑必须走这个函数，不要在那里另写一份 clamp。
+ *
+ * ⚠️ **边界用「格数」而不是秒表达**（实测踩到，2026-10-13）：
+ *   另一端 otherEnd 已保证在网格上，故 `otherEnd - MIN_SEG_GRID * SEG_GRID_SEC`（= -6 格）也必在网格上。
+ *   若边界写成 `otherEnd - MIN_SEG_SEC`（-0.1 秒 = -6.25 格），那个边界脱离网格 →
+ *   产出的值无论怎么夹都既不在网格上、或被夹出合法区间，两条要求无法同时成立。
+ *   前提是 otherEnd 本身在网格上 —— 本文件里所有段的时间都经过本函数，故该前提恒成立。
+ *
+ * @param t        目标时间（秒）
+ * @param otherEnd 另一端的当前值（秒）—— start 边传 end_sec，end 边传 start_sec
+ * @param edge     被改的是哪一端
+ * @param maxSec   素材总时长（秒）
+ */
+const clampSegTime = (t: number, otherEnd: number, edge: 'start' | 'end', maxSec: number): number => {
+  const gap = MIN_SEG_GRID * SEG_GRID_SEC; // 0.096 秒，恒在网格上（前提：otherEnd 在网格上）
+  const lo = edge === 'start' ? 0 : Math.min(maxSec, snapToGrid(otherEnd) + gap);
+  const hi = edge === 'start' ? Math.max(0, snapToGrid(otherEnd) - gap) : snapToGrid(maxSec);
+  // 先夹进 [lo, hi]，再吸附网格。吸附只可能把值推向区间内的邻近格点，
+  //   故第二次夹是兜底（防止 lo/hi 本身因 maxSec 不在网格上而让结果越界）。
+  return clamp(snapToGrid(clamp(t, lo, hi)), lo, hi);
+};
 
 /**
  * 每段是「同一组起止时间里」的第几个（0 起，按数组顺序）。
@@ -101,6 +148,14 @@ export default function StudioDetailPage() {
   const [duration, setDuration] = useState(0);        // <video>.duration —— 时间轴的唯一真相
   const [current, setCurrent] = useState(0);          // 播放头位置（秒）
   const [segments, setSegments] = useState<EditSeg[]>([]);
+  // 半成品段的起点（秒）。null = 当前没有半成品（2026-10-13 spec D1：双击打起点、再双击补终点）。
+  // 为什么它**不在** segments 里：服务端硬规矩要求 0 ≤ start < end（project-routes.ts:33），
+  // 半成品没有终点 → 存不进去 → 保存时自然被跳过（spec D2）。
+  const [pendingStart, setPendingStart] = useState<number | null>(null);
+  // 循环播放总开关（工具栏那颗，spec D11）：开 → 点任何段的播放都循环那一段
+  const [loopEnabled, setLoopEnabled] = useState(false);
+  // 正在播放的段下标；null = 没有段在播。驱动两件事：区间结束判定、段行高亮
+  const [playingSegIndex, setPlayingSegIndex] = useState<number | null>(null);
   const [selected, setSelected] = useState<number | null>(null);
   const [rev] = useState(0);                          // 版本串的本地分量（T7 起与 file_size 拼成 version）
   const [fileSize, setFileSize] = useState<number | null>(null); // 素材字节数：upsert 换素材不改 created_at，只能靠它识别「素材被替换」
@@ -287,6 +342,9 @@ export default function StudioDetailPage() {
         }
         setWork(w);
         setSegments(w.segments.map((s) => ({ start_sec: s.start_sec, end_sec: s.end_sec, label: s.label ?? null })));
+        // ⚠️ 半成品必须一并清掉（2026-10-13）：它不在 segments 里，不随 setSegments 走。
+        //   不清 → 上一个作品的半成品起点会漏到这一个作品的轨道上（换作品后凭空多一条虚线块）。
+        setPendingStart(null);
         setDirty(false);
         // 换作品要重置素材侧的态：上一件的只读原因不能粘到新的一件上
         setSourceMissing(false);
@@ -365,6 +423,9 @@ export default function StudioDetailPage() {
     try {
       const r = await putWork(projectId, { name: work?.name ?? null, segments });
       setSegments(r.segments.map((s) => ({ start_sec: s.start_sec, end_sec: s.end_sec, label: s.label ?? null })));
+      // ⚠️ 半成品**没被保存**（它不在 segments 里，服务端也拒收无终点的段）→ 保存成功即丢弃，
+      //   否则轨道上留着一条「以为存上了其实没有」的虚线块。用户下次双击会重新起一个（spec D2）。
+      setPendingStart(null);
       setWork((prev) => (prev === null ? prev : { ...prev, name: r.name, updated_at: r.updated_at, segments: r.segments }));
       setDirty(false);
       message.success('剪辑点已保存');
@@ -554,6 +615,42 @@ export default function StudioDetailPage() {
     if (v !== null) v.currentTime = clamp(t, 0, duration || 0);
   };
 
+  /**
+   * 播放某一段（spec D10）：**用监视器这个 <video> 本身**，定位到起点播、到终点停。
+   * 为什么不用全局播放器 audio-player.ts：它是 <audio> 元素（audio-player.ts:24），能出声放不出画面，
+   * 而用户要「在原来的完整视频上播」= 要画面。只用一个元素 → 声画天然同步，不存在错位。
+   * ⚠️ 因此 audio-player.ts 零改动。
+   *
+   * ⚠️ readOnly **必须**挡住（spec D13，2026-10-13 审查 P0-1）：
+   *   只读有两种成因 —— 资料已删除 / 资料没有视频素材（:1038-1042）。两者都意味着 <video> 没有可用源，
+   *   此时点播放必然失败。判据是「有没有源可播」，**不是**「改不改数据」（播放确实不改数据）。
+   *   行内按钮也据此置灰（SortableSegmentRow），两处口径必须一致。
+   */
+  const playSegment = async (i: number): Promise<void> => {
+    const v = videoRef.current;
+    const seg = segmentsRef.current[i]; // 读 ref：见 segmentsRef 的注释
+    if (v === null || seg === undefined || readOnly) return;
+    v.pause(); // 先停，避免两路声音重叠
+    // ⚠️ 必须走 seekProgrammatically：直接写 currentTime 会触发 seeking →
+    //   监听器把 playingSegIndex 设成 null → 区间判定立刻失效（循环不生效的根因之一）。
+    seekProgrammatically(v, seg.start_sec);
+    setPlayingSeg(i); // 走 setPlayingSeg：state + ref 同步更新（ref 供 onTimeUpdate 即时读）
+    logFe('info', `段播放 project=${projectId} 第 ${i + 1} 段 ${seg.start_sec.toFixed(3)}-${seg.end_sec.toFixed(3)}s loop=${loopEnabled}`);
+    try {
+      await v.play();
+    } catch (e) {
+      logFe('error', `段播放失败 第 ${i + 1} 段: ${(e as Error).message}`);
+      setPlayingSeg(null);
+      message.error('播放失败，请点一下播放器的播放按钮');
+    }
+  };
+
+  // 手动停止段播放（再点一次播放按钮时走这里）。不影响 <video> 自己的普通播放。
+  const stopSegmentPlay = (): void => {
+    setPlayingSeg(null);
+    videoRef.current?.pause();
+  };
+
   // 时间 → 轨道内的百分比位置（Spec B：缩放后轨道的 0% / 100% 对应**窗口**两端，不再是整片两端；
   // L0 时 windowStart=0、levelSpan=duration → 与旧的 (t/duration)*100 完全等价，所以 L0 行为不变）。
   const timeToPct = useCallback((t: number): number => ((t - windowStart) / levelSpan) * 100, [windowStart, levelSpan]);
@@ -568,26 +665,25 @@ export default function StudioDetailPage() {
     return clamp(t, 0, duration); // 窗口贴到片尾时右边界会略超出 → 夹回来
   }, [duration, levelSpan, windowStart]);
 
-  // atTime：**轨道双击打点专用**（2026-10-09 审查第 1 轮 medium 修复）。
-  //   为什么需要这个参数：原来 addSegment 只读闭包里的 current state，而 seek() 只写
-  //   videoRef.current.currentTime，current 要等 <video onTimeUpdate> 异步触发才更新（周期 ~250ms）。
-  //   双击的两次 pointerdown 间隔远小于该周期 → addSegment() 读到的是**双击前的旧播放头**，
-  //   段会打在上一次位置而非双击处，与 spec D1「双击处打点」相悖。
-  //   工具栏那颗按钮不传参 → 继续按 current（播放头）打点，语义不变。
-  // ⚠️ **调用方必须写 `onClick={() => addSegment()}`，不能写 `onClick={addSegment}`**：
-  //   后者会把 MouseEvent 当成 atTime 传进来（tsc 会报 TS2322，但很容易顺手改成裸引用绕过）。
-  const addSegment = (atTime?: number): void => {
+  // 轨道双击打点已改内联（onTrackDoubleClick，见 :978 附近）：双击处直接 setSegs 造段，
+  // 不再走 addSegment——否则读闭包 current 会拿到双击前的旧播放头（seek 只写 video 的
+  // currentTime，state 的 current 要等 onTimeUpdate 异步触发才更新），spec D1「双击处打点」位置会偏。
+  // 因此本函数只服务工具栏「按播放头打点」那颗按钮：base = current，不接 atTime 形参
+  // （2026-10-13 review maintainability·low：atTime 已无任何调用方传值，删掉避免死参数误导）。
+  const addSegment = (): void => {
     // 判定统一走 addBlockReason（2026-10-09 审查第 5 轮 low），不在这里另写一套。
     // 这里**静默**返回（工具栏那颗按钮自己有 Tooltip 说明为什么点不了）；
     //   需要给用户看的路径（轨道双击）在调用前先取 addBlockReason() 弹 message。
     if (addBlockReason() !== null) return;
-    // 起点回退：播放头停在片尾时 current === duration，原写法 start = duration，则
-    //   end = clamp(duration+10, duration+0.1, duration) = duration → 生成 start === end 的**零长非法段**
+    // 起点回退：播放头停在片尾时 current === duration → 直接打点会产出 start === end 的**零长非法段**
     //   （段区块宽度 0、列表显「时长 00:00」，且与 D18「end_sec > start_sec」冲突，保存必被拒）。
-    // 因此剩余时长不足 0.1s 时把起点回退到片尾前 10 秒（并 clamp 到 ≥0），保证产生的段恒满足 end > start。
-    const base = atTime ?? current;
-    const start = duration - base < 0.1 ? clamp(duration - 10, 0, duration) : clamp(base, 0, duration);
-    const end = clamp(start + 10, start + 0.1, duration); // 从播放头起、默认 10 秒，随后可拖边微调
+    // 剩余时长不足 MIN_SEG_SEC 时把起点回退到片尾前 10 秒（并 clamp 到 ≥0），保证 end > start。
+    const startRaw = duration - current < MIN_SEG_SEC ? clamp(duration - 10, 0, duration) : current;
+    // 打点路径统一走 clampSegTime（吸附 16ms 网格 + 夹边界）：2026-10-13 review bug·medium——
+    // 原来用 clamp + 字面量 0.1 不吸附网格，与轨道拖边/列表按钮/双击收口不同口径，
+    // 文件头 clampSegTime 注释「所有段的时间都经过本函数」的断言不成立。
+    const start = snapToGrid(clamp(startRaw, 0, duration));
+    const end = clampSegTime(start + 10, start, 'end', duration);
     setSegs((prev) => [...prev, { start_sec: start, end_sec: end, label: null }]); // 走 setSegs → 置脏
     setSelected(segments.length); // 新段的下标 = 追加前的长度
     logFe('info', `打点 project=${projectId} import=${importId} ${start.toFixed(2)}-${end.toFixed(2)}s 共 ${segments.length + 1} 段`);
@@ -601,6 +697,18 @@ export default function StudioDetailPage() {
     setSegs((prev) => prev.map((s, k) => (k === i ? { ...s, label: label === '' ? null : label } : s))); // 走 setSegs → 置脏
   };
 
+  // 列表改起止时间（2026-10-13 spec §4.2）：**clamp 与吸附的唯一入口在这里**，
+  // 行内的 SegTimeBox 只负责收集用户输入。三条改时间的路径（轨道拖边 / 框里敲 / 上下按钮）
+  // 最终都经过 clampSegTime —— 这是「两边产出同一批数值」的保证。
+  const setSegTime = (i: number, edge: 'start' | 'end', nextSec: number): void => {
+    setSegs((prev) => prev.map((s, k) => {
+      if (k !== i) return s;
+      return edge === 'start'
+        ? { ...s, start_sec: clampSegTime(nextSec, s.end_sec, 'start', duration) }
+        : { ...s, end_sec: clampSegTime(nextSec, s.start_sec, 'end', duration) };
+    })); // 走 setSegs → 置脏
+  };
+
   // 拖边微调：pointermove 期间只改被拖段的首/尾（clamp 到 [0,duration]，首尾至少差 0.1s，和服务端校验同口径）
   // 监听挂在 window 上而不是元素上：指针划出细窄的拖柄后事件还能继续跟手（挂在元素上会中途“掉手”）
   const dragEdge = (index: number, edge: 'start' | 'end') => (e: ReactPointerEvent): void => {
@@ -609,11 +717,13 @@ export default function StudioDetailPage() {
     setSelected(index);
     const move = (ev: PointerEvent): void => {
       const t = xToTime(ev.clientX);
-      setSegs((prev) => prev.map((s, i) => { // 走 setSegs → 置脏（拖边微调也是要保存的改动）
+      setSegs((prev) => prev.map((s, i) => { // 走 setSegs → 置脏（拖边微调也是要保存的改动)
         if (i !== index) return s;
+        // ⚠️ 统一走 clampSegTime：吸附 16ms 网格 + 夹边界 + 保证两端至少差 0.1s。
+        //   原写法在这里内联 clamp，且用字面量 0.1 —— 与 addSegment / 服务端 parseSegments 三处口径相同但各写一份。
         return edge === 'start'
-          ? { ...s, start_sec: clamp(t, 0, s.end_sec - 0.1) }
-          : { ...s, end_sec: clamp(t, s.start_sec + 0.1, duration) };
+          ? { ...s, start_sec: clampSegTime(t, s.end_sec, 'start', duration) }
+          : { ...s, end_sec: clampSegTime(t, s.start_sec, 'end', duration) };
       }));
     };
     const up = (): void => {
@@ -818,8 +928,10 @@ export default function StudioDetailPage() {
   // 轨道双击打点（spec D1，2026-10-09 用户反馈图 1）。
   // 为什么这里还要显式 seek：双击 = 两次 pointerdown，startScrub 的「位移< 4px 按单击处理」分支
   //   可能把第二次的定位吃掉 → 自己再算一次时间并 seek，播放头一定落到双击处。
-  // ⚠️ 但**光靠 seek 不够**（2026-10-09 审查第 1 轮 medium）：addSegment 读的是 current state，
-  //   而 current 由 onTimeUpdate 异步更新 → 必须把算出的时间**显式传给 addSegment**。
+  // ⚠️ 光靠 seek 不够（2026-10-09 审查第 1 轮 medium）：addSegment 读的是 current state，
+  //   而 current 由 onTimeUpdate 异步更新 → 打点位置**不能靠读 current**。
+  //   2026-10-13 起双击已改内联直接造段（不调 addSegment，见下方 pendingStart 收口）：
+  //   位置 = 双击处 t 显式算出并 seek；addSegment 只服务工具栏按钮（按 current 打点）。
   // ⚠️ 事件类型是 **MouseEvent** 不是 PointerEvent：它挂在 onDoubleClick 上，
   //   React 类型定义里onDoubleClick?: MouseEventHandler<T>（@types/react 2510行），
   //   原生 dblclick 事件没有 pointerId/pressure 这类 pointer 专有字段。
@@ -833,10 +945,41 @@ export default function StudioDetailPage() {
       if (!readOnly && duration > 0) message.warning(blocked);
       return;
     }
-    const t = xToTime(e.clientX);
+    // ⚠️ 必须吸附到 16ms 网格：与轨道拖边、列表上下按钮产出同一批数值（clampSegTime 同口径）。
+    const t = snapToGrid(xToTime(e.clientX));
     seek(t);
-    addSegment(t); // ⚠️ 显式传双击位置：addSegment 内读 current state，而 current 由 onTimeUpdate 异步更新，
-                  //   不传就会读到双击前的旧播放头（2026-10-09 审查第 1 轮 medium）。内部已 setSelected(新段下标)。
+
+    // —— 起-收配对（2026-10-13 spec D1）——
+    // 第一次双击 → 落半成品（只有起点）；第二次双击 → 终点定在这里，转成实心完整段。
+    if (pendingStart === null) {
+      setPendingStart(t);
+      logFe('info', `打起点 project=${projectId} ${t.toFixed(3)}s`);
+      return;
+    }
+    // 离起点太近 → 视为误双击：丢弃半成品，并在**双击处**重起一个（用户 2026-10-13 拍板）。
+    // 「收口」与「误双击丢弃」走同一条路径，不另设分支，行为才可预测。
+    if (t - pendingStart < MIN_SEG_SEC) {
+      logFe('info', `收口失败(过短 ${(t - pendingStart).toFixed(3)}s)→丢弃半成品重起 ${pendingStart.toFixed(3)}→${t.toFixed(3)}s`);
+      setPendingStart(t);
+      return;
+    }
+    // ⚠️ **收口时必须再查一次段数上限**（spec D15，2026-10-13 审查 P0-2）：
+    //   addBlockReason 是在**进入**时查的，那时 pendingStart 还是 null；等到这一步收口时，
+    //   segments.length 可能已被别的入口（工具栏打点按钮）顶到 MAX_SEGMENTS。
+    //   不查 → setSegs 造出第 51 段 → 界面上看着加成功了，保存时才被服务端 parseSegments 拒。
+    if (segments.length >= MAX_SEGMENTS) {
+      message.warning(`最多 ${MAX_SEGMENTS} 段，先删一段`);
+      setPendingStart(null); // 丢弃半成品，不要让它挂在那儿等下一次双击
+      logFe('info', `收口被段数上限拦下 project=${projectId} 已有 ${segments.length} 段，半成品已丢弃`);
+      return;
+    }
+    const start = pendingStart;
+    setPendingStart(null);
+    // 终点也过一遍 clamp：保证 end 与 start 至少差 6 格且都在网格上（防两处 snap 后仍贴太近）
+    const end = clampSegTime(t, start, 'end', duration);
+    setSegs((prev) => [...prev, { start_sec: start, end_sec: end, label: null }]); // 走 setSegs → 置脏
+    setSelected(segments.length); // 新段的下标 = 追加前的长度（与 addSegment 同款）
+    logFe('info', `补终点 project=${projectId} ${start.toFixed(3)}-${end.toFixed(3)}s 共 ${segments.length + 1} 段`);
   };
 
   // 拖拽只允许**竖直**移动（2026-10-09 审查第 9 轮 low）。
@@ -868,6 +1011,67 @@ export default function StudioDetailPage() {
   //   为什么 occurrence 不能用数组下标：arrayMove 换位后每行下标都变 → id 全变 → 库认为位置又变了。
   //   occurrence 只依赖数据本身（0-10 那段前面有几种 0-10 的段），重排不影响它。
   const segOccurrence = useMemo(() => buildOccurrences(segments), [segments]);
+
+  /**
+ * 每行的**稳定渲染期 id**（2026-10-13，修复「每按一次 ▴ 输入框就重获焦点」）。
+ *
+ * ⚠️ **为什么不能直接用 segKeyAt 当 React key**：segKey 的组成是 `${start}-${end}#${occurrence}`
+ *   —— **起止时间在里面**。改一次时间（按 ▴ / 敲数字 / 拖边）→ key 变 → React 认为「这行没了、
+ *   那行是新的」→ **整行销毁重建**。后果两个：
+ *     ① 新挂载的 `<input>` 自动获得焦点（用户实测：点一下 ▴，输入框立刻被聚焦）；
+ *     ② 正在键入的草稿（draft state）随组件一起销毁，输入到一半的内容消失。
+ *
+ * ⚠️ **为什么不改 segKey**：它是 dnd-kit 的 sortable id，必须跟着数据走（见 SortableSegmentRow 里
+ *   segKey 上方的踩坑记录：带数组下标会让放下瞬间多播一遍交换动画）。改它会牵动整个排序链路。
+ *   所以另建一份**只给 React key 用**的 id。
+ *
+ * 实现：指纹只取**标签**（不含 start/end —— 那是会变的；也不含下标 i —— 排序会变），
+ *   指纹 → 尚未领用的 id 队列。每次渲染按顺序领 id、把没领完的归还，
+ *   于是「改时间 / 排序 / 删除 / 新增」下同一段拿到的 id 都不变（已用 node 模拟验证过这 6 种场景）。
+ * ⚠️ 为什么不加进 EditSeg：那会牵连 PUT 保存格式（见 SortableSegmentRow 的注释），id 只该活在渲染期。
+ */
+const rowIdsRef = useRef(new Map<string, string[]>());
+const nextRowIdRef = useRef(0);
+/** 与 segments 等长的稳定 id 数组。用 useMemo 保证一次渲染内算一次（它在 JSX 里被逐行消费）。 */
+const rowIds = useMemo(() => {
+  const table = rowIdsRef.current;
+  const want = segments.map((s) => s.label ?? '');
+  const out: (string | null)[] = want.map((f) => {
+    const pool = table.get(f);
+    if (pool === undefined || pool.length === 0) return null;
+    return pool.shift() as string;
+  });
+  // 缺的现分配
+  for (let i = 0; i < out.length; i++) {
+    if (out[i] === null) {
+      out[i] = `row-${nextRowIdRef.current}`;
+      nextRowIdRef.current += 1;
+    }
+  }
+  // 归还剩余，供下次渲染按指纹领用（池子里未被本次领用的保留）
+  for (const [f, pool] of table) {
+    const rest = pool.filter((id) => !out.includes(id));
+    if (rest.length === 0) table.delete(f);
+    else table.set(f, rest);
+  }
+  // 本次领用的按指纹收集（保持行序）后一次放回各自池子末尾，下次同指纹的行接着领。
+  // ⚠️ 不能边遍历边 set 覆盖：那样每个指纹只会留下「最后一个领用的 id」，
+  //    同指纹多行（如多个 label=null 的段，指纹全 ''）下次渲染领到的 id 集合全变 →
+  //    React key 每次渲染都不同 → 整行销毁重建 → ▴ 输入框重新聚焦 / draft 丢失复发
+  //    （2026-10-13 review-code-to-death bug·high 实测，已用 node 模拟验证 6 场景中的「多段同指纹」）。
+  const usedByFingerprint = new Map<string, string[]>();
+  for (let i = 0; i < out.length; i++) {
+    const f = want[i] as string;
+    const arr = usedByFingerprint.get(f) ?? [];
+    arr.push(out[i] as string);
+    usedByFingerprint.set(f, arr);
+  }
+  for (const [f, used] of usedByFingerprint) {
+    const pool = table.get(f) ?? [];
+    table.set(f, [...pool, ...used]);
+  }
+  return out as string[];
+}, [segments]);
 
   // 取第 i 段的 dnd-kit id。**三处（items / React key / onDragEnd 反查）都必须走它**。
   //   为什么多这一层：segOccurrence[i] 在 noUncheckedIndexedAccess 下是 number | undefined
@@ -988,6 +1192,9 @@ export default function StudioDetailPage() {
       onOk: () => {
         const n = segments.length;
         setSegs(() => []); // 走 setSegs → 置脏（清空后保存即 PUT segments:[]，C-5）
+        // ⚠️ 半成品一并清掉：它在 segments 之外，segments.length===0 的早退也拦不住它。
+        //   不清 → 「清空所有剪辑点」后轨道上还挂着一段虚线，用户会以为没清干净。
+        setPendingStart(null);
         setSelected(null);
         logFe('info', `清空剪辑点 project=${projectId} 共 ${n} 段`);
       },
@@ -1005,6 +1212,113 @@ export default function StudioDetailPage() {
     () => (importId !== null ? `${mediaFileUrl(importId)}&v=${version}&retry=${videoNonce}` : ''),
     [importId, version, videoNonce],
   );
+
+  /**
+ * 「这次 seek 是程序发起的」标记（2026-10-13 修循环不生效的根因）。
+ *
+ * ⚠️ **为什么必须有它**：我们自己在区间播放里会反复写 `currentTime`（定位到起点、到终点夹回去、
+ *   循环时拨回起点）。每次写都触发 `<video>` 的 `seeking` 事件 —— 而那个事件的监听器
+ *   「用户手动拖了进度条 → 解除段播放状态」会被**连带触发**：循环刚拨回起点，
+ *   `setPlayingSegIndex(null)` 就执行了，下一个 `onTimeUpdate` 直接 return → **表现为「到终点就停，循环不生效」**。
+ *
+ * 判据：程序写 currentTime 前后把 ref 置 true，等 `seeked`（seek 完成）后再清。
+ *   只有 ref 为 false 时进来的 seeking 才是用户手动操作。
+ */
+const programmaticSeekRef = useRef(false);
+
+/**
+ * playingSegIndex 的**同步镜像**（2026-10-13 修循环不生效的第二个根因）。
+ *
+ * ⚠️ **为什么需要 ref 而不是直接读 state**：`onTimeUpdate` 是 React 渲染产物里的闭包，
+ *   读的是**当次渲染时**的 playingSegIndex。而 `setPlayingSegIndex` 引起的重渲染要等到下一次
+ *   React 提交才完成 —— 在这中间的窗口里，`timeupdate` 事件读到的仍是**旧值**。
+ *   表现：刚 `setPlayingSegIndex(i)` 就立刻 `play()`，紧接着的那次 timeupdate 若落在窗口内，
+ *   读到的还是 null → `if (playingSegIndex === null) return` → 区间判定整个失效。
+ *   ref 在 set 的**同一刻**同步更新，不受渲染时机影响。
+ */
+const playingSegIndexRef = useRef<number | null>(null);
+
+/** 统一改 playingSegIndex 的入口：state（驱动渲染）+ ref（供事件回调同步读）。 */
+const setPlayingSeg = (v: number | null): void => {
+  playingSegIndexRef.current = v;
+  setPlayingSegIndex(v);
+};
+
+/**
+ * loopEnabled 的同步镜像（2026-10-13 修「播放越过结束点」的根因）。
+ *
+ * ⚠️ **为什么必须读 ref**：`onTimeUpdate` 是 React 渲染产物里的闭包，拿的是**当次渲染时**的
+ *   loopEnabled。用户点开循环的**那一刻** setState 还没生效（重渲染要等下一次提交），
+ *   这段窗口里若来一次 timeupdate（周期约 250ms），它读到的是 `false`（旧值）→
+ *   走「不循环」分支把视频暂停 → 表现为**播放头停在结束点、或越过结束点继续走**
+ *   （用户 2026-10-13 实测报的现象）。
+ *
+ * ⚠️ **写入点在点击处理函数里、setState 的同一刻**，不是渲染函数体 ——
+ *   写在渲染体里等于「等下一次渲染才同步」，那正是我们要消除的延迟。
+ */
+const loopEnabledRef = useRef(false);
+
+/**
+ * segments 的同步镜像（2026-10-13 修「播放中改时间不生效」）。
+ *
+ * ⚠️ 为什么 segments 也需要 ref：`onTimeUpdate` 读的是闭包里的 segments（当次渲染的快照）。
+ *   用户在段列表改时间 → setState → 重渲染未提交的窗口里，区间判定仍按**旧区间**跑
+ *   （旧 end_sec 可能已经小于当前播放位置 → 立刻误停）。实测表现：「改短了这一段，正在播的却突然停」。
+ *   ⚠️ 这里可以直接在**渲染函数体**里同步（不像 loopEnabledRef 要写在点击处理函数里）：
+ *   segments 只会由程序侧的 setSegs 改动，不存在「用户点击 → 等待渲染」这种必须抢时间的窗口，
+ *   而渲染时同步能保证「每次渲染后 ref 都是最新的 segments 快照」。
+ */
+const segmentsRef = useRef<EditSeg[]>([]);
+segmentsRef.current = segments;
+
+/** 循环开关的唯一改入口：ref 同步 + state 驱动渲染（按钮高亮靠 state）。 */
+const toggleLoop = (): void => {
+  const next = !loopEnabledRef.current;
+  loopEnabledRef.current = next; // ← 同步，onTimeUpdate 立刻能读到
+  setLoopEnabled(next);
+  logFe('info', `循环播放开关 → ${next ? '开' : '关'}`);
+};
+
+/**
+ * 用户手动拖动原生控制条 → seeking 事件触发 → **解除段播放状态**（spec D10 注，2026-10-13 审查 P1-5）。
+ * 不这么做：用户把播放头拖到段外，onTimeUpdate 里的区间判定会**强制暂停**他的手动操作 ——
+ *   用户想自由听，他却怎么拖都拖不动。
+ * ⚠️ **必须跳过程序性 seek**（见 programmaticSeekRef 的注释）——不跳过就是「循环不生效」的根因。
+ * ⚠️ 依赖用 previewSrc（换素材时 <video key> 变了会重挂），**不要用 playingSegIndex** ——
+ *   进依赖会导致每帧重挂监听。
+ */
+useEffect(() => {
+    const v = videoRef.current;
+    if (v === null) return undefined;
+    const onSeeking = (): void => {
+      if (programmaticSeekRef.current) return; // 程序自己 seek 的，不管
+      setPlayingSeg(null);
+    };
+    // 2026-10-13 review bug·low：程序性 seek 的标记真正在 seeked（seek 完成）时清，
+    // 不能只靠 seekProgrammatically 里的 120ms 固定超时——seeking 事件异步派发，
+    // 主线程被重渲染/解码占满时可能晚于 120ms 到达，标记已被清 → 自己的 seek 被当
+    // 用户手动拖动 → setPlayingSeg(null) → 恰好复现「循环不生效」。
+    const onSeeked = (): void => { programmaticSeekRef.current = false; };
+    v.addEventListener('seeking', onSeeking);
+    v.addEventListener('seeked', onSeeked);
+    return () => {
+      v.removeEventListener('seeking', onSeeking);
+      v.removeEventListener('seeked', onSeeked);
+    };
+  }, [previewSrc]);
+
+  /**
+   * 程序性 seek 的统一入口：置标记 → 改 currentTime → 等 seeked 再清标记。
+   * 所有「我们自己改播放位置」的地方都必须走它（playSegment 的定位、区间判定里的夹回/拨回）。
+   */
+  const seekProgrammatically = (v: HTMLVideoElement, t: number): void => {
+    programmaticSeekRef.current = true;
+    v.currentTime = t;
+    // 标记在 seeked（seek 完成）时清（见上方监听）。这里只留兜底：
+    // 极端情况下 seeked 不来（如目标时间与当前相同），延迟清掉标记，否则标记一直挂着，
+    // 之后用户真的手动拖进度条也不响应了。
+    window.setTimeout(() => { programmaticSeekRef.current = false; }, 120);
+  };
 
   // 成品列表每条的播放地址（Important 2 修复轮 1）：**同样必须 useMemo 钉住**，理由与 previewSrc 完全相同 ——
   //   audioFileUrl 内部第一件事就是 logFe(debug) + 同步 POST /api/logs。原先这里直调，
@@ -1170,6 +1484,24 @@ export default function StudioDetailPage() {
               {/* 禁用态包一层 span，否则 antd Tooltip 收不到鼠标事件、悬停不出提示（D9 要求提示可查） */}
               <span>
                 <CyberButton type="primary" icon={<SaveOutlined />} loading={saving} disabled={readOnly} onClick={() => void doSave()} />
+              </span>
+            </Tooltip>
+            {/* 循环播放总开关（spec D11）。
+                ⚠️ **状态必须自己加类，不能靠 type="primary"**（2026-10-13 用户实测报「看不出开没开」）：
+                cyber-btn 的切角内层是 `.cyber-btn.ant-btn::after`，背景写死 rgba(0,0,0,0.75) 且盖在
+                antd 的 primary 背景**之上** → 传 type="primary" 只改了外框，内层不变，两态看起来一样。
+                `is-loop-on` 走 cyber.css 里新加的规则，它**直接覆盖 ::after 的背景**（那才是用户看到的那层）。
+                ⚠️ 不用红色表示「开」：本页红色 = 危险/删除（保存旁的删除键就是红的），语义冲突。
+                ⚠️ aria-pressed 只是给读屏的，不能替代视觉状态。*/}
+            <Tooltip title={loopEnabled ? '循环播放：开（点任意段的播放都会循环）' : '循环播放：关'}>
+              <span>
+                <CyberButton
+                  icon={<RetweetOutlined />}
+                  className={loopEnabled ? 'is-loop-on' : undefined}
+                  aria-label="循环播放开关"
+                  aria-pressed={loopEnabled}
+                  onClick={toggleLoop}
+                />
               </span>
             </Tooltip>
             {/* N1:导出内容已不止音频(导出区可选视频),固定文案去掉"音频"二字;「以当前界面上的段为准」保留(D15 语义)。
@@ -1379,7 +1711,45 @@ export default function StudioDetailPage() {
                 setVideoErrCode(code ?? 0); // 0 = 有 onError 但读不到 code（异常兜底），文案归到「原因未知」
                 logFe('error', `视频素材加载失败 import=${importId} project=${projectId} mediaErrCode=${code ?? '(none)'} retry=${videoNonce}`);
               }}
-              onTimeUpdate={(e) => setCurrent(e.currentTarget.currentTime)}
+              onTimeUpdate={(e) => {
+                const v = e.currentTarget;
+                const t = v.currentTime;
+                setCurrent(t);
+                // 区间结束判定（spec D10）。⚠️ timeupdate 周期约 250ms，
+                //   所以到点后必须 pause() 再把 currentTime 夹回 end_sec，否则会溢出最多 250ms（听感是「停晚了」）。
+                // ⚠️ 读 **ref** 而不是 state（见 playingSegIndexRef 的注释）：state 有「set 了但还没重渲染」的窗口，
+                //   在窗口内这里会读到 null → 区间判定整段失效（表现为循环拨回去了却立刻停）。
+                const pi = playingSegIndexRef.current;
+                if (pi === null) return;
+                // ⚠️ 读 segmentsRef 而不是闭包里的 segments（见 segmentsRef 的注释）：
+                //   否则「播放中改这一段的时间」在重渲染窗口内仍按旧区间判定 → 误停。
+                const seg = segmentsRef.current[pi];
+                if (seg === undefined) return;
+                if (t < seg.end_sec) return;
+                // ⚠️ 这里**只夹不跳**：把越界的那点溢出吃掉。非循环路径到此为止。
+                //   循环路径在下面拨回起点 —— 若在这里也拨，两次 seek 会在同一 tick 里互相打架。
+                if (t > seg.end_sec) seekProgrammatically(v, seg.end_sec);
+                // ⚠️ 读 **loopEnabledRef** 而不是 state（见 loopEnabledRef 的注释）：
+                //   state 有「刚点开关但还没重渲染」的窗口，在窗口内这里读到旧值 false →
+                //   走「不循环」分支 → 播放头越过结束点继续走（用户 2026-10-13 实测报的现象）。
+                if (!loopEnabledRef.current) {
+                  v.pause();
+                  setPlayingSeg(null); // 播完 → 解除行高亮
+                  return;
+                }
+                // 循环：拨回起点继续播。
+                // ⚠️ **必须先 seek 再 play，且不能 pause** —— <video> 在暂停状态下改 currentTime
+                //   不会自己恢复播放（表现为「循环拨回去了但还是不动」）。
+                // ⚠️ seek 走 seekProgrammatically：不走它会触发 seeking → playingSegIndex 被置 null
+                //   → 下一个 onTimeUpdate 直接 return，**这正是「循环不生效」的根因**（2026-10-13 实测）。
+                seekProgrammatically(v, seg.start_sec);
+                if (v.paused) void v.play().catch((err: unknown) => {
+                  logFe('error', `循环播放续播失败: ${(err as Error).message}`);
+                });
+                // 2026-10-13 review performance·medium：循环回起点高频触发（最短段 ~0.1s 时 ~9 条/秒），
+                // logFe('info') 会同步 push 环形缓冲 + POST /api/logs，冲掉日志页缓冲 —— 降 debug 级。
+                logFe('debug', `循环回起点 project=${projectId} 第 ${pi + 1} 段 → ${seg.start_sec.toFixed(3)}s`);
+              }}
               style={{ width: '100%', maxWidth: 720, background: '#000', borderRadius: 0, alignSelf: 'center' }}
             />
 
@@ -1591,6 +1961,24 @@ export default function StudioDetailPage() {
                     </div>
                   );
                 })}
+                {/* 半成品段（2026-10-13 spec D1/D2）：只有起点、还没有终点。
+                    虚线框 + 半透明，与实心完整段视觉上必须能一眼分开。
+                    ⚠️ **刻意不挂 onDoubleClick 拦截**：完整段的区块挂了 stopPropagation 是**防双击加段**，
+                    而半成品需要双击冒泡到轨道层走「收口」——挂了就永远收不了口。
+                    ⚠️ pointerEvents:'none'：它不能挡任何指针交互（拖边、定位、双击都得穿过它）。
+                    宽度从起点画到窗口右缘（终点未定）；起点在窗口左侧时不画（画出来是负宽度）。 */}
+                {duration > 0 && pendingStart !== null && pendingStart >= windowStart && pendingStart < windowStart + levelSpan && (
+                  <div
+                    style={{
+                      position: 'absolute', top: RULER_H, height: filmH + waveH,
+                      left: `${timeToPct(pendingStart)}%`,
+                      width: `${Math.max(0, ((windowStart + levelSpan - pendingStart) / levelSpan) * 100)}%`,
+                      boxSizing: 'border-box', pointerEvents: 'none',
+                      background: 'rgba(94,246,255,0.06)',
+                      border: '1px dashed rgba(94,246,255,0.55)',
+                    }}
+                  />
+                )}
                 {/* 播放头：随 <video> 的 timeupdate 走；pointerEvents none，别挡住拖动定位。
                     Spec B：位置按窗口换算；播放头在**窗口外**时不画 —— 换算出来是负百分比或 >100%，
                     画出来就是一条贴在容器边上、骗人的假红线。 */}
@@ -1651,17 +2039,21 @@ export default function StudioDetailPage() {
               collisionDetection={closestCenter}
               onDragEnd={onDragEnd}
             >
-              {/* ⚠️ items、每行的 React key、onDragEnd 反查，三者都用同一个 segKeyAt()（底层是 SortableSegmentRow 导出的 segKey），
-                    不要在任何一处手写模板字符串：两份写法一旦漂移，dnd-kit 会静默认不出行、排序落到错误的行上。
-                    为什么 id 里带 occurrence 而不是数组下标：纯起止时间会撞键（同一播放头打点两次 → 两段起止相同），
-                    而带数组下标会让**重排后每行 id 全变** → 库认为位置又变了（sortable.esm.js:313 itemsHaveChanged）
-                    → 放下瞬间多播一遍 1↔2 对调动画（用户 2026-10-09 实测报的现象，根因见 segKey 注释）。
-                    ⚠️ React 的 key 也必须是它：key={i} 在重排后会复用错的 DOM 节点，行内容与数据错位。 */}
+              {/* ⚠️ **两套 id，别混用**（2026-10-13 起分开）：
+                    ① `SortableContext items` 与 `onDragEnd` 反查 → **必须用 segKeyAt()**（底层 segKey）。
+                       两处写法漂移时 dnd-kit 会静默认不出行、排序落到错误的行上。
+                       为什么 id 里带 occurrence 而不是数组下标：纯起止时间会撞键（同一播放头打点两次 → 两段起止相同），
+                       而带数组下标会让**重排后每行 id 全变** → 库认为位置又变了（sortable.esm.js:313 itemsHaveChanged）
+                       → 放下瞬间多播一遍 1↔2 对调动画（用户 2026-10-09 实测报的现象，根因见 segKey 注释）。
+                       ⚠️ 它**含起止时间**，所以只能给 dnd-kit 用，不能给 React key 用（见 ②）。
+                    ② 每行的 React `key` → **用 rowIds[i]**，那是不含时间的稳定 id。
+                       曾经这里用的是 segKeyAt(i)，后果：改一次时间 key 就变 → 整行销毁重建 →
+                       输入框自动重新聚焦 + 键入中的草稿丢失（用户 2026-10-13 实测报「点一下 ▴ 焦点就跳进输入框」）。 */}
               <SortableContext items={segments.map((_s, i) => segKeyAt(i))} strategy={verticalListSortingStrategy}>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
                   {segments.map((s, i) => (
                     <SortableSegmentRow
-                      key={segKeyAt(i)}
+                      key={rowIds[i]}
                       index={i}
                       occurrence={segOccurrence[i] ?? 0}
                       seg={s}
@@ -1672,6 +2064,15 @@ export default function StudioDetailPage() {
                       onSelect={setSelected}
                       onDelete={removeSegment}
                       onLabelChange={setLabel}
+                      onTimeChange={setSegTime}
+                      onPlaySegment={(i) => {
+                        // ⚠️ 读 ref 而不是 state：state 有「刚 set 完还没重渲染」的窗口，
+                        //   连点两下时第二次会误判成「不是当前段」→ 变成重新起播而不是停止。
+                        if (playingSegIndexRef.current === i) stopSegmentPlay();
+                        else void playSegment(i);
+                      }}
+                      playing={playingSegIndex === i}
+                      readOnlyMsg={readOnlyMsg}
                     />
                   ))}
                 </div>

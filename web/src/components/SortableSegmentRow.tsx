@@ -4,13 +4,110 @@
 //      整行拖会与行内的拖边微调把手打架，用户想微调某段时会误触发整行搬家。
 //   ② 列宽固定：序列/时间段/时长/删除按钮各自定宽，只有标签框自适应 —— 解决跨行对不齐。
 // ⚠️ 本组件是**纯展示 + 事件回调**，不碰任何业务逻辑（增删改排序由父组件 setSegs 统一走）。
-import { DeleteOutlined, HolderOutlined } from '@ant-design/icons';
+import { DeleteOutlined, HolderOutlined, PauseOutlined, PlayCircleOutlined } from '@ant-design/icons';
 import { useSortable } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
-import { Button, Input, Tooltip, Typography } from 'antd';
+import { Button, Input, Tooltip, Typography, type InputRef } from 'antd';
+import { useRef, useState } from 'react';
 import { cyberColors, cyberFontStack } from '@/setup/theme';
-import { fmtTime } from '@/time';
+import { fmtTime, fmtTimeMs, parseTimeMs } from '@/time';
 import './segment-row.css';
+
+/**
+ * 起止时间框（2026-10-13 spec §4.2）：可输入 + 上下按钮 ±16 毫秒。
+ *
+ * ⚠️ **为什么输入框用 draft state**：用户键入过程中会逐字符改值（想把 `01:23.456` 改成 `01:30.000`，
+ *   中途会出现 `01:23.4`、`01:23.`、`01:2` …）。若每次 onChange 都提交，value 被父组件 state 反灌
+ *   会把输入内容抢走（刚敲下 `01:2` 就被 clamp 后的值替换，根本敲不完）。故：键入期间由 draft 接管，
+ *   失焦或回车才提交。
+ *
+ * ⚠️ **clamp 与吸附不在这里做**：全在父组件的 clampSegTime（统一判定处）。本组件只负责
+ *   「收集用户输入 → 交给父组件」—— 本仓已为「同一判定散在多处必然漂移」留过教训（addBlockReason 的旧事）。
+ */
+function SegTimeBox({
+  value, edge, index, disabled, onSelect, onCommit,
+}: {
+  value: number;
+  edge: 'start' | 'end';
+  index: number;
+  disabled: boolean;
+  onSelect: () => void;
+  onCommit: (sec: number) => void;
+}) {
+  const [draft, setDraft] = useState<string | null>(null);
+  const inputRef = useRef<InputRef>(null);
+  /** 这次聚焦是 step() 程序发起的（用于跳过 onSelect 选行）。见 onFocus 处注释。 */
+  const focusingByStep = useRef(false);
+  // 非键入态显示 mm:ss.mmm —— 看得见毫秒，16ms 的步进才看得出变化（spec D4）
+  const shown = draft ?? fmtTimeMs(value);
+  const commit = (raw: string): void => {
+    setDraft(null);
+    const t = parseTimeMs(raw); // 支持 mm:ss.mmm / ss.mmm / 纯数字
+    if (t !== null) onCommit(t);
+    // t === null（敲了非法内容）→ 什么都不做，draft 清空后自动回显真值。
+    //   不弹错误、不保留草稿：用户敲错一个字符不该被拦下（spec D7）。
+  };
+  // 步进：±16 毫秒。**键盘 ↑/↓ 与鼠标点 ▴▾ 走的是同一个函数**（spec D5）。
+  // ⚠️ 步进后**主动把焦点放回输入框**：这样连点 ▴ 不用重新点输入框、方向键也能接着用。
+  //   用 setTimeout(0) 而不是直接 focus()：直接调会早于 React 把新值渲染进 DOM，
+  //   光标可能落在旧文本的末尾（表现为「焦点到了但位置不对」）。
+  const step = (deltaSec: number): void => {
+    setDraft(null);
+    onCommit(value + deltaSec);
+    focusingByStep.current = true;
+    window.setTimeout(() => {
+      inputRef.current?.focus();
+      // 焦点事件是同步派发的，这里再撤标记即可（留一帧余量防 antd 异步派发）
+      window.setTimeout(() => { focusingByStep.current = false; }, 0);
+    }, 0);
+  };
+  const btn = (deltaSec: number, label: string, glyph: string) => (
+    <span className="sr-time-step sr-no-drag">
+      <button
+        type="button"
+        className="sr-time-step-btn"
+        disabled={disabled}
+        aria-label={`${label} ${Math.round(Math.abs(deltaSec) * 1000)} 毫秒`}
+        title={`${label} ${Math.round(Math.abs(deltaSec) * 1000)} 毫秒（快捷键 ↑↓）`}
+        onPointerDown={(e) => e.stopPropagation()}
+        onClick={(e) => { e.stopPropagation(); step(deltaSec); }}
+      >{glyph}</button>
+    </span>
+  );
+  return (
+    <span className="sr-time-box sr-no-drag" style={{ display: 'flex', alignItems: 'center', gap: 2 }}>
+      {btn(-0.016, `第 ${index + 1} 段${edge === 'start' ? '开始' : '结束'}时间减`, '▾')}
+      <Input
+        ref={inputRef}
+        className="sr-time"
+        size="small"
+        value={shown}
+        disabled={disabled}
+        aria-label={`第 ${index + 1} 段${edge === 'start' ? '开始' : '结束'}时间（上下方向键调整 16 毫秒）`}
+        // ⚠️ onFocus 只在「用户自己点进来 / Tab 进来」时选中整行；
+        //   step() 里程序 focus() 也会触发它 —— 那会让「点一下 ▴」整行闪红，属打扰。
+        //   用 focusingByStep 挡掉程序性聚焦。
+        onFocus={() => { if (!focusingByStep.current) onSelect(); }}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={(e) => commit(e.target.value)}
+        onPressEnter={(e) => commit((e.target as HTMLInputElement).value)}
+        // ⚠️ **键盘 ↑/↓ = ±16 毫秒**（spec D5）。antd Input 会把 ↑/↓ 绑给自己的增减，
+        //   这里抢过来自己处理：onKeyDown 里 preventDefault 后不再冒泡给 antd，
+        //   所以 antd 那套「±1」不会叠加执行。
+        // ⚠️ Shift/Alt 加修饰键时不拦截（留给系统/输入法；也避免 Shift+↑ 这类组合行为诡异）。
+        onKeyDown={(e) => {
+          if (disabled) return;
+          if (e.key !== 'ArrowUp' && e.key !== 'ArrowDown') return;
+          if (e.shiftKey || e.altKey || e.ctrlKey || e.metaKey) return;
+          e.preventDefault();     // 阻止 antd Input 的默认增减
+          e.stopPropagation();    // 不让它冒泡到行/列表的快捷键处理
+          step(e.key === 'ArrowUp' ? 0.016 : -0.016);
+        }}
+      />
+      {btn(0.016, `第 ${index + 1} 段${edge === 'start' ? '开始' : '结束'}时间加`, '▴')}
+    </span>
+  );
+}
 
 export interface SortableSegmentRowProps {
   index: number;
@@ -32,6 +129,18 @@ export interface SortableSegmentRowProps {
   onSelect: (index: number) => void;
   onDelete: (index: number) => void;
   onLabelChange: (index: number, label: string) => void;
+  /**
+   * 改起止时间。**传进来的是用户想要的值，clamp 与吸附全在父组件做**（clampSegTime），
+   * 行内不重复判定 —— 本仓已为「同一个判定散在多处必然漂移」留过教训（addBlockReason 三份判定的旧事）。
+   * @param nextSec 用户输入/步进给出的秒数（可能越界，由父组件夹）
+   */
+  onTimeChange: (index: number, edge: 'start' | 'end', nextSec: number) => void;
+  /** 段播放按钮点击（Task 5）。**只读态禁用**（spec D13）：只读 = 资料已删除 / 没有视频素材 → 无源可播。 */
+  onPlaySegment: (index: number) => void;
+  /** 该段是否正在播放（决定按钮图标与行高亮）。 */
+  playing: boolean;
+  /** 只读原因文案（父组件算出）。播放按钮置灰时用它做 Tooltip。 */
+  readOnlyMsg: string | null;
 }
 
 /**
@@ -58,8 +167,8 @@ export const segKey = (seg: { start_sec: number; end_sec: number }, occurrence: 
   `${seg.start_sec}-${seg.end_sec}#${occurrence}`;
 
 export default function SortableSegmentRow({
-  index, occurrence, seg, selected, readOnly, glitch, glitchSeq,
-  onSelect, onDelete, onLabelChange,
+  index, occurrence, seg, selected, readOnly, readOnlyMsg, glitch, glitchSeq,
+  onSelect, onDelete, onLabelChange, onTimeChange, onPlaySegment, playing,
 }: SortableSegmentRowProps) {
   // id = 起止时间 + occurrence。**不要改成数组下标** —— 判据与踩坑见上方 segKey 的注释：
   //   下标随重排变化会让 id 全变，dnd-kit 判定「位置又变了」→ 放下瞬间多播一遍交换动画（用户实测报过）。
@@ -76,7 +185,7 @@ export default function SortableSegmentRow({
   return (
     <div
       ref={setNodeRef}
-      className={`sr-row${isDragging ? ' is-dragging' : ''}`}
+      className={`sr-row${isDragging ? ' is-dragging' : ''}${playing ? ' is-playing' : ''}`}
       onClick={() => onSelect(index)}
       style={{
         display: 'flex', alignItems: 'center', gap: 8, padding: '6px 8px',
@@ -129,9 +238,26 @@ export default function SortableSegmentRow({
         </span>
       </span>
 
-      <Typography.Text className="sr-span" style={{ fontFamily: cyberFontStack, color: cyberColors.cyan }}>
-        {fmtTime(seg.start_sec)} - {fmtTime(seg.end_sec)}
-      </Typography.Text>
+      {/* 起止时间：可编辑输入框 + 上下按钮 ±16 毫秒（2026-10-13 spec §4.2）。
+          替换掉原来的纯文本 `.sr-span`。**时长列仍在右边、仍用 fmtTime 到秒** ——
+          时长是概览信息不需要毫秒，且它与两个可编辑框是不同语义区。 */}
+      <SegTimeBox
+        value={seg.start_sec}
+        edge="start"
+        index={index}
+        disabled={readOnly}
+        onSelect={() => onSelect(index)}
+        onCommit={(sec) => onTimeChange(index, 'start', sec)}
+      />
+      <span className="sr-time-sep sr-no-drag" aria-hidden="true">→</span>
+      <SegTimeBox
+        value={seg.end_sec}
+        edge="end"
+        index={index}
+        disabled={readOnly}
+        onSelect={() => onSelect(index)}
+        onCommit={(sec) => onTimeChange(index, 'end', sec)}
+      />
 
       <Typography.Text className="sr-dur" type="secondary" style={{ fontSize: 12, fontFamily: cyberFontStack, color: cyberColors.cyan }}>
         时长 {fmtTime(seg.end_sec - seg.start_sec)}
@@ -148,7 +274,28 @@ export default function SortableSegmentRow({
         onChange={(e) => onLabelChange(index, e.target.value)}
       />
 
-      <Tooltip title={readOnly ? '只读态不能删除' : '删除这一段'}>
+      {/* 单段播放：播这一段（spec D10）。⚠️ 必须 stopPropagation —— 行的 onClick 会 setSelected(index)，
+          不拦会同时触发选中（与删除按钮同款理由，见下方 onDelete 的注释）。
+          ⚠️ 只读态**禁用**（spec D13）：只读 = 资料已删除 / 没有视频素材（studio-detail.tsx:1038-1042）
+          → <video> 没有源可播。判据是「有没有源可播」，不是「改不改数据」。与 playSegment 里的守卫同口径。
+          ⚠️ readOnly 由父页 readOnly = readOnlyMsg !== null 推出 → readOnly 为真时 readOnlyMsg 必非空，
+          `?? '资料不可用'` 是运行期死代码（2026-10-13 review maintainability·medium，与删除按钮同款口径）。 */}
+      <Tooltip title={readOnly ? readOnlyMsg : (playing ? '停止播放这一段' : '播放这一段')}>
+        {/* 包 span：antd Tooltip 对 disabled 按钮收不到鼠标事件（与下方删除按钮同款） */}
+        <span className="sr-play sr-no-drag" style={{ display: 'flex' }}>
+          <Button
+            size="small"
+            type="text"
+            icon={playing ? <PauseOutlined /> : <PlayCircleOutlined />}
+            disabled={readOnly}
+            aria-label={playing ? `停止播放第 ${index + 1} 段` : `播放第 ${index + 1} 段`}
+            onClick={(e) => { e.stopPropagation(); onPlaySegment(index); }}
+            style={{ color: playing ? cyberColors.red : cyberColors.cyan }}
+          />
+        </span>
+      </Tooltip>
+
+      <Tooltip title={readOnly ? readOnlyMsg : '删除这一段'}>
         {/* 包 span：antd Tooltip 对 disabled 按钮收不到鼠标事件 */}
         <span className="sr-del sr-no-drag" style={{ display: 'flex' }}>
           <Button
