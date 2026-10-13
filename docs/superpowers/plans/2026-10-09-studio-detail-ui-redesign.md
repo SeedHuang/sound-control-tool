@@ -10,6 +10,20 @@
 
 **Spec:** `docs/superpowers/specs/2026-10-09-studio-detail-ui-redesign.md`
 
+## 进度状态（2026-10-10 更新）
+
+**7 个任务的代码全部落地**，勾选框已按实际状态补上。**但 §8 的 7 条真机自检一条都没做。**
+
+| 项| 状态 | 依据 |
+|---|---|---|
+| Task 1–7 的代码 Step（30 个） | ✅ 已勾 | 逐条取证：三个新组件存在、`pnpm -r run typecheck` EXIT=0、残留符号（`moveSegment`/`latestProduct`/`previewing`/`previewTip`/`onPreviewAudio`/`audioProducts`/`stopPreview`）在 `web/src` 里已零真代码命中 |
+| 7 个 typecheck Step | ✅ 已勾 | `pnpm -r run typecheck` → 三包零错，EXIT=0 |
+| 7 个收尾 Step | ✅ 已勾 | 内容是「改动留工作区，不做任何 git 操作」—— 实际未做任何 git 写操作 |
+| **7 个真机验证 Step** | ⬜ **未勾** | **一条都没点过。**`web/` 无单测、vitest 在本环境 stuck 在 `[queued]`；typecheck 只能证明编译通过，证明不了「拖起来手感对不对」 |
+| §8 跨页面回归 | ⬜ **未跑** | `PageHeader` 是 `library.tsx` / `studio.tsx` 的共用组件，资料库页有没有被带坏**没看过** |
+
+⬜ 的部分**只有用户能在真机上点**，程序侧验不了。清单见 §9（7 条）与 §8（3 个页面）。
+
 ## Global Constraints
 
 - **禁止任何 git 写操作**（`git add` / `commit` / `push` 一律不做）。每个任务的收尾动作统一为「改动留在工作区，由用户提交」。理由：用户有全局禁令，且计划里的 commit 步骤不算授权。
@@ -100,7 +114,7 @@ Select-String -Path studio-detail.tsx -Pattern "const moveSegment|const clearAll
   leading?: ReactNode   // 渲染在 icon 之后、title 之前
   ```
 
-- [ ] **Step 1: 建 `StudioToolbar.tsx`**
+- [x] **Step 1: 建 `StudioToolbar.tsx`**
 
 创建 `web/src/components/StudioToolbar.tsx`：
 
@@ -121,7 +135,7 @@ export default function StudioToolbar({ tools }: StudioToolbarProps) {
 }
 ```
 
-- [ ] **Step 2: 给 `PageHeader` 加 `leading` prop**
+- [x] **Step 2: 给 `PageHeader` 加 `leading` prop**
 
 `web/src/components/PageHeader.tsx`：在 `PageHeaderProps` 接口里加（放在 `icon` 之后）：
 
@@ -140,7 +154,7 @@ export default function StudioToolbar({ tools }: StudioToolbarProps) {
 
 ⚠️ **不要动 `toolbarInline` / `titleMaxWidth` / 标题容器 flex 的任何逻辑**——那三处上一轮刚改过并验证过。
 
-- [ ] **Step 3: `studio-detail.tsx` 包一层 + 返回键移最左**
+- [x] **Step 3: `studio-detail.tsx` 包一层 + 返回键移最左**
 
 在 `PageHeader` 调用处（约 L938-995），把 `toolbar={...}` 的内容整体包进 `StudioToolbar`，并给 `PageHeader` 传 `leading`：
 
@@ -171,7 +185,7 @@ export default function StudioToolbar({ tools }: StudioToolbarProps) {
 
 **返回键原来在 toolbar 的最末**（`<Tooltip title="返回剪辑室"><CyberButton icon={<ArrowLeftOutlined />} .../></Tooltip>`，约 L990-992），**整块删掉**，不要重复渲染。
 
-- [ ] **Step 4: 补 import**
+- [x] **Step 4: 补 import**
 
 `studio-detail.tsx` 顶部加：
 
@@ -179,7 +193,7 @@ export default function StudioToolbar({ tools }: StudioToolbarProps) {
 import StudioToolbar from '@/components/StudioToolbar';
 ```
 
-- [ ] **Step 5: typecheck**
+- [x] **Step 5: typecheck**
 
 ```powershell
 cd d:\Seed\sound-control-tool\web; npx tsc --noEmit
@@ -198,7 +212,7 @@ cd d:\Seed\sound-control-tool\web; pnpm dev
 2. 点击返回仍弹「有未保存的剪辑点」确认框（`goBack` 逻辑未变）
 3. **切到资料库页**（`PageHeader` 的另一个调用方）——布局与改动前**完全一致**，`leading` 不渲染
 
-- [ ] **Step 7: 收尾**
+- [x] **Step 7: 收尾**
 
 改动留工作区，**不做任何 git 操作**。
 
@@ -213,7 +227,7 @@ cd d:\Seed\sound-control-tool\web; pnpm dev
 - Consumes: 无（纯删除）
 - Produces: 无新导出；**清理掉的符号**：`latestProduct` / `previewing` / `previewTip` / `onPreviewAudio` / `audioProducts`
 
-- [ ] **Step 1: 删工具栏里那组按钮**
+- [x] **Step 1: 删工具栏里那组按钮**
 
 在 `StudioToolbar` 的 `tools` 里删掉（现约 L981-992，两块：试听按钮 + `previewing !== null` 时的「正在试听《…》」文字与「停止」按钮）：
 
@@ -234,7 +248,7 @@ cd d:\Seed\sound-control-tool\web; pnpm dev
 
 ⚠️ **块内的注释「（D16）」连同删掉**——它在描述一个已不存在的能力，留着就是过时声明。
 
-- [ ] **Step 2: 删 `stopPreview` 的定义，但保留 `stop` 的能力**
+- [x] **Step 2: 删 `stopPreview` 的定义，但保留 `stop` 的能力**
 
 ⚠️ **这是本任务最容易出错的一处**。`stopPreview` 只是 `stop` 的一层包装，全文共**3 处**引用（实测行号，取自 `Select-String -Pattern "stopPreview"`）：
 
@@ -258,7 +272,7 @@ cd d:\Seed\sound-control-tool\web; pnpm dev
 
 `stop` 已在顶部从 `@/audio-player` 导入（`import { getSnapshot, stop, subscribe, toggle } from '@/audio-player';`），**不要重复导入**。
 
-- [ ] **Step 3: 删 `latestProduct` / `previewing` / `previewTip` / `onPreviewAudio` / `audioProducts`**
+- [x] **Step 3: 删 `latestProduct` / `previewing` / `previewTip` / `onPreviewAudio` / `audioProducts`**
 
 删掉这一整块（约 L824-850，包含 `audioProducts` / `latestProduct` / `previewing` / `previewTip` / `stopPreview` / `onPreviewAudio` 全部定义与其上的注释）。
 
@@ -266,7 +280,7 @@ cd d:\Seed\sound-control-tool\web; pnpm dev
 
 ⚠️ `onPreviewAudio` 的函数体里若引用了 `latestProduct`，随它一起删即可。
 
-- [ ] **Step 4: 全局搜残留**
+- [x] **Step 4: 全局搜残留**
 
 ```powershell
 cd d:\Seed\sound-control-tool\web
@@ -276,13 +290,13 @@ Expected: **零命中**。
 
 若有命中：`StopOutlined` 单独判断（它可能只被上面那处用，一并删干净）；其余符号必须清零。
 
-- [ ] **Step 5: 清理 import**
+- [x] **Step 5: 清理 import**
 
 从 `import { Alert, Button, Empty, Input, message, Modal, Progress, Radio, Space, Tag, Tooltip, Typography } from 'antd';` 里删掉不再用到的项（Step 4 搜出来的）。
 
 从 `import { ArrowLeftOutlined, CustomerServiceOutlined, DeleteOutlined, ExportOutlined, FolderOpenOutlined, PlusOutlined, SaveOutlined, StopOutlined } from '@ant-design/icons';` 里删掉 `CustomerServiceOutlined` 与 `StopOutlined`（若 Step 4 确认零使用）。
 
-- [ ] **Step 6: typecheck**
+- [x] **Step 6: typecheck**
 
 ```powershell
 cd d:\Seed\sound-control-tool\web; npx tsc --noEmit
@@ -295,7 +309,7 @@ Expected: 零错。**报错集中在未使用的 import / 未定义的引用** �
 2. 点击「删除成品」若正在播那条 → 声音会停（验 Step 2 的改法对）
 3. 成品列表里**仍能正常播放**（这次删的只是顶部那个冗余入口）
 
-- [ ] **Step 8: 收尾**
+- [x] **Step 8: 收尾**
 
 改动留工作区，不做 git 操作。
 
@@ -327,7 +341,7 @@ Expected: 零错。**报错集中在未使用的 import / 未定义的引用** �
   export default function SortableSegmentRow(props: SortableSegmentRowProps): JSX.Element
   ```
 
-- [ ] **Step 1: 建 `segment-row.css`**
+- [x] **Step 1: 建 `segment-row.css`**
 
 创建 `web/src/components/segment-row.css`：
 
@@ -355,7 +369,7 @@ Expected: 零错。**报错集中在未使用的 import / 未定义的引用** �
 .sr-label { flex: 1 1 auto; min-width: 0; }
 ```
 
-- [ ] **Step 2: 建 `SortableSegmentRow.tsx`**
+- [x] **Step 2: 建 `SortableSegmentRow.tsx`**
 
 创建 `web/src/components/SortableSegmentRow.tsx`：
 
@@ -462,7 +476,7 @@ export default function SortableSegmentRow({
 
 ⚠️ `total` 这个 prop 本版**没用上**（首尾判断交给 dnd-kit 的 `arrayMove`）。留着是为了后续若要做「首尾不能拖」时不用改签名；**若 `tsc` 因未使用参数报错（`noUnusedParameters`），把 `total: _total` 改名或在解构里省略该字段**。不要为了消除警告改结构。
 
-- [ ] **Step 3: `studio-detail.tsx` 删 `moveSegment`**
+- [x] **Step 3: `studio-detail.tsx` 删 `moveSegment`**
 
 删掉整个函数（约 L545-553）：
 
@@ -480,7 +494,7 @@ export default function SortableSegmentRow({
 
 ⚠️ 删完搜一次 `moveSegment` 确认零残留。
 
-- [ ] **Step 4: 加拖拽结束处理函数**
+- [x] **Step 4: 加拖拽结束处理函数**
 
 在 `studio-detail.tsx` 里 `clearAll` 附近（约 L788 之后）加：
 
@@ -506,7 +520,7 @@ import SortableSegmentRow from '@/components/SortableSegmentRow';
 
 ⚠️ 若 dnd-kit 的 `DragEndEvent` 类型能导入，优先用它（`import type { DragEndEvent } from '@dnd-kit/core';`）替代上面手写的内联类型；内联类型只是兜底，两者都能过 tsc。
 
-- [ ] **Step 5: 段列表 JSX 换成 `DndContext` 包裹**
+- [x] **Step 5: 段列表 JSX 换成 `DndContext` 包裹**
 
 把现有段列表（现约 L1316-1337 的 `segments.map(...)` 那一坨）整段替换为：
 
@@ -584,7 +598,7 @@ import SortableSegmentRow from '@/components/SortableSegmentRow';
 
 **判断依据**：`EditSeg` 里没有拖边把手（那只在轨道上的段区块里），所以大概率**不会**冲突。但别跳过验证直接假设。
 
-- [ ] **Step 6: typecheck**
+- [x] **Step 6: typecheck**
 
 ```powershell
 cd d:\Seed\sound-control-tool\web; npx tsc --noEmit
@@ -605,7 +619,7 @@ cd d:\Seed\sound-control-tool\web; pnpm dev
 7. 点标签框能正常输入（`distance: 4` 生效了）
 8. 「上移/下移」按钮没了，「删除」是红色垃圾桶图标
 
-- [ ] **Step 8: 收尾**
+- [x] **Step 8: 收尾**
 
 改动留工作区，不做 git 操作。
 
@@ -620,7 +634,7 @@ cd d:\Seed\sound-control-tool\web; pnpm dev
 - Consumes: 既有 `addSegment()`（自带 `setSelected(新下标)`）、`xToTime()`、`seek()`、`trackRef`
 - Produces: `const onTrackDoubleClick: (e: ReactPointerEvent<HTMLDivElement>) => void`
 
-- [ ] **Step 1: 加双击处理函数**
+- [x] **Step 1: 加双击处理函数**
 
 在 `startScrub` 定义之后（约 L770 附近）加：
 
@@ -643,7 +657,7 @@ cd d:\Seed\sound-control-tool\web; pnpm dev
     if (segments.length >= MAX_SEGMENTS) { message.warning(`最多 ${MAX_SEGMENTS} 段，先删一段`); return; }
 ```
 
-- [ ] **Step 2: 轨道层挂 `onDoubleClick`**
+- [x] **Step 2: 轨道层挂 `onDoubleClick`**
 
 在轨道层那个带 `ref={trackRef}` / `onPointerDown={startScrub}` 的 `div` 上加：
 
@@ -651,7 +665,7 @@ cd d:\Seed\sound-control-tool\web; pnpm dev
                 onDoubleClick={onTrackDoubleClick}
 ```
 
-- [ ] **Step 3: 段区块中部挡双击**
+- [x] **Step 3: 段区块中部挡双击**
 
 ⚠️ **这一步不做会导致「在段上双击 → 又加一段」**（事件冒泡到轨道层）。
 
@@ -667,7 +681,7 @@ cd d:\Seed\sound-control-tool\web; pnpm dev
 cd d:\Seed\sound-control-tool\web; rg -n "stopPropagation" src/pages/studio-detail.tsx
 ```
 
-- [ ] **Step 4: tooltip 文案**
+- [x] **Step 4: tooltip 文案**
 
 把打点按钮的 Tooltip 从 `'在当前播放头打点'` 改成 `'打点（也可在轨道上双击）'`。
 
@@ -677,7 +691,7 @@ cd d:\Seed\sound-control-tool\web; rg -n "stopPropagation" src/pages/studio-deta
 <Tooltip title={readOnlyMsg ?? (duration <= 0 ? '视频还没加载出时长，无法打点' : segments.length >= MAX_SEGMENTS ? `最多 ${MAX_SEGMENTS} 段，先删一段` : '打点（也可在轨道上双击）')}>
 ```
 
-- [ ] **Step 5: typecheck**
+- [x] **Step 5: typecheck**
 
 ```powershell
 cd d:\Seed\sound-control-tool\web; npx tsc --noEmit
@@ -692,7 +706,7 @@ cd d:\Seed\sound-control-tool\web; npx tsc --noEmit
 5. 全片档位（L0）双击也能加段
 6. 时间轴出现「拖动定位」文案那一行仍正常
 
-- [ ] **Step 7: 收尾**
+- [x] **Step 7: 收尾**
 
 改动留工作区，不做 git 操作。
 
@@ -707,7 +721,7 @@ cd d:\Seed\sound-control-tool\web; npx tsc --noEmit
 - Consumes: 既有 `clearAll`（`Modal.confirm` + `okType:'danger'`）、`segments.length`、`readOnly`
 - Produces: 无新导出
 
-- [ ] **Step 1: 从工具栏删掉按钮**
+- [x] **Step 1: 从工具栏删掉按钮**
 
 从 `StudioToolbar` 的 `tools` 里删掉现约 L985-989 那块：
 
@@ -719,7 +733,7 @@ cd d:\Seed\sound-control-tool\web; npx tsc --noEmit
             </Tooltip>
 ```
 
-- [ ] **Step 2: 加到缩放档位行右端**
+- [x] **Step 2: 加到缩放档位行右端**
 
 在缩放档位那行（现约 L1079-1087，`缩放 / 全片 / 中景 / 近景 / Ctrl+滚轮提示` 那一行）的**最后**（那句提示文字之后）插入：
 
@@ -737,7 +751,7 @@ cd d:\Seed\sound-control-tool\web; npx tsc --noEmit
 
 ⚠️ `marginLeft: 'auto'` 把它推到该行最右。若视觉上没贴右（因为那行有 `flexWrap: 'wrap'`），改成给外层那个 div 加 `marginLeft: 'auto'` 而不是 span。
 
-- [ ] **Step 3: typecheck**
+- [x] **Step 3: typecheck**
 
 ```powershell
 cd d:\Seed\sound-control-tool\web; npx tsc --noEmit
@@ -750,7 +764,7 @@ cd d:\Seed\sound-control-tool\web; npx tsc --noEmit
   3. 无段时按钮是灰的，且**悬停能看到 Tooltip**（验 `span` 垫层）
   4. 只读态下也是灰的，Tooltip 走 `readOnlyMsg`
 
-- [ ] **Step 5: 收尾**
+- [x] **Step 5: 收尾**
 
 改动留工作区，不做 git 操作。
 
@@ -784,7 +798,7 @@ cd d:\Seed\sound-control-tool\web; npx tsc --noEmit
   export default function ExportSettingsModal(props: ExportSettingsModalProps): JSX.Element
   ```
 
-- [ ] **Step 1: 建 `ExportSettingsModal.tsx`**
+- [x] **Step 1: 建 `ExportSettingsModal.tsx`**
 
 创建 `web/src/components/ExportSettingsModal.tsx`：
 
@@ -884,7 +898,7 @@ export default function ExportSettingsModal({
 
 ⚠️ `Button` 在上面这段里其实没用到（`okButtonProps` 是 Modal 的 prop）—— **删掉 `Button` 的 import**，否则 `noUnusedLocals` 可能报错。
 
-- [ ] **Step 2: 父组件加对话框 state 与 open/close**
+- [x] **Step 2: 父组件加对话框 state 与 open/close**
 
 `studio-detail.tsx` 里，在 `const [exporting, setExporting] = useState(false);` 附近加：
 
@@ -892,7 +906,7 @@ export default function ExportSettingsModal({
   const [exportModalOpen, setExportModalOpen] = useState(false);
 ```
 
-- [ ] **Step 3: 导出按钮改为开对话框**
+- [x] **Step 3: 导出按钮改为开对话框**
 
 把工具栏里「导出」那个按钮的 `onClick` 从 `() => void doExport()` 改成：
 
@@ -902,7 +916,7 @@ onClick={() => setExportModalOpen(true)}
 
 （保持 `loading={exporting}` 与 `disabled={readOnly}` 不变。）
 
-- [ ] **Step 4: 挂对话框，并让「开始导出」关闭它**
+- [x] **Step 4: 挂对话框，并让「开始导出」关闭它**
 
 在返回的 JSX 里（`<PageHeader .../>` 之后、正文容器之内或之外均可，紧挨着 PageHeader 放最省事）加：
 
@@ -924,7 +938,7 @@ onClick={() => setExportModalOpen(true)}
 
 ⚠️ **`onConfirm` 里先关 Modal 再导出** —— 这是 spec §4.5 的决定：Modal 长时间开着会挡住错误信息（失败走 `message.error`）。
 
-- [ ] **Step 5: 删常驻导出卡片，只留导出期进度条**
+- [x] **Step 5: 删常驻导出卡片，只留导出期进度条**
 
 删掉正文里那整个常驻 `CyberCard`（现约 L1339-1386，含 4 组控件 + 提示 + `Progress`）。
 
@@ -936,13 +950,13 @@ onClick={() => setExportModalOpen(true)}
         {exporting && <Progress percent={exportPercent} />}
 ```
 
-- [ ] **Step 6: 清理 import**
+- [x] **Step 6: 清理 import**
 
 删掉正文卡片搬走后不再用的 antd 组件（`Space` / `Radio` 若页面别处也不用就要删；`CyberCard` 若别处还用就留）。逐个按 `tsc` 提示来。
 
 ⚠️ `Progress` **必须保留**（Step 5 还在用）。
 
-- [ ] **Step 7: typecheck**
+- [x] **Step 7: typecheck**
 
 ```powershell
 cd d:\Seed\sound-control-tool\web; npx tsc --noEmit
@@ -957,7 +971,7 @@ cd d:\Seed\sound-control-tool\web; npx tsc --noEmit
 5. **故意导一个会失败的**（例如先把导出目录设成不可写）→ 错误 toast **看得见**（这条是 Step 5 那段决策的验收点）
 6. 导出成功后成品列表多出新行
 
-- [ ] **Step 9: 收尾**
+- [x] **Step 9: 收尾**
 
 改动留工作区，不做 git 操作。
 
@@ -972,7 +986,7 @@ cd d:\Seed\sound-control-tool\web; npx tsc --noEmit
 - Consumes: 既有 `products` / `productsErr` / `productSrcs` / `loadProducts` / `removeProduct` / `CyberAudioPlayer` / `OpenFileDirButton`；范式照 `TaskDrawer.tsx`
 - Produces: `const [productsDrawerOpen, setProductsDrawerOpen] = useState(false)`
 
-- [ ] **Step 1: 加 state**
+- [x] **Step 1: 加 state**
 
 在 `const [products, setProducts] = useState<AudioRow[]>([]);` 附近加：
 
@@ -980,7 +994,7 @@ cd d:\Seed\sound-control-tool\web; npx tsc --noEmit
   const [productsDrawerOpen, setProductsDrawerOpen] = useState(false);
 ```
 
-- [ ] **Step 2: 工具栏加按钮**
+- [x] **Step 2: 工具栏加按钮**
 
 在 `StudioToolbar` 的 `tools` 里（打点按钮之后、打开目录按钮之前）加：
 
@@ -1000,7 +1014,7 @@ import { ArrowLeftOutlined, CustomerServiceOutlined, DeleteOutlined, ExportOutli
 
 ⚠️ `CustomerServiceOutlined` 与 `StopOutlined` 若 Task 2 已删，**这一行不要把它们加回来**。按 Task 2 完成后 `package.json` 里的实际 import 行做增量修改。
 
-- [ ] **Step 3: 常驻卡片整块搬进抽屉**
+- [x] **Step 3: 常驻卡片整块搬进抽屉**
 
 把正文里那整个「已导出的成品」`CyberCard`（现约 L1390-1460，含 `SectionTitle` / 错误 `Alert` / 空态 `Empty` / 成品行 map）**整段剪出来**，放进：
 
@@ -1026,11 +1040,11 @@ import { ArrowLeftOutlined, CustomerServiceOutlined, DeleteOutlined, ExportOutli
 import { Alert, Button, Drawer, Empty, message, Modal, Progress, Tooltip, Typography } from 'antd';
 ```
 
-- [ ] **Step 4: 清理正文里搬走后留下的空白**
+- [x] **Step 4: 清理正文里搬走后留下的空白**
 
 正文从「剪辑点列表」到页面底部之间现在可能只剩一个孤立的临时 `Progress`（Task 6 留下的），**保留它**。删掉空的 `CyberCard` 外壳即可。
 
-- [ ] **Step 5: typecheck**
+- [x] **Step 5: typecheck**
 
 ```powershell
 cd d:\Seed\sound-control-tool\web; npx tsc --noEmit
@@ -1047,7 +1061,7 @@ cd d:\Seed\sound-control-tool\web; npx tsc --noEmit
 7. 抽屉开着时执行一次导出 → **抽屉内列表自动刷新**（`doExport` 的 `onDone` 里 `loadProducts()` 未改）
 8. 正文里不再有「已导出的成品」卡片，**省出的空间在正文底部**
 
-- [ ] **Step 7: 收尾**
+- [x] **Step 7: 收尾**
 
 改动留工作区，不做 git 操作。
 
