@@ -201,6 +201,13 @@ export default function SortableSegmentRow({
   if (readOnly) playTitle = readOnlyMsg;
   else playTitle = playing ? '停止播放这一段' : '播放这一段';
 
+  // 时间框禁用原因（D13）：**readOnly 优先于 timeDisabled**——readOnly（资料已删 / 无素材）时 duration 也常为 0，
+  // 若只报 timeDisabled 的原因，会与页面 readOnlyMsg 黄条、播放/删除按钮（都报 readOnlyMsg）自相矛盾
+  // （2026-10-13 第 5 轮 review bug·low）。单一本地变量，供两个 SegTimeBox 共用，避免同一判定两处漂移。
+  let timeBoxDisabledReason: string | undefined;
+  if (readOnly) timeBoxDisabledReason = readOnlyMsg ?? undefined;
+  else if (timeDisabled) timeBoxDisabledReason = timeDisabledMsg ?? undefined;
+
   return (
     <div
       ref={setNodeRef}
@@ -265,7 +272,7 @@ export default function SortableSegmentRow({
         edge="start"
         index={index}
         disabled={readOnly || timeDisabled}
-        disabledReason={timeDisabled ? (timeDisabledMsg ?? undefined) : undefined}
+        disabledReason={timeBoxDisabledReason}
         onSelect={() => onSelect(index)}
         onCommit={(sec) => onTimeChange(index, 'start', sec)}
       />
@@ -275,7 +282,7 @@ export default function SortableSegmentRow({
         edge="end"
         index={index}
         disabled={readOnly || timeDisabled}
-        disabledReason={timeDisabled ? (timeDisabledMsg ?? undefined) : undefined}
+        disabledReason={timeBoxDisabledReason}
         onSelect={() => onSelect(index)}
         onCommit={(sec) => onTimeChange(index, 'end', sec)}
       />

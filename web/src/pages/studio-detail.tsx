@@ -1070,6 +1070,10 @@ const rowIds = storedRowIds.length === segments.length
   ? storedRowIds
   : segments.map((_s, i) => storedRowIds[i] ?? `row-idx-${i}`);
 
+// 时间编辑器禁用原因单一来源（D13）：duration<=0 → 给原因；timeDisabled 由它推出，避免同一判定写两处漂移
+// （2026-10-13 第 5 轮 review maintainability·low，本仓「同一判定散在多处必然漂移」）。
+const timeEditDisabledMsg = duration <= 0 ? '视频还没加载出时长，暂时不能改时间' : null;
+
   // 取第 i 段的 dnd-kit id。**三处（items / React key / onDragEnd 反查）都必须走它**。
   //   为什么多这一层：segOccurrence[i] 在 noUncheckedIndexedAccess 下是 number | undefined
   //   （tsconfig.json:8），越界时 `segKey(s, undefined!)` 会静默算出 `NaN#undefined` 这种垃圾 id，
@@ -2083,9 +2087,8 @@ useEffect(() => {
                       seg={s}
                       selected={selected === i}
                       readOnly={readOnly}
-                      timeDisabled={duration <= 0}
-                      // 与 addBlockReason 的「视频还没加载出时长，无法打点」同源，D13「禁用→置灰+说明原因」
-                      timeDisabledMsg={duration <= 0 ? '视频还没加载出时长，暂时不能改时间' : null}
+                      timeDisabled={timeEditDisabledMsg !== null}
+                      timeDisabledMsg={timeEditDisabledMsg}
                       glitchSeq={glitch.seq}
                       glitch={glitch.ids.has(segKeyAt(i))}
                       onSelect={setSelected}
