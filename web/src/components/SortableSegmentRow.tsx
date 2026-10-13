@@ -25,12 +25,14 @@ import './segment-row.css';
  *   「收集用户输入 → 交给父组件」—— 本仓已为「同一判定散在多处必然漂移」留过教训（addBlockReason 的旧事）。
  */
 function SegTimeBox({
-  value, edge, index, disabled, onSelect, onCommit,
+  value, edge, index, disabled, disabledReason, onSelect, onCommit,
 }: {
   value: number;
   edge: 'start' | 'end';
   index: number;
   disabled: boolean;
+  /** 禁用原因（本仓约定 D13：禁用要给出可见原因）。有值且 disabled 时用 Tooltip 展示。 */
+  disabledReason?: string;
   onSelect: () => void;
   onCommit: (sec: number) => void;
 }) {
@@ -79,6 +81,8 @@ function SegTimeBox({
     </span>
   );
   return (
+    // ⚠️ Tooltip 直接包根 span（DOM 元素，可被 antd Tooltip 附加）；disabledReason 为空时无提示、不影响布局。
+    <Tooltip title={disabledReason ?? ''}>
     <span className="sr-time-box sr-no-drag" style={{ display: 'flex', alignItems: 'center', gap: 2 }}>
       {btn(-0.016, `第 ${index + 1} 段${edge === 'start' ? '开始' : '结束'}时间减`, '▾')}
       <Input
@@ -110,6 +114,7 @@ function SegTimeBox({
       />
       {btn(0.016, `第 ${index + 1} 段${edge === 'start' ? '开始' : '结束'}时间加`, '▴')}
     </span>
+    </Tooltip>
   );
 }
 
@@ -147,6 +152,8 @@ export interface SortableSegmentRowProps {
   readOnlyMsg: string | null;
   /** 时间编辑器是否禁用（父组件算：duration 未就绪时为 true）。与 readOnly 分开——只禁时间，不禁删除/排序/标签。 */
   timeDisabled: boolean;
+  /** timeDisabled 的可见原因（D13）。非 null 时作 SegTimeBox 的 Tooltip，别让禁用控件「灰得没理由」。 */
+  timeDisabledMsg: string | null;
 }
 
 /**
@@ -173,7 +180,7 @@ export const segKey = (seg: { start_sec: number; end_sec: number }, occurrence: 
   `${seg.start_sec}-${seg.end_sec}#${occurrence}`;
 
 export default function SortableSegmentRow({
-  index, occurrence, seg, selected, readOnly, readOnlyMsg, timeDisabled, glitch, glitchSeq,
+  index, occurrence, seg, selected, readOnly, readOnlyMsg, timeDisabled, timeDisabledMsg, glitch, glitchSeq,
   onSelect, onDelete, onLabelChange, onTimeChange, onPlaySegment, playing,
 }: SortableSegmentRowProps) {
   // id = 起止时间 + occurrence。**不要改成数组下标** —— 判据与踩坑见上方 segKey 的注释：
@@ -258,6 +265,7 @@ export default function SortableSegmentRow({
         edge="start"
         index={index}
         disabled={readOnly || timeDisabled}
+        disabledReason={timeDisabled ? (timeDisabledMsg ?? undefined) : undefined}
         onSelect={() => onSelect(index)}
         onCommit={(sec) => onTimeChange(index, 'start', sec)}
       />
@@ -267,6 +275,7 @@ export default function SortableSegmentRow({
         edge="end"
         index={index}
         disabled={readOnly || timeDisabled}
+        disabledReason={timeDisabled ? (timeDisabledMsg ?? undefined) : undefined}
         onSelect={() => onSelect(index)}
         onCommit={(sec) => onTimeChange(index, 'end', sec)}
       />

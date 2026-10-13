@@ -342,9 +342,10 @@ export default function StudioDetailPage() {
         }
         setWork(w);
         setSegments(w.segments.map((s) => ({ start_sec: s.start_sec, end_sec: s.end_sec, label: s.label ?? null })));
-        // ⚠️ 换作品要重置行 id 数组（2026-10-13 第 3 轮）：否则新作品的段沿用上一个作品的 id，
-        //   且旧 id 与新内容错位 → 行 key 复用错位。清空后由 rowIds 的对齐逻辑按新长度重填。
-        rowIdsRef.current = [];
+        // ⚠️ 换作品要重置行 id 数组（2026-10-13 第 3 轮）：必须**直接对齐新长度**（render 已改成只读、不再重填），
+        //   否则 ref 停在 [] 而 segments 有 N 个 → rowIds 永久退化成下标兜底、handler 维护全错位。
+        //   （第 4 轮 review bug·high：早期写 `= []` 依赖 render 重填，改只读后即失效。）
+        rowIdsRef.current = w.segments.map(() => makeRowId());
         // ⚠️ 半成品必须一并清掉（2026-10-13）：它不在 segments 里，不随 setSegments 走。
         //   不清 → 上一个作品的半成品起点会漏到这一个作品的轨道上（换作品后凭空多一条虚线块）。
         setPendingStart(null);
@@ -2083,6 +2084,8 @@ useEffect(() => {
                       selected={selected === i}
                       readOnly={readOnly}
                       timeDisabled={duration <= 0}
+                      // 与 addBlockReason 的「视频还没加载出时长，无法打点」同源，D13「禁用→置灰+说明原因」
+                      timeDisabledMsg={duration <= 0 ? '视频还没加载出时长，暂时不能改时间' : null}
                       glitchSeq={glitch.seq}
                       glitch={glitch.ids.has(segKeyAt(i))}
                       onSelect={setSelected}
