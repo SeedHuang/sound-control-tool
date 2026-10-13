@@ -145,6 +145,8 @@ export interface SortableSegmentRowProps {
   playing: boolean;
   /** 只读原因文案（父组件算出）。播放按钮置灰时用它做 Tooltip。 */
   readOnlyMsg: string | null;
+  /** 时间编辑器是否禁用（父组件算：duration 未就绪时为 true）。与 readOnly 分开——只禁时间，不禁删除/排序/标签。 */
+  timeDisabled: boolean;
 }
 
 /**
@@ -171,7 +173,7 @@ export const segKey = (seg: { start_sec: number; end_sec: number }, occurrence: 
   `${seg.start_sec}-${seg.end_sec}#${occurrence}`;
 
 export default function SortableSegmentRow({
-  index, occurrence, seg, selected, readOnly, readOnlyMsg, glitch, glitchSeq,
+  index, occurrence, seg, selected, readOnly, readOnlyMsg, timeDisabled, glitch, glitchSeq,
   onSelect, onDelete, onLabelChange, onTimeChange, onPlaySegment, playing,
 }: SortableSegmentRowProps) {
   // id = 起止时间 + occurrence。**不要改成数组下标** —— 判据与踩坑见上方 segKey 的注释：
@@ -255,7 +257,7 @@ export default function SortableSegmentRow({
         value={seg.start_sec}
         edge="start"
         index={index}
-        disabled={readOnly}
+        disabled={readOnly || timeDisabled}
         onSelect={() => onSelect(index)}
         onCommit={(sec) => onTimeChange(index, 'start', sec)}
       />
@@ -264,7 +266,7 @@ export default function SortableSegmentRow({
         value={seg.end_sec}
         edge="end"
         index={index}
-        disabled={readOnly}
+        disabled={readOnly || timeDisabled}
         onSelect={() => onSelect(index)}
         onCommit={(sec) => onTimeChange(index, 'end', sec)}
       />

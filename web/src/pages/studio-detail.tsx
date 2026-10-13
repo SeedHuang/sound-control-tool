@@ -699,6 +699,7 @@ export default function StudioDetailPage() {
     // 文件头 clampSegTime 注释「所有段的时间都经过本函数」的断言不成立。
     const start = snapToGrid(clamp(startRaw, 0, duration));
     const end = clampSegTime(start + 10, start, 'end', duration);
+    rowIdsRef.current.push(makeRowId()); // 行 id 随结构变动显式维护（见 rowIds 声明处注释）
     setSegs((prev) => [...prev, { start_sec: start, end_sec: end, label: null }]); // 走 setSegs → 置脏
     setSelected(segments.length); // 新段的下标 = 追加前的长度
     logFe('info', `打点 project=${projectId} import=${importId} ${start.toFixed(2)}-${end.toFixed(2)}s 共 ${segments.length + 1} 段`);
@@ -998,6 +999,7 @@ export default function StudioDetailPage() {
     setPendingStart(null);
     // 终点也过一遍 clamp：保证 end 与 start 至少差 6 格且都在网格上（防两处 snap 后仍贴太近）
     const end = clampSegTime(t, start, 'end', duration);
+    rowIdsRef.current.push(makeRowId()); // 行 id 随结构变动显式维护（见 rowIds 声明处注释）
     setSegs((prev) => [...prev, { start_sec: start, end_sec: end, label: null }]); // 走 setSegs → 置脏
     setSelected(segments.length); // 新段的下标 = 追加前的长度（与 addSegment 同款）
     logFe('info', `补终点 project=${projectId} ${start.toFixed(3)}-${end.toFixed(3)}s 共 ${segments.length + 1} 段`);
@@ -1056,10 +1058,16 @@ export default function StudioDetailPage() {
 const rowIdsRef = useRef<string[]>([]);
 const nextRowIdRef = useRef(0);
 const makeRowId = (): string => `row-${nextRowIdRef.current++}`;
-// 与 segments 对齐：尾部新增的行补 id、尾部删掉的行截断；中段删除 / 重排由各自的 handler 显式搬（见下）。
-const rowIds = rowIdsRef.current;
-while (rowIds.length < segments.length) rowIds.push(makeRowId());
-if (rowIds.length > segments.length) rowIds.length = segments.length;
+// 渲染期**只读**：结构变动时由各 handler 同步维护 rowIdsRef——
+//   增：addSegment / 打点收口 push；删：removeSegment splice；重排：onDragEnd arrayMove；
+//   换作品：load 重置；清空：clearAll 重置。
+//   ⚠️ 早期版本在这里 while(push)/截断：那是在**渲染期改 ref**（React 副作用），React 18 并发渲染下
+//   渲染可能被中断/丢弃而 ref 已改 → 边缘情况下行 key 错位（problems.md 第 3 轮 bug·medium）。
+const storedRowIds = rowIdsRef.current;
+// 防御副本：理论上 handler 已保证等长；万一不齐用「已存 id 前缀 + 下标兜底」，**不回写 ref**。
+const rowIds = storedRowIds.length === segments.length
+  ? storedRowIds
+  : segments.map((_s, i) => storedRowIds[i] ?? `row-idx-${i}`);
 
   // 取第 i 段的 dnd-kit id。**三处（items / React key / onDragEnd 反查）都必须走它**。
   //   为什么多这一层：segOccurrence[i] 在 noUncheckedIndexedAccess 下是 number | undefined
@@ -1182,6 +1190,7 @@ if (rowIds.length > segments.length) rowIds.length = segments.length;
       cancelText: '取消',
       onOk: () => {
         const n = segments.length;
+        rowIdsRef.current = []; // 清空后行 id 数组同步清空（见 rowIds 声明处注释）
         setSegs(() => []); // 走 setSegs → 置脏（清空后保存即 PUT segments:[]，C-5）
         // ⚠️ 半成品一并清掉：它在 segments 之外，segments.length===0 的早退也拦不住它。
         //   不清 → 「清空所有剪辑点」后轨道上还挂着一段虚线，用户会以为没清干净。
@@ -1310,6 +1319,10 @@ useEffect(() => {
         clearTimeout(seekTimerRef.current);
         seekTimerRef.current = null;
       }
+      // ⚠️ 取消 timer 的同时必须复位标记（2026-10-13 第 3 轮 review bug·low）：
+      //   timer 被取消而 seeked 又不来（元素即将因 previewSrc 变化重挂）时，标记会永远留在 true →
+      //   之后用户手动 seek 全被 seeking 监听忽略 → setPlayingSeg(null) 永不执行 → 段播放态清不掉。
+      programmaticSeekRef.current = false;
     };
   }, [previewSrc]);
 
@@ -2069,6 +2082,7 @@ useEffect(() => {
                       seg={s}
                       selected={selected === i}
                       readOnly={readOnly}
+                      timeDisabled={duration <= 0}
                       glitchSeq={glitch.seq}
                       glitch={glitch.ids.has(segKeyAt(i))}
                       onSelect={setSelected}
