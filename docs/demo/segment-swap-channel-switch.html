@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>段序切换 · 频道感 Demo</title>
+<style>
+/* =====================================================================
+   段序切换动画 demo —— 独立文件，不依赖主工程
+   色板/切角/字体栈取自 web/src/setup/theme.tsx + global.css，保持同一套观感。
+
+   为什么第一版看着是静的：它用 innerHTML='' 重建了 DOM（过渡全丢），
+   且 --from 被写死 0px（位移恒为 0）。这一版改用 FLIP：
+     量旧位置 → 换序（复用同一批 DOM 节点）→ 反向 transform → 归零过渡。
+   ===================================================================== */
+:root {
+  --bg-layout:#0E0E17; --bg-elevated:#1A1A26;
+  --red:#F75049; --cyan:#5EF6FF; --green:#1DED83; --yellow:#F0B537;
+  --tp:#F0F0F0; --ts:rgba(255,255,255,.6); --tm:rgba(255,255,255,.4);
+  --bc:rgba(94,246,255,.3); --br:rgba(247,80,73,.5); --bw:rgba(255,255,255,.08);
+  --clip:polygon(12px 0,100% 0,100% calc(100% - 12px),calc(100% - 12px) 100%,0 100%,0 12px);
+  --row-h:42px; --gap:6px;
+}
+*{box-sizing:border-box}
+body{margin:0;padding:26px 22px 56px;background:var(--bg-layout);color:var(--tp);
+  font-family:'Rajdhani',-apple-system,'Segoe UI','Microsoft YaHei','PingFang SC',sans-serif;min-height:100vh}
+h1{font-size:20px;letter-spacing:.04em;margin:0 0 6px;font-weight:600}
+.sub{color:var(--tm);font-size:12px;line-height:1.9;margin-bottom:20px;max-width:900px}
+.sub b{color:var(--cyan);font-weight:500}
+.wrap{display:grid;grid-template-columns:repeat(auto-fit,minmax(440px,1fr));gap:20px}
+
+.card{border:1px solid var(--bw);background:rgba(22,22,22,.55);clip-path:var(--clip);position:relative;overflow:hidden}
+.card>header{padding:11px 14px;border-bottom:1px solid var(--bw);display:flex;align-items:baseline;gap:9px;flex-wrap:wrap}
+.card>header h2{margin:0;font-size:14px;font-weight:600;letter-spacing:.06em}
+.tag{font-size:10px;color:#06121a;background:var(--cyan);padding:1px 7px;letter-spacing:.04em}
+.tag.alt{background:var(--yellow)}
+.card>header .desc{font-size:11px;color:var(--tm);margin-left:auto}
+.stage{padding:16px}
+.ctrl{display:flex;gap:8px;align-items:center;margin-bottom:14px;flex-wrap:wrap}
+button{font-family:inherit;font-size:12px;letter-spacing:.04em;background:var(--bg-elevated);color:var(--tp);
+  border:1px solid var(--bc);padding:5px 12px;cursor:pointer;clip-path:var(--clip);transition:background .15s,color .15s}
+button:hover{background:var(--cyan);color:#06121a}
+button.ghost{border-color:var(--bw);color:var(--ts)}
+.hint{font-size:11px;color:var(--tm)}
+
+/* ---- 段行：与真实组件同构（列宽 flex:0 0 Npx 定死）---- */
+.list{position:relative;display:flex;flex-direction:column;gap:var(--gap)}
+.row{display:flex;align-items:center;gap:8px;padding:6px 8px;min-height:var(--row-h);
+  background:transparent;border:1px solid var(--bw);font-size:13px;will-change:transform}
+.row.sel{background:rgba(247,80,73,.15);border-color:var(--br)}
+.row .hnd{flex:0 0 24px;display:flex;align-items:center;justify-content:center;cursor:grab;
+  color:rgba(255,255,255,.4);user-select:none;touch-action:none;font-size:15px}
+.row .hnd:active{cursor:grabbing}
+.row .no{flex:0 0 48px;perspective:220px}
+.row .no span{display:inline-block;background:var(--cyan);color:#06121a;font-size:11px;padding:1px 7px;font-weight:600}
+.row .span{flex:0 0 150px;font-family:'Rajdhani',Consolas,monospace;color:var(--cyan)}
+.row .dur{flex:0 0 90px;font-size:12px;color:var(--cyan);opacity:.75}
+.row .lbl{flex:1 1 auto;min-width:0}
+.row .lbl input{width:100%;background:transparent;border:1px solid var(--bw);color:var(--tp);
+  font-family:inherit;font-size:13px;padding:3px 7px;outline:none}
+.row .lbl input:focus{border-color:var(--bc)}
+.row .del{flex:0 0 36px;display:flex;justify-content:center}
+.row .del button{border:none;background:transparent;padding:0;font-size:14px;color:var(--red);clip-path:none}
+.row .del button:hover{background:transparent;color:#fff}
+.meta{padding:10px 14px 13px;font-size:11px;color:var(--tm);line-height:1.85;border-top:1px solid var(--bw)}
+.meta b{color:var(--cyan);font-weight:500}
+code{color:var(--yellow);font-family:Consolas,monospace}
+
+/* ============ 风格 1：CRT 竖向滚屏（老电视换台） ============ */
+/* 滚动由 FLIP 负责；这里只加「信号亮带横扫 + 过曝回稳 + 常驻扫描线」 */
+.crt .list::before{ /* 常驻扫描线 */
+  content:'';position:absolute;inset:0;pointer-events:none;z-index:6;border-radius:2px;
+  background:repeating-linear-gradient(180deg,rgba(0,0,0,.32) 0 1px,transparent 1px 3px);
+}
+.crt .list::after{ /* 换台瞬间的横向信号亮带 */
+  content:'';position:absolute;left:-2px;right:-2px;height:46px;pointer-events:none;z-index:7;opacity:0;
+  background:linear-gradient(180deg,transparent,rgba(94,246,255,.30) 45%,rgba(255,255,255,.42) 50%,rgba(94,246,255,.30) 55%,transparent);
+}
+.crt.on .list::after{animation:sweep .46s cubic-bezier(.25,.75,.2,1)}
+@keyframes sweep{
+  0%{opacity:0;transform:translateY(-50px)}
+  22%{opacity:1}
+  100%{opacity:0;transform:translateY(240px)}
+}
+.crt.on .list{animation:overexp .46s cubic-bezier(.25,.75,.2,1)}
+@keyframes overexp{
+  0%{filter:brightness(2.4) saturate(.15) contrast(1.4)}
+  22%{filter:brightness(1.55) saturate(.65)}
+  62%{filter:brightness(1.08) saturate(1)}
+  100%{filter:none}
+}
+.crt.on .row{animation:vhold .46s steps(3) 1}
+@keyframes vhold{0%,100%{margin-top:0}33%{margin-top:2px}}
+
+/* ============ 风格 2：扫描线掠过 + RGB 色差 ============ */
+.scan .list::after{
+  content:'';position:absolute;left:-2px;right:-2px;height:0;pointer-events:none;z-index:7;opacity:0;
+  background:repeating-linear-gradient(180deg,rgba(94,246,255,.20) 0 2px,transparent 2px 8px);
+}
+.scan.on .list::after{animation:scanpass .36s ease-out}
+@keyframes scanpass{0%{opacity:0;top:-6%}25%{opacity:1}100%{opacity:0;top:104%}}
+.scan .list::before{
+  content:'';position:absolute;inset:0;pointer-events:none;z-index:6;
+  background:repeating-linear-gradient(180deg,rgba(0,0,0,.22) 0 1px,transparent 1px 4px);
+}
+.scan.on .row{animation:chroma .36s steps(5) 1}
+@keyframes chroma{
+  0%{filter:drop-shadow(3px 0 rgba(247,80,73,.95)) drop-shadow(-3px 0 rgba(94,246,255,.95)) brightness(1.7)}
+  50%{filter:drop-shadow(-1px 0 rgba(247,80,73,.55)) drop-shadow(1px 0 rgba(94,246,255,.55)) brightness(1.2)}
+  100%{filter:none}
+}
+
+/* ============ 风格 3：频道号翻转（语义最贴） ============ */
+/* 滚动由 FLIP 负责；这里只把序号牌沿 X 轴翻面 */
+.flip .no span{transform-origin:center center}
+.flip.on .no span{animation:numflip .42s ease-in-out}
+@keyframes numflip{
+  0%{transform:rotateX(0deg) translateZ(0);filter:brightness(2.4)}
+  45%{transform:rotateX(92deg);filter:brightness(3.4) saturate(0)}
+  55%{transform:rotateX(-88deg);filter:brightness(3.4) saturate(0)}
+  100%{transform:rotateX(0deg);filter:brightness(1)}
+}
+.flip.on .row{animation:settle .42s cubic-bezier(.2,.8,.2,1)}
+@keyframes settle{
+  0%{box-shadow:inset 0 0 0 1px rgba(94,246,255,.55)}
+  100%{box-shadow:inset 0 0 0 1px rgba(94,246,255,0)}
+}
+.flip .list::before{ /* 极淡扫描线，只为统一质感 */
+  content:'';position:absolute;inset:0;pointer-events:none;z-index:6;
+  background:repeating-linear-gradient(180deg,rgba(0,0,0,.14) 0 1px,transparent 1px 4px);
+}
+
+/* ============ 风格 4：静电溶解 ============ */
+/* 位移抖动不能放在 .row 上（会和 FLIP 的 transform 打架）→ 放在 .jit 内层 */
+.diss .jit{display:inline-flex}
+.diss.on .row{animation:dissolve .44s steps(6) 1}
+@keyframes dissolve{
+  0%{filter:contrast(3.2) brightness(1.75) saturate(.3)}
+  50%{filter:contrast(1.6) brightness(1.15)}
+  100%{filter:none}
+}
+.diss.on .jit{animation:jitter .44s steps(5) 1}
+@keyframes jitter{
+  0%{transform:translate(3px,-2px) skewX(7deg);opacity:.65}
+  40%{transform:translate(-3px,2px) skewX(-5deg)}
+  100%{transform:none;opacity:1}
+}
+.diss .list::after{ /* 噪点层 */
+  content:'';position:absolute;inset:0;pointer-events:none;z-index:7;opacity:0;
+  background-image:
+    repeating-linear-gradient(0deg,rgba(255,255,255,.08) 0 1px,transparent 1px 2px),
+    repeating-linear-gradient(90deg,rgba(94,246,255,.06) 0 2px,transparent 2px 5px);
+}
+.diss.on .list::after{animation:noise .44s steps(4) 1}
+@keyframes noise{0%{opacity:.95}55%{opacity:.3}100%{opacity:0}}
+
+/* 拖拽中的样子 */
+.row.dragging{opacity:.3}
+.row.preview{outline:1px dashed var(--bc)}
+</style>
+</head>
+<body>
+
+<h1>段序切换 · 频道感 Demo</h1>
+<div class="sub">
+  目标：把「位置突变」包装成「一次信号切换」—— 段行不再瞬移，而是<b>滚过去</b>。<br />
+  每张卡片都能试：点「交换 1↔2」或「末位移到首位」，也可<b>直接上下拖 ⣿把手</b>。位移由 FLIP 技法驱动（量旧位 → 换序 → 反向偏移 → 归零），所以滚动是真实可见的。
+</div>
+
+<div class="wrap" id="wrap"></div>
+
+<script>
+'use strict';
+/* ===================== 演示数据 ===================== */
+const SEGS = [
+  { id:'a', start:525,  end:762,  label:'' },
+  { id:'b', start:850,  end:1043, label:'' },
+  { id:'c', start:1110, end:1230, label:'片头' },
+  { id:'d', start:1400, end:1560, label:'' },
+];
+const fmt = (s) => String(Math.floor(s / 60)).padStart(2,'0') + ':' + String(Math.floor(s % 60)).padStart(2,'0');
+
+const STYLES = [
+  { id:'crt',  name:'风格 1 · CRT 竖向滚屏', tag:'最像老电视', alt:false,
+    desc:'整列滚过去 + 亮带横扫 + 过曝回稳 + 扫描线',
+    meta:'<b>合成管电视换台</b>：内容整列竖向滚过去，一条<b>信号亮带</b>横扫，途中<b>过曝</b>再回稳；配常驻扫描线与轻微垂直保持抖动。' },
+  { id:'scan', name:'风格 2 · 扫描线掠过 + RGB 色差', tag:'更赛博', alt:true,
+    desc:'扫描线掠过 + 红蓝色差抖动',
+    meta:'<b>信号锁定</b>：扫描线自上而下掠过 + <code>drop-shadow</code> 做红蓝<b>色差</b>抖动后归位。比风格 1 短促、机械感更强。' },
+  { id:'flip', name:'风格 3 · 频道号翻转', tag:'语义最贴', alt:true,
+    desc:'序号牌沿 X 轴翻面换数字',
+    meta:'序号牌（就是「频道号」）沿 X 轴<b>翻面</b>换数字，行滚到新位置。<b>语义最直接</b> —— 用户看的就是频道号在跳。' },
+  { id:'diss', name:'风格 4 · 静电溶解', tag:'最脏', alt:true,
+    desc:'噪点撕裂 + 阶跃抖动归位',
+    meta:'整列<b>噪点撕裂</b>并用 <code>steps()</code> 做阶跃抖动，模拟模拟信号丢失后重新锁定。旧设备味最足，也最躁。' },
+];
+
+/* ===================== FLIP 核心 ===================== */
+/** 量旧位置 → 换序 → 给每个节点反向 transform → 强制 reflow → 归零过渡 */
+function flip(listEl, data, mutate, dur) {
+  const rows = Array.from(listEl.children);
+  const before = new Map();
+  for (const el of rows) before.set(el.dataset.id, el.getBoundingClientRect().top);
+
+  mutate();
+  render(listEl, data); // 复用同一批节点，只重排顺序
+
+  const moved = [];
+  for (const el of Array.from(listEl.children)) {
+    const dy = before.get(el.dataset.id) - el.getBoundingClientRect().top;
+    if (Math.abs(dy) > 0.5) {
+      el.style.transition = 'none';
+      el.style.transform = 'translate3d(0,' + dy + 'px,0)';
+      moved.push(el);
+    }
+  }
+  if (!moved.length) return;
+  void listEl.offsetHeight; // 强制 reflow，让「反向位置」成为起点
+  for (const el of moved) {
+    el.style.transition = 'transform ' + dur + 'ms cubic-bezier(.22,.78,.18,1)';
+    el.style.transform = '';
+  }
+}
+
+/* ===================== 渲染（节点复用） ===================== */
+function makeRow(s) {
+  const row = document.createElement('div');
+  row.className = 'row';
+  row.dataset.id = s.id;
+  row.innerHTML =
+    '<div class="hnd">⠿</div>' +
+    '<div class="no"><span class="jit"></span></div>' +
+    '<div class="span jit"></div>' +
+    '<div class="dur jit"></div>' +
+    '<div class="lbl"><input placeholder="标签（可空）" /></div>' +
+    '<div class="del"><button title="删除这一段">🗑</button></div>';
+
+  row.querySelector('.hnd').addEventListener('pointerdown', (e) => startDrag(e, row, listElOf(row)));
+  row.querySelector('.del button').addEventListener('click', () => {
+    const i = dataOf(row).findIndex((x) => x.id === row.dataset.id);
+    if (i >= 0) { dataOf(row).splice(i, 1); render(listElOf(row), dataOf(row)); }
+  });
+  row.querySelector('input').addEventListener('input', (e) => {
+    const s = dataOf(row).find((x) => x.id === row.dataset.id);
+    if (s) s.label = e.target.value;
+  });
+  row.addEventListener('click', (e) => {
+    if (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON') return;
+    stateOf(listElOf(row)).sel = dataOf(row).findIndex((x) => x.id === row.dataset.id);
+    render(listElOf(row), dataOf(row));
+  });
+  return row;
+}
+
+function listElOf(row) { return row.closest('.list'); }
+function dataOf(row) { return stateOf(listElOf(row)).data; }
+function stateOf(list) { return LIST_STATE.get(list); }
+const LIST_STATE = new Map();
+const ROW_CACHE = new WeakMap();
+
+function render(list, data) {
+  let cache = ROW_CACHE.get(list);
+  if (!cache) { cache = new Map(); ROW_CACHE.set(list, cache); }
+  // 建缺失的
+  for (const s of data) if (!cache.has(s.id)) cache.set(s.id, makeRow(s));
+  // 删多余的
+  const keep = new Set(data.map((s) => s.id));
+  for (const [id, el] of cache) if (!keep.has(id)) { el.remove(); cache.delete(id); }
+  // 更新内容 + 重排（appendChild 对已有节点是移动，不是克隆）
+  data.forEach((s, i) => {
+    const el = cache.get(s.id);
+    el.querySelector('.no span').textContent = String(i + 1);
+    el.querySelector('.span').textContent = fmt(s.start) + ' - ' + fmt(s.end);
+    el.querySelector('.dur').textContent = '时长 ' + fmt(s.end - s.start);
+    const inp = el.querySelector('input');
+    if (document.activeElement !== inp) inp.value = s.label || '';
+    el.classList.toggle('sel', stateOf(list).sel === i);
+    list.appendChild(el);
+  });
+}
+
+/* ===================== 播动画 ===================== */
+function channelSwap(list, data, st, mutate) {
+  const dur = st.id === 'diss' ? 440 : st.id === 'scan' ? 360 : st.id === 'flip' ? 420 : 460;
+  flip(list, data, mutate, dur);
+  const card = list.closest('.card');
+  card.classList.remove('on');
+  void card.offsetWidth;
+  card.classList.add('on');
+  clearTimeout(card._t);
+  card._t = setTimeout(() => card.classList.remove('on'), dur + 60);
+}
+
+/* ===================== 拖拽 ===================== */
+function startDrag(e, row, list) {
+  e.preventDefault();
+  const state = stateOf(list);
+  const data = state.data;
+  const from = data.findIndex((s) => s.id === row.dataset.id);
+  row.classList.add('dragging');
+  let cur = from;
+
+  const onMove = (ev) => {
+    const rows = Array.from(list.children);
+    let to = from;
+    for (let k = 0; k < rows.length; k++) {
+      const b = rows[k].getBoundingClientRect();
+      if (ev.clientY > b.top + b.height / 2) to = Math.max(to, k);
+    }
+    to = Math.min(to, data.length - 1);
+    if (to !== cur) {
+      cur = to;
+      data.splice(to, 0, data.splice(from, 1)[0]);
+      state.sel = to;
+      render(list, data);
+    }
+  };
+  const onUp = () => {
+    window.removeEventListener('pointermove', onMove);
+    window.removeEventListener('pointerup', onUp);
+    list.querySelectorAll('.dragging').forEach((n) => n.classList.remove('dragging'));
+    if (cur !== from) {
+      // 拖动过程中已经实时换序了，这里补一次「落定」的换台动画
+      const card = list.closest('.card');
+      card.classList.remove('on'); void card.offsetWidth; card.classList.add('on');
+      clearTimeout(card._t);
+      card._t = setTimeout(() => card.classList.remove('on'), 520);
+    }
+  };
+  window.addEventListener('pointermove', onMove);
+  window.addEventListener('pointerup', onUp);
+}
+
+/* ===================== 组装 ===================== */
+const wrap = document.getElementById('wrap');
+for (const st of STYLES) {
+  const card = document.createElement('div');
+  card.className = 'card ' + st.id;
+  card.innerHTML =
+    '<header><h2>' + st.name + '</h2>' +
+    '<span class="tag' + (st.alt ? ' alt' : '') + '">' + st.tag + '</span>' +
+    '<span class="desc">' + st.desc + '</span></header>' +
+    '<div class="stage">' +
+      '<div class="ctrl">' +
+        '<button data-act="swap">交换 1 ↔ 2</button>' +
+        '<button data-act="rot" class="ghost">末位移到首位</button>' +
+        '<span class="hint">也可直接上下拖 ⣿ 把手</span>' +
+      '</div>' +
+      '<div class="list"></div>' +
+    '</div>' +
+    '<div class="meta">' + st.meta + '</div>';
+  wrap.appendChild(card);
+
+  const list = card.querySelector('.list');
+  const data = SEGS.map((s) => ({ ...s }));
+  LIST_STATE.set(list, { data, sel: 0 });
+  render(list, data);
+
+  card.querySelector('[data-act="swap"]').addEventListener('click', () => {
+    if (data.length < 2) return;
+    channelSwap(list, data, st, () => {
+      const pulled = data.splice(1, 1)[0];
+      data.unshift(pulled);
+      stateOf(list).sel = 0;
+    });
+  });
+  card.querySelector('[data-act="rot"]').addEventListener('click', () => {
+    if (data.length < 2) return;
+    channelSwap(list, data, st, () => {
+      data.unshift(data.pop());
+      stateOf(list).sel = 0;
+    });
+  });
+}
+</script>
+</body>
+</html>

@@ -26,3 +26,99 @@
 .sr-del  { flex: 0 0 36px; }
 /* 标签框吃掉剩余空间；min-width:0 是它能被压缩的前提 */
 .sr-label { flex: 1 1 auto; min-width: 0; }
+
+/* ---- 序号框（.sr-no）：段序变化时唯一的动画主体（2026-10-09 用户定案）----
+   为什么自己写而不用 antd <Tag>：色散要叠「红/蓝/本体」三层，Tag 的内部结构不由我们控制。
+   ⚠️ 尺寸必须贴着原 Tag（2026-10-09 用户实测「框太大」+ 浏览器实测）：
+   实测 antd Tag 在本项目 token 下 paddingInline = 4px（paddingXXS），而第一版我写成了 7px
+   → 框宽 38px、数字只有 3.6px，**框比数字宽 10 倍**，视觉上是一个空壳。
+   现在 padding 0 4px + 数字自身 font-size 11。
+   ⚠️ 宽度必须固定，且按 3 位数字锁死（2026-10-09 用户指出「你的宽度不固定吗」+「不会超过3位数」）：
+   宽度 = padding + 数字宽度，若只靠 padding 撑着，则 1~9 段一个宽、10~99 段另一个宽 ——
+   过 9 段时第一列会突然变宽，而这一列本就是 spec 定的固定列宽（.sr-index 48px），不能自己变。
+   用 3ch 而不是写死 px：ch = 当前字体里一个数字的宽度，写死 px 会在字体回退时对不上。
+   ⚠️ box-sizing 显式声明为 content-box：min-width 在 border-box 下算的是「含 padding 的总宽」，
+   会让 3 位数那档比预期窄 8px。不写这一行，本规则的值会随全局 reset 悄悄漂移。
+   ⚠️ 背景别抢戏：原来纯青 #5EF6FF 实测在暗底上很跳。现在降为半透明青底 + 青字，
+      平时是「一个不太显眼的序号标记」，只有色散那 0.34s 才亮起来。
+      为什么不留暗字：暗字（#06121a）配深底在暗色主题里几乎看不见，序号会「消失」；
+      半透明底 + 青字才是「底不抢戏、字看得清」。 */
+.sr-no {
+  position: relative; display: inline-flex; align-items: center; justify-content: center;
+  box-sizing: content-box;
+  min-width: 3ch;
+  padding: 0 4px;
+  background: rgba(94, 246, 255, .16); color: #5EF6FF;
+  font-family: 'Rajdhani', sans-serif; font-size: 11px; font-weight: 600; line-height: 16px;
+}
+.sr-no-num { position: relative; z-index: 3; }
+/* 两个色散残影层：叠在本体下面，靠 animation 让它们错位显形 */
+.sr-no-ghost { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; opacity: 0; z-index: 2; }
+.sr-no-ghost-r { color: #F75049; }
+.sr-no-ghost-b { color: #5EF6FF; }
+/* 噪点层：色散时在框内闪雪花（用户要求「干扰更明显」）。三层错位只是位移，
+   噪点才带来「信号接收不良」的颗粒感 —— 只靠位移会显得太干净、像设计好的动效。 */
+.sr-no-noise {
+  position: absolute; inset: 0; z-index: 1; opacity: 0; pointer-events: none;
+  background-image:
+    repeating-linear-gradient(0deg, rgba(255,255,255,.9) 0 1px, transparent 1px 2px),
+    repeating-linear-gradient(90deg, rgba(255,255,255,.6) 0 1px, transparent 1px 2px);
+}
+
+/* 色散：steps() 是「信号不良」的关键 —— 阶跃跳变而非平滑过渡。
+   为什么只动序号框：行本身不滚不抖（用户定案：整行动画太吵）。 */
+.sr-no.is-glitch .sr-no-num     { animation: srNumShift .34s steps(5) 1; }
+.sr-no.is-glitch .sr-no-ghost-r  { animation: srGhostR .34s steps(5) 1; }
+.sr-no.is-glitch .sr-no-ghost-b  { animation: srGhostB .34s steps(5) 1; }
+.sr-no.is-glitch .sr-no-noise    { animation: srNoise .34s steps(6) 1; }
+.sr-no.is-glitch                 { animation: srBoxFlicker .34s steps(5) 1; }
+@keyframes srNumShift {
+  0%   { transform: translate(0, 0); filter: none; }
+  20%  { transform: translate(-2px, 1px); filter: brightness(2) saturate(0); }
+  40%  { transform: translate(2px, -1px); filter: brightness(1.6); }
+  60%  { transform: translate(-1px, 1px); }
+  80%  { transform: translate(1px, 0); }
+  100% { transform: translate(0, 0); filter: none; }
+}
+/* 残影错位从 3px 加到 5px、透明度拉满 —— 用户实测「干扰不够明显」。
+   为什么加到 5px：数字本身只有 ~4px 宽，3px 错位几乎贴在一起看不出分离；5px 才形成「一个数裂成三个」。 */
+@keyframes srGhostR {
+  0%   { opacity: 0; transform: translate(0, 0); }
+  15%  { opacity: 1; transform: translate(-5px, -1px); }
+  40%  { opacity: .85; transform: translate(4px, 1px); }
+  65%  { opacity: .6; transform: translate(-3px, 0); }
+  100% { opacity: 0; transform: translate(0, 0); }
+}
+@keyframes srGhostB {
+  0%   { opacity: 0; transform: translate(0, 0); }
+  15%  { opacity: 1; transform: translate(5px, 1px); }
+  40%  { opacity: .85; transform: translate(-4px, -1px); }
+  65%  { opacity: .6; transform: translate(3px, 0); }
+  100% { opacity: 0; transform: translate(0, 0); }
+}
+/* 噪点：阶跃 6 档，从满格降到 0 —— 颗粒感是「干扰明显」的主要来源 */
+@keyframes srNoise {
+  0%   { opacity: 0; }
+  10%  { opacity: .95; }
+  30%  { opacity: .75; }
+  50%  { opacity: .45; }
+  70%  { opacity: .2; }
+  100% { opacity: 0; }
+}
+/* 框体闪烁：只在色散那 0.34s 内亮一下，平时保持低存在感的半透明底。
+   为什么末帧回到 rgba(.16) 而不是纯青：回到纯青会让动画结束后框「留在高亮态」，
+   与「背景别抢戏」冲突 —— 帧色必须和 .sr-no 的静态底色一致。 */
+@keyframes srBoxFlicker {
+  0%   { background: rgba(94, 246, 255, .16); box-shadow: none; }
+  30%  { background: rgba(154, 249, 255, .75); box-shadow: 0 0 7px rgba(94, 246, 255, .8); }
+  70%  { background: rgba(94, 246, 255, .3); }
+  100% { background: rgba(94, 246, 255, .16); box-shadow: none; }
+}
+/* 无动画偏好：关掉色散（色差对认知障碍用户不友好，steps 闪屏也本是视觉设计的一部分） */
+@media (prefers-reduced-motion: reduce) {
+  .sr-no.is-glitch .sr-no-num,
+  .sr-no.is-glitch .sr-no-ghost-r,
+  .sr-no.is-glitch .sr-no-ghost-b,
+  .sr-no.is-glitch .sr-no-noise,
+  .sr-no.is-glitch { animation: none; }
+}

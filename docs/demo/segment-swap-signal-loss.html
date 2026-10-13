@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>段序切换 · 信号接收不良 Demo</title>
+<style>
+/* =====================================================================
+   段序切换动画 demo（第2 版）—— 独立文件，不依赖主工程
+   第1版做的是「主动换台」（设备正常扫描），这版做的是**信号接收不良**：
+   画面不是在切换，而是在**丢失 → 雪花 → 错位滚动 → 慢慢锁定**。
+   色板/切角/字体栈取自 web/src/setup/theme.tsx + global.css。
+   ===================================================================== */
+:root {
+  --bg-layout:#0E0E17; --bg-elevated:#1A1A26;
+  --red:#F75049; --cyan:#5EF6FF; --green:#1DED83; --yellow:#F0B537;
+  --tp:#F0F0F0; --ts:rgba(255,255,255,.6); --tm:rgba(255,255,255,.4);
+  --bc:rgba(94,246,255,.3); --br:rgba(247,80,73,.5); --bw:rgba(255,255,255,.08);
+  --clip:polygon(12px 0,100% 0,100% calc(100% - 12px),calc(100% - 12px) 100%,0 100%,0 12px);
+}
+*{box-sizing:border-box}
+body{margin:0;padding:26px 22px 56px;background:var(--bg-layout);color:var(--tp);
+  font-family:'Rajdhani',-apple-system,'Segoe UI','Microsoft YaHei','PingFang SC',sans-serif;min-height:100vh}
+h1{font-size:20px;letter-spacing:.04em;margin:0 0 6px;font-weight:600}
+.sub{color:var(--tm);font-size:12px;line-height:1.9;margin-bottom:20px;max-width:920px}
+.sub b{color:var(--cyan);font-weight:500}
+.wrap{display:grid;grid-template-columns:repeat(auto-fit,minmax(440px,1fr));gap:20px}
+
+.card{border:1px solid var(--bw);background:rgba(22,22,22,.55);clip-path:var(--clip);position:relative;overflow:hidden}
+.card>header{padding:11px 14px;border-bottom:1px solid var(--bw);display:flex;align-items:baseline;gap:9px;flex-wrap:wrap}
+.card>header h2{margin:0;font-size:14px;font-weight:600;letter-spacing:.06em}
+.tag{font-size:10px;color:#06121a;background:var(--cyan);padding:1px 7px}
+.tag.alt{background:var(--yellow)}
+.card>header .desc{font-size:11px;color:var(--tm);margin-left:auto}
+.stage{padding:16px;position:relative;z-index:1}
+.ctrl{display:flex;gap:8px;align-items:center;margin-bottom:14px;flex-wrap:wrap}
+button{font-family:inherit;font-size:12px;letter-spacing:.04em;background:var(--bg-elevated);color:var(--tp);
+  border:1px solid var(--bc);padding:5px 12px;cursor:pointer;clip-path:var(--clip);transition:background .15s,color .15s}
+button:hover{background:var(--cyan);color:#06121a}
+button.ghost{border-color:var(--bw);color:var(--ts)}
+.hint{font-size:11px;color:var(--tm)}
+
+.list{position:relative;display:flex;flex-direction:column;gap:6px}
+.row{display:flex;align-items:center;gap:8px;padding:6px 8px;min-height:42px;
+  background:transparent;border:1px solid var(--bw);font-size:13px;will-change:transform}
+.row.sel{background:rgba(247,80,73,.15);border-color:var(--br)}
+.row .hnd{flex:0 0 24px;display:flex;align-items:center;justify-content:center;cursor:grab;
+  color:rgba(255,255,255,.4);user-select:none;touch-action:none;font-size:15px}
+.row .no{flex:0 0 48px}
+.row .no span{display:inline-block;background:var(--cyan);color:#06121a;font-size:11px;padding:1px 7px;font-weight:600}
+.row .span{flex:0 0 150px;font-family:'Rajdhani',Consolas,monospace;color:var(--cyan)}
+.row .dur{flex:0 0 90px;font-size:12px;color:var(--cyan);opacity:.75}
+.row .lbl{flex:1 1 auto;min-width:0}
+.row .lbl input{width:100%;background:transparent;border:1px solid var(--bw);color:var(--tp);
+  font-family:inherit;font-size:13px;padding:3px 7px;outline:none}
+.row .del{flex:0 0 36px;display:flex;justify-content:center}
+.row .del button{border:none;background:transparent;padding:0;font-size:14px;color:var(--red);clip-path:none}
+.row .del button:hover{background:transparent;color:#fff}
+.meta{padding:10px 14px 13px;font-size:11px;color:var(--tm);line-height:1.85;border-top:1px solid var(--bw);position:relative;z-index:1}
+.meta b{color:var(--cyan);font-weight:500}
+code{color:var(--yellow);font-family:Consolas,monospace}
+
+/* =====================================================================
+   失效层：雪花 / 噪点 / 滚动条 —— 三种质感，按风格组合使用
+   ===================================================================== */
+
+/* --- ① 静态雪花噪点：多层 repeating-conic/linear 叠出随机点阵 --- */
+.snow{position:absolute;inset:-6px;pointer-events:none;z-index:8;opacity:0}
+.snow::before,.snow::after{content:'';position:absolute;inset:0}
+.snow::before{
+  background-image:
+    repeating-conic-gradient(rgba(255,255,255,.85) 0% 25%, transparent 0% 50%);
+  background-size:3px 3px;
+}
+.snow::after{
+  background-image:
+    radial-gradient(circle at 20% 30%, rgba(255,255,255,.7) 0 1px, transparent 1px),
+    radial-gradient(circle at 70% 65%, rgba(255,255,255,.55) 0 1px, transparent 1px),
+    radial-gradient(circle at 45% 85%, rgba(94,246,255,.5) 0 1px, transparent 1px),
+    radial-gradient(circle at 85% 15%, rgba(255,255,255,.45) 0 1px, transparent 1px);
+  background-size:7px 7px, 9px 9px, 11px 11px, 13px 13px;
+}
+
+/* --- ② 水平撕裂条：模拟信号不同步，画面被撕成几条错位 --- */
+.tear{position:absolute;inset:0;pointer-events:none;z-index:7;opacity:0;overflow:hidden}
+.tear i{position:absolute;left:-6px;right:-6px;display:block;
+  background:repeating-linear-gradient(90deg,rgba(255,255,255,.10) 0 2px,rgba(0,0,0,.25) 2px 4px);
+  mix-blend-mode:screen}
+
+/* --- ③ 行内噪点：每行自带一层，抖动时更脏 --- */
+.grain{position:absolute;inset:0;pointer-events:none;opacity:0;z-index:6;
+  background-image:repeating-linear-gradient(0deg,rgba(255,255,255,.07) 0 1px,transparent 1px 2px)}
+
+/* =====================================================================
+   风格 A · 雪花爆闪（最纯粹的「信号没了」）
+   画面先被雪白噪点吞掉 → 噪点减弱 → 内容重新显形
+   ===================================================================== */
+.a .snow{z-index:9}
+.a.on .snow{animation:snowFlash .62s steps(9) 1}
+@keyframes snowFlash{
+  0%  {opacity:0}
+  6%  {opacity:1}
+  22% {opacity:.92}
+  38% {opacity:.62}
+  56% {opacity:.34}
+  74% {opacity:.16}
+  100%{opacity:0}
+}
+.a.on .row{animation:aRecover .62s steps(8) 1}
+@keyframes aRecover{
+  0%{filter:invert(1) contrast(2.4) brightness(1.9);opacity:.25}
+  30%{filter:invert(1) contrast(1.6) brightness(1.2);opacity:.6}
+  62%{filter:grayscale(.4) brightness(.95);opacity:.9}
+  100%{filter:none;opacity:1}
+}
+.a .list::before{ /* 扫描线 */
+  content:'';position:absolute;inset:0;pointer-events:none;z-index:10;
+  background:repeating-linear-gradient(180deg,rgba(0,0,0,.30) 0 1px,transparent 1px 3px);
+}
+
+/* =====================================================================
+   风格 B · 垂直滚动失锁（信号不同步）
+   整列向上猛冲几帧 → 上下抖动 → 一点点回落到位（不是平滑过渡，是"找信号"）
+   ===================================================================== */
+.b .list::after{
+  content:'';position:absolute;inset:0;pointer-events:none;z-index:10;opacity:0;
+  background:linear-gradient(180deg,transparent 0%,rgba(255,255,255,.09) 45%,rgba(255,255,255,.16) 50%,rgba(255,255,255,.09) 55%,transparent 100%);
+}
+.b.on .list::after{animation:bRollBar .68s steps(10) 1}
+@keyframes bRollBar{0%{opacity:0;transform:translateY(-100%)}20%{opacity:.9}100%{opacity:0;transform:translateY(100%)}}
+.b.on .list{animation:bVloss .68s cubic-bezier(.2,.9,.3,1)}
+@keyframes bVloss{
+  0%  {transform:translateY(0)}
+  8%  {transform:translateY(-26px)}
+  18% {transform:translateY(18px)}
+  28% {transform:translateY(-11px)}
+  40% {transform:translateY(7px)}
+  52% {transform:translateY(-4px)}
+  66% {transform:translateY(2px)}
+  80% {transform:translateY(-1px)}
+  100%{transform:translateY(0)}
+}
+.b.on .row{animation:bRowJit .68s steps(8) 1}
+@keyframes bRowJit{
+  0%,100%{transform:translate(0,0)}
+  20%{transform:translate(-2px,1px)}
+  40%{transform:translate(3px,-1px)}
+  60%{transform:translate(-2px,1px)}
+  80%{transform:translate(1px,0)}
+}
+.b.on .grain{animation:bGrain .68s steps(6) 1}
+@keyframes bGrain{0%{opacity:.7}40%{opacity:.28}100%{opacity:0}}
+
+/* =====================================================================
+   风格 C · 横向撕裂 + 色散（信号被撕开再错位）
+   几道水平条上下错位跳动 + RGB 三色分离 + 雪花微闪
+   ===================================================================== */
+.c .tear{z-index:9}
+.c.on .tear{animation:cTear .58s steps(6) 1}
+@keyframes cTear{0%{opacity:0}10%{opacity:1}35%{opacity:.85}60%{opacity:.4}100%{opacity:0}}
+.c.on .tear i:nth-child(1){animation:t1 .58s steps(5) 1}
+.c.on .tear i:nth-child(2){animation:t2 .58s steps(5) 1}
+.c.on .tear i:nth-child(3){animation:t3 .58s steps(5) 1}
+.c.on .tear i:nth-child(4){animation:t4 .58s steps(5) 1}
+@keyframes t1{0%{top:6%;transform:translateX(-14px)}40%{transform:translateX(11px)}100%{top:6%;transform:none}}
+@keyframes t2{0%{top:28%;transform:translateX(12px)}40%{transform:translateX(-9px)}100%{top:28%;transform:none}}
+@keyframes t3{0%{top:52%;transform:translateX(-16px)}40%{transform:translateX(13px)}100%{top:52%;transform:none}}
+@keyframes t4{0%{top:74%;transform:translateX(9px)}40%{transform:translateX(-12px)}100%{top:74%;transform:none}}
+.c.on .row{animation:cChroma .58s steps(5) 1}
+@keyframes cChroma{
+  0%  {filter:drop-shadow(4px 0 rgba(247,80,73,.95)) drop-shadow(-4px 0 rgba(94,246,255,.95)) saturate(.35) contrast(1.8)}
+  35% {filter:drop-shadow(-2px 0 rgba(247,80,73,.6)) drop-shadow(2px 0 rgba(94,246,255,.6)) saturate(.8)}
+  70% {filter:drop-shadow(1px 0 rgba(247,80,73,.25)) drop-shadow(-1px 0 rgba(94,246,255,.25))}
+  100%{filter:none}
+}
+.c.on .snow{animation:cSnow .58s steps(6) 1}
+@keyframes cSnow{0%{opacity:.85}50%{opacity:.2}100%{opacity:0}}
+.c .list::before{
+  content:'';position:absolute;inset:0;pointer-events:none;z-index:10;
+  background:repeating-linear-gradient(180deg,rgba(0,0,0,.28) 0 1px,transparent 1px 3px);
+}
+
+/* =====================================================================
+   风格 D · 失锁雪花（重灾）：先全屏雪化，再分几帧"抓回"信号
+   ===================================================================== */
+.d .snow{z-index:9}
+.d.on .snow{animation:dFull .78s steps(11) 1}
+@keyframes dFull{
+  0%{opacity:0}
+  5%{opacity:1}
+  15%{opacity:1}
+  25%{opacity:.85}
+  40%{opacity:.5}
+  55%{opacity:.28}
+  75%{opacity:.1}
+  100%{opacity:0}
+}
+.d.on .row{animation:dLock .78s steps(11) 1}
+@keyframes dLock{
+  0%{filter:invert(1) brightness(2.2);opacity:0;transform:scaleY(.2)}
+  10%{opacity:.4;transform:scaleY(1.12)}
+  22%{opacity:.75;transform:translateX(6px) scaleY(.94)}
+  36%{transform:translateX(-5px) scaleY(1.03)}
+  52%{transform:translateX(3px)}
+  70%{transform:translateX(-1px)}
+  86%{transform:none;filter:none;opacity:1}
+  100%{transform:none;filter:none;opacity:1}
+}
+.d.on .grain{animation:dGrain .78s steps(8) 1}
+@keyframes dGrain{0%{opacity:.85}50%{opacity:.3}100%{opacity:0}}
+.d .list::before{
+  content:'';position:absolute;inset:0;pointer-events:none;z-index:10;
+  background:repeating-linear-gradient(180deg,rgba(0,0,0,.34) 0 1px,transparent 1px 4px);
+}
+
+.row.dragging{opacity:.25}
+</style>
+</head>
+<body>
+
+<h1>段序切换 · 信号接收不良 Demo</h1>
+<div class="sub">
+  与第1版的区别：那一版是<b>设备主动换台</b>（正常扫描）；这一版是<b>信号接收不良</b> —— 画面不是在切换，而是在<b>丢失 → 雪花爆闪 → 撕裂错位 → 一点点重新锁定</b>。<br />
+  每张卡片都能试：点「交换 1↔2」或「末位移到首位」，也可直接上下拖 ⣿ 把手。行与行之间不是平滑过渡，是<b>阶跃抖动</b>（<code>steps()</code>）—— 这是「找信号」的关键手感。
+</div>
+
+<div class="wrap" id="wrap"></div>
+
+<script>
+'use strict';
+const SEGS = [
+  { id:'a', start:525,  end:762,  label:'' },
+  { id:'b', start:850,  end:1043, label:'' },
+  { id:'c', start:1110, end:1230, label:'片头' },
+  { id:'d', start:1400, end:1560, label:'' },
+];
+const fmt = (s) => String(Math.floor(s/60)).padStart(2,'0') + ':' + String(Math.floor(s%60)).padStart(2,'0');
+
+const STYLES = [
+  { id:'a', name:'风格 A · 雪花爆闪', tag:'最纯粹的信号丢失', alt:false,
+    desc:'整列被雪白噪点吞掉 → 噪点减弱 → 内容重新显形',
+    meta:'<b>信号彻底丢失又回来</b>：画面先被<b>雪白噪点</b>吞掉（伴随反色高亮），噪点逐档减弱，最后内容重新显形。最像「天线松了」。' },
+  { id:'b', name:'风格 B · 垂直滚动失锁', tag:'信号不同步', alt:true,
+    desc:'整列猛冲几帧 → 反向折返 → 阶跃式一点点回落',
+    meta:'<b>垂直同步丢失</b>：整列先向上猛冲，再反向折返，<b>逐帧阶跃地回落</b>到位 —— 不是平滑过渡，是「找不到同步信号在来回试」。' },
+  { id:'c', name:'风格 C · 横向撕裂 + 色散', tag:'被撕开', alt:true,
+    desc:'几道水平条错位跳动 + RGB 三色分离',
+    meta:'<b>画面被撕成几条错位</b>：四道水平条各自横向跳动，叠<b>RGB 色散</b>，配微雪花。数字时代信号不稳的典型画面。' },
+  { id:'d', name:'风格 D · 失锁雪花（重灾）', tag:'最剧烈', alt:true,
+    desc:'全屏雪化 → 分帧抓回信号 → 行高抖一下归位',
+    meta:'<b>从完全雪花里重新锁回信号</b>：全屏雪化近半程，随后内容<b>一帧一帧抓回来</b>（行高从 0.2 倍弹回），抖动收尾。最夸张也最脏。' },
+];
+
+/* ===================== 失效层 DOM ===================== */
+function buildFx(list) {
+  const tear = document.createElement('div');
+  tear.className = 'tear';
+  tear.innerHTML = '<i style="top:6%"></i><i style="top:28%"></i><i style="top:52%"></i><i style="top:74%"></i>';
+  const snow = document.createElement('div'); snow.className = 'snow';
+  const grain = document.createElement('div'); grain.className = 'grain';
+  list.appendChild(snow); list.appendChild(tear); list.appendChild(grain);
+}
+
+/* ===================== FLIP ===================== */
+function flip(list, mutate, dur) {
+  const before = new Map();
+  for (const el of list.querySelectorAll('.row')) before.set(el.dataset.id, el.getBoundingClientRect().top);
+  mutate();
+  render(list);
+  const moved = [];
+  for (const el of list.querySelectorAll('.row')) {
+    const dy = before.get(el.dataset.id) - el.getBoundingClientRect().top;
+    if (Math.abs(dy) > 0.5) { el.style.transition='none'; el.style.transform='translate3d(0,'+dy+'px,0)'; moved.push(el); }
+  }
+  if (!moved.length) return;
+  void list.offsetHeight;
+  for (const el of moved) { el.style.transition='transform '+dur+'ms cubic-bezier(.2,.85,.25,1)'; el.style.transform=''; }
+}
+
+/* ===================== 渲染（节点复用） ===================== */
+const STATE = new WeakMap(), CACHE = new WeakMap();
+function st(list){ return STATE.get(list); }
+function render(list) {
+  const data = st(list).data;
+  let cache = CACHE.get(list);
+  if (!cache) { cache = new Map(); CACHE.set(list, cache); }
+  for (const s of data) if (!cache.has(s.id)) cache.set(s.id, makeRow(s));
+  const keep = new Set(data.map(s=>s.id));
+  for (const [id,el] of cache) if (!keep.has(id)) { el.remove(); cache.delete(id); }
+  data.forEach((s,i) => {
+    const el = cache.get(s.id);
+    el.querySelector('.no span').textContent = String(i+1);
+    el.querySelector('.span').textContent = fmt(s.start)+' - '+fmt(s.end);
+    el.querySelector('.dur').textContent = '时长 '+fmt(s.end-s.start);
+    const inp = el.querySelector('input');
+    if (document.activeElement !== inp) inp.value = s.label || '';
+    el.classList.toggle('sel', st(list).sel === i);
+    list.appendChild(el);
+  });
+  // 行始终排在失效层之上（appendChild 会把行移到末尾 → 需重排层级）
+  const fx = ['snow','tear','grain'];
+  for (const cls of fx) { const n = list.querySelector('.'+cls); if (n) list.appendChild(n); }
+}
+
+function makeRow(s) {
+  const row = document.createElement('div');
+  row.className = 'row'; row.dataset.id = s.id;
+  row.innerHTML =
+    '<div class="hnd">⠿</div>' +
+    '<div class="no"><span></span></div>' +
+    '<div class="span"></div><div class="dur"></div>' +
+    '<div class="lbl"><input placeholder="标签（可空）" /></div>' +
+    '<div class="del"><button title="删除这一段">🗑</button></div>';
+  row.querySelector('.hnd').addEventListener('pointerdown', (e)=>startDrag(e,row,row.closest('.list')));
+  row.querySelector('.del button').addEventListener('click', ()=>{
+    const L = row.closest('.list'), i = st(L).data.findIndex(x=>x.id===row.dataset.id);
+    if (i>=0){ st(L).data.splice(i,1); st(L).sel = null; render(L); }
+  });
+  row.querySelector('input').addEventListener('input',(e)=>{
+    const s = st(row.closest('.list')).data.find(x=>x.id===row.dataset.id); if (s) s.label = e.target.value;
+  });
+  row.addEventListener('click',(e)=>{
+    if (e.target.tagName==='INPUT'||e.target.tagName==='BUTTON') return;
+    const L = row.closest('.list');
+    st(L).sel = st(L).data.findIndex(x=>x.id===row.dataset.id); render(L);
+  });
+  return row;
+}
+
+/* ===================== 播失效动画 ===================== */
+const DUR = { a:620, b:680, c:580, d:780 };
+function glitch(list, mutate) {
+  const card = list.closest('.card');
+  flip(list, mutate, DUR[st(list).style] ?? 620);
+  card.classList.remove('on'); void card.offsetWidth; card.classList.add('on');
+  clearTimeout(card._t);
+  card._t = setTimeout(()=>card.classList.remove('on'), (DUR[st(list).style] ?? 620) + 80);
+}
+
+/* ===================== 拖拽 ===================== */
+function startDrag(e,row,list){
+  e.preventDefault();
+  const S = st(list), data = S.data;
+  const from = data.findIndex(s=>s.id===row.dataset.id);
+  row.classList.add('dragging');
+  let cur = from;
+  const onMove = (ev)=>{
+    const rows=[...list.querySelectorAll('.row')];
+    let to = from;
+    for (let k=0;k<rows.length;k++){ const b=rows[k].getBoundingClientRect(); if (ev.clientY > b.top+b.height/2) to=Math.max(to,k); }
+    to = Math.min(to, data.length-1);
+    if (to!==cur){ cur=to; data.splice(to,0,data.splice(from,1)[0]); S.sel=to; render(list); }
+  };
+  const onUp = ()=>{
+    window.removeEventListener('pointermove',onMove); window.removeEventListener('pointerup',onUp);
+    list.querySelectorAll('.dragging').forEach(n=>n.classList.remove('dragging'));
+    if (cur!==from) glitch(list, ()=>{});   // 落定补一次失效抖动
+  };
+  window.addEventListener('pointermove',onMove); window.addEventListener('pointerup',onUp);
+}
+
+/* ===================== 组装 ===================== */
+const wrap = document.getElementById('wrap');
+for (const style of STYLES) {
+  const card = document.createElement('div');
+  card.className = 'card '+style.id;
+  card.innerHTML =
+    '<header><h2>'+style.name+'</h2><span class="tag'+(style.alt?' alt':'')+'">'+style.tag+'</span>' +
+    '<span class="desc">'+style.desc+'</span></header>' +
+    '<div class="stage"><div class="ctrl">' +
+      '<button data-act="swap">交换 1 ↔ 2</button>' +
+      '<button data-act="rot" class="ghost">末位移到首位</button>' +
+      '<span class="hint">也可直接上下拖 ⣿ 把手</span>' +
+    '</div><div class="list"></div></div>' +
+    '<div class="meta">'+style.meta+'</div>';
+  wrap.appendChild(card);
+
+  const list = card.querySelector('.list');
+  STATE.set(list, { data: SEGS.map(s=>({...s})), sel:0, style:style.id });
+  buildFx(list);
+  render(list);
+
+  card.querySelector('[data-act="swap"]').addEventListener('click', ()=>{
+    const S = st(list); if (S.data.length<2) return;
+    glitch(list, ()=>{ S.data.unshift(S.data.splice(1,1)[0]); S.sel=0; });
+  });
+  card.querySelector('[data-act="rot"]').addEventListener('click', ()=>{
+    const S = st(list); if (S.data.length<2) return;
+    glitch(list, ()=>{ S.data.unshift(S.data.pop()); S.sel=0; });
+  });
+}
+</script>
+</body>
+</html>

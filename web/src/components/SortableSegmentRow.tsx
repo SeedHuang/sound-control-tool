@@ -7,16 +7,28 @@
 import { DeleteOutlined, HolderOutlined } from '@ant-design/icons';
 import { useSortable } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
-import { Button, Input, Tag, Tooltip, Typography } from 'antd';
+import { Button, Input, Tooltip, Typography } from 'antd';
 import { cyberColors, cyberFontStack } from '@/setup/theme';
 import { fmtTime } from '@/time';
 import './segment-row.css';
 
 export interface SortableSegmentRowProps {
   index: number;
+  /** 同一组起止时间里本段是第几个（父组件用 useMemo 算出）。**只有 segKey 需要它**，
+   *  别拿 index 当 occurrence 用 —— 下标会随重排变化，id 变了就触发库的重测与补间动画（见 segKey 注释）。 */
+  occurrence: number;
   seg: { start_sec: number; end_sec: number; label: string | null };
   selected: boolean;
   readOnly: boolean;
+  /** 序号框是否播一次 RGB 色散。**只在本行序号刚刚变化的那一次为 true**——
+   *  若让它长时间为 true，动画会在后续任何重渲染时重播（CSS animation 在 class 还在时就一直在跑/重跑）。 */
+  glitch: boolean;
+  /** 第几次色散（全局递增，每次 flashIndex 自增）。**用作序号框的 React key**——
+   *  CSS animation 只在元素挂上 class 那一刻开播，class 名不变就不会重播。
+   *  而「把 1↔2 换回来」这种输入两次 flash 的 id 集合完全相同，class 全程没掉过 → 第二次零反馈；
+   *  靠 key 递增强制重建元素 → animation 从头播，**且不依赖任何时序**（不靠「先清空再下一帧加回」）。
+   *  代价：每次 flash 重建**所有行**的序号框（DOM 节点只有 4 个 span，可忽略），行为上看不出来。 */
+  glitchSeq: number;
   onSelect: (index: number) => void;
   onDelete: (index: number) => void;
   onLabelChange: (index: number, label: string) => void;
@@ -24,27 +36,37 @@ export interface SortableSegmentRowProps {
 
 /**
  * 段行的 dnd-kit id。**父组件的 SortableContext items 与 onDragEnd 反查必须用这个函数**，
- *不要在各处手写模板字符串 —— 三处各写一份时任何一处漂移，dnd-kit 会静默认不出行、排序落到错误的行上。
+ * 不要在各处手写模板字符串 —— 三处各写一份时任何一处漂移，dnd-kit 会静默认不出行、排序落到错误的行上。
+ *
+ * `occurrence` = **同一组起止时间里，这个段是第几个**（由父组件用 `segOccurrences` 算出，不是数组下标）。
+ *
+ * ⚠️ **为什么 id 里绝不能带数组下标**（2026-10-09 用户实测报的现象，根因已定位到库源码）：
+ *   带下标时，`arrayMove` 换位后**每一行的 id 都变了** → dnd-kit 的
+ *   `itemsHaveChanged = !itemsEqual(items, previousItemsRef.current)`
+ *   （node_modules/@dnd-kit/sortable/dist/sortable.esm.js:313）为真 → 触发
+ *   `measureDroppableContainers(items)` 重新量（:317-319）+ `useDerivedTransform`
+ *   （:546）再补一段 transition。表现：**数据已换位（看起来对），但动画又播了一遍 1↔2 对调**。
+ *   即「放下后多闪一次交换动画」。dnd-kit 内部按 `active.id` 反查位置（:310
+ *   `items.indexOf(active.id)`），id 必须跨重排稳定。
+ *
+ *⚠️ 为什么不用纯 `${start}-${end}`：会撞键。addSegment 的 start/end 全由播放头推出
+ *   （current 起、固定 10 秒长），「同一位置打点两次」会产出两段起止完全相同的段 → id 相同 →
+ *   `onDragEnd` 的 findIndex 返回**第一个**匹配 → 拖错行。
+ *   加 occurrence 后「同一渲染内唯一」恒成立，且它跟着**数据**而不是位置走，重排时不变。
  */
-export const segKey = (seg: { start_sec: number; end_sec: number }, index: number): string =>
-  `${seg.start_sec}-${seg.end_sec}-${index}`;
+export const segKey = (seg: { start_sec: number; end_sec: number }, occurrence: number): string =>
+  `${seg.start_sec}-${seg.end_sec}#${occurrence}`;
 
 export default function SortableSegmentRow({
-  index, seg, selected, readOnly,
+  index, occurrence, seg, selected, readOnly, glitch, glitchSeq,
   onSelect, onDelete, onLabelChange,
 }: SortableSegmentRowProps) {
-  // ⚠️ id 用「起止时间 + 当前下标」而非**纯**数组下标，也不用纯起止时间（判据见上方 segKey 的注释处）：
-//   ① 纯下标：删中间行后下标整体前移，而 dnd-kit 缓存的仍是旧下标 → 落位算错。
-//   ② 纯起止时间（2026-10-09 审查第 1 轮 medium 修复前的老写法）：**会撞键**。
-//      addSegment 的 start/end 全由播放头推出（current 起、固定 10 秒长），所以
-//      「同一位置打点两次」或「同一处双击两次」会产出两段起止完全相同的段 → id 相同 →
-//      dnd-kit 分不清是哪一行，onDragEnd 的 findIndex 还会返回**第一个**匹配 → 拖错行。
-//      加下标后缀后「一次渲染内唯一」恒成立，撞键不可能；而下标只在增删/排序后变
-//      （那些都发生在拖拽手势**之外**），不影响拖拽过程中 id 的稳定性。
-//   为什么不给 EditSeg 加自增 id：改数据结构会牵连保存格式（PUT segments 的字段集），
-//      代价远大于收益；id 只活在渲染期，不必持久化。
-  // React 自己的渲染 key 仍用 index（在父组件 map 上），两套 key 别混。
-  const segId = segKey(seg, index);
+  // id = 起止时间 + occurrence。**不要改成数组下标** —— 判据与踩坑见上方 segKey 的注释：
+  //   下标随重排变化会让 id 全变，dnd-kit 判定「位置又变了」→ 放下瞬间多播一遍交换动画（用户实测报过）。
+  //   也不要用纯起止时间（会撞键：同一位置打点两次会产出两段起止相同的段）。
+  // 为什么不给 EditSeg 加自增 id：改数据结构会牵连保存格式（PUT segments 的字段集），
+  //   代价远大于收益；id 只活在渲染期，不必持久化。
+  const segId = segKey(seg, occurrence);
   // ⚠️ `disabled: readOnly` 是**行为**上的禁用，与原来的「上移/下移」按钮 disabled={readOnly} 同口径：
   //   只读态下保存已灰，拖拽排序同样是改数据 → 必须一并禁掉，否则用户能改却存不进。
   // isDragging 直接取 useSortable 的返回值（2026-10-09 审查第 2 轮）：它内部就是「本行是否正被拖」的真值，
@@ -88,8 +110,23 @@ export default function SortableSegmentRow({
         <HolderOutlined />
       </span>
 
+      {/* 序号框：段序变化时**唯一**做动画的元素（2026-10-09 用户定案：整行动画太吵，只动序号框）。
+          三层叠出RGB 色散：红残影 / 蓝残影 / 本体。glitch 由父组件在「序号真的变了」那一轮传 true。
+          ⚠️ 原来是 antd<Tag color="blue">，换成手写是为了拿到这三层结构；配色保持一致（半透明青底 + 青字）。 */}
       <span className="sr-index sr-no-drag" style={{ display: 'flex' }}>
-        <Tag color="blue" style={{ marginInlineEnd: 0, borderRadius: 0, fontFamily: cyberFontStack }}>{index + 1}</Tag>
+        {/* ⚠️ 残影与噪点层必须 aria-hidden（2026-10-10 审查 low）：辅助技术**不理会 opacity:0**，
+            同一个序号在 DOM 里出现三份 → 读屏会把「第 3 段」播报成三遍。噪点层是纯装饰（无文本），
+            一并标上是为了让「这三层都不是内容」这件事在标记上自洽。 */}
+        {/* ⚠️ key={glitchSeq} 是「动画能重播」的唯一保证（2026-10-10 审查 low）：
+            class 名不变时 React 不写 DOM，CSS animation 不会重新开播 —— 表现是「第二次换位没动画」。
+            序号框内部只有 4 个 span，重建成本可忽略；不能改成改 class 名（is-glitch→is-glitch-2 之类），
+            那会让 CSS 选择器与 class 名互相绑死，且「改名能否触发重播」取决于浏览器是否重启同名动画 —— 不确定，别走这条路。 */}
+        <span key={glitchSeq} className={`sr-no${glitch ? ' is-glitch' : ''}`}>
+          <span className="sr-no-noise" aria-hidden="true" />
+          <span className="sr-no-ghost sr-no-ghost-r" aria-hidden="true">{index + 1}</span>
+          <span className="sr-no-ghost sr-no-ghost-b" aria-hidden="true">{index + 1}</span>
+          <span className="sr-no-num">{index + 1}</span>
+        </span>
       </span>
 
       <Typography.Text className="sr-span" style={{ fontFamily: cyberFontStack, color: cyberColors.cyan }}>

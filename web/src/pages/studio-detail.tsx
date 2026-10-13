@@ -60,6 +60,27 @@ interface EditSeg { start_sec: number; end_sec: number; label: string | null }
 //   两份在同一屏显示（轨道刻度 vs 段列表），漂移就会让「列表时间与轨道刻度对不上」。
 const clamp = (v: number, lo: number, hi: number): number => Math.min(Math.max(v, lo), hi);
 
+/**
+ * 每段是「同一组起止时间里」的第几个（0 起，按数组顺序）。
+ *
+ * ⚠️ **单一来源**（2026-10-10 审查 medium）：这份推导原先在 `segOccurrence` 与 `idsOf` 里各写一遍。
+ *   两份漂移的后果不是「多一行重复代码」，而是**色散动画闪错行** —— `flashIndex` 用 idsOf 的结果
+ *   去匹配下一轮渲染里 `segKeyAt` 算出的 id，两边不一致就找不到对应行（表现为「序号变了但框不闪」）。
+ *   这种 bug 极难定位：数据全对、动画逻辑全对，只是对不上号。故只留这一份。
+ *
+ * @param arr 任意顺序的段数组（**结果跟着入参顺序走**，调用方各自负责传入它要的那份快照）
+ * @returns 与 arr 等长的 occurrence 数组
+ */
+const buildOccurrences = (arr: readonly EditSeg[]): number[] => {
+  const seen = new Map<string, number>();
+  return arr.map((s) => {
+    const k = `${s.start_sec}-${s.end_sec}`;
+    const n = seen.get(k) ?? 0;
+    seen.set(k, n + 1);
+    return n;
+  });
+};
+
 export default function StudioDetailPage() {
   // 路由参数是**作品 id**（spec D16）；资料 id 由作品带出来（work.import_id），两者不可混用
   const { projectId: projectIdRaw } = useParams<{ projectId: string }>();
@@ -841,18 +862,102 @@ export default function StudioDetailPage() {
     useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
   );
 
-  // 拖拽排序落定（spec D7）：dnd-kit 给的是「从哪条拖到哪条」（id 由 segKey 生成，不是纯下标），
+  //   每段 occurrence（同一组起止时间里它是第几个），下标→occurrence 的映射。
+  //   ⚠️ 用 useMemo 钉住：它的身份参与 dnd-kit 的 items，深比较引用一变就会触发
+  //   sortable.esm.js:317 的 measureDroppableContainers 重测（用户实测看到的「多闪一次交换动画」同一条链路）。
+  //   为什么 occurrence 不能用数组下标：arrayMove 换位后每行下标都变 → id 全变 → 库认为位置又变了。
+  //   occurrence 只依赖数据本身（0-10 那段前面有几种 0-10 的段），重排不影响它。
+  const segOccurrence = useMemo(() => buildOccurrences(segments), [segments]);
+
+  // 取第 i 段的 dnd-kit id。**三处（items / React key / onDragEnd 反查）都必须走它**。
+  //   为什么多这一层：segOccurrence[i] 在 noUncheckedIndexedAccess 下是 number | undefined
+  //   （tsconfig.json:8），越界时 `segKey(s, undefined!)` 会静默算出 `NaN#undefined` 这种垃圾 id，
+  //   而 dnd-kit 对**格式非法但彼此不同**的 id 一样不报错 → 很难排查。这里显式兜成 0（越界本不该发生，
+  //   真发生了也会因「id 与某一行的真实 id 相同/不同」表现为落位算错，不至于静默错乱）。
+  const segKeyAt = (i: number): string => segKey(segments[i] ?? { start_sec: 0, end_sec: 0 }, segOccurrence[i] ?? 0);
+
+  // 哪些行要播序号色散（2026-10-09 用户定案：只动序号框）。
+  //   判据 = **换位前后该行的序号是否真的变了**：相邻交换只有 2 行的序号变，跨位移动则全部变。
+  //   ⚠️ 为什么用「传换位后的下标」而不是「读闭包里的 segments」：
+  //   动画必须发生在 setSegs 落地**之后**，而那一刻这个函数闭包里的 segments 还是换位前的旧值
+  //   （setTimeout(0) 也不保证 —— React 18 的自动批处理可能把更新推到更晚的微任务里）。
+  //   与其赌调度时机，不如把「换位后的新数组」直接算出来传进来：纯函数、时序无关、结果唯一。
+  //
+  //   ⚠️ 为什么 state 里除了 ids 还要带 seq（2026-10-10 审查 low，这是「第二次换位没动画」的根因）：
+  //   CSS animation 只在**元素挂上该class 那一刻**开播；class 名不变 → React 不写 DOM → 不会重播。
+  //   而旧的「只存 ids」写法恰好会撞上：把 1↔2 换回来时，两次 flash 的 id 集合完全相同，
+  //   中间那个 400ms 清空定时器要到第二次 flash 才被清掉 → class 全程没掉过 → 第二次零反馈。
+  //   seq 每次 flash 递增并写进序号框的 React key → 元素重建 → animation 从头播，且**不依赖任何时序**。
+  const [glitch, setGlitch] = useState<{ seq: number; ids: ReadonlySet<string> }>({ seq: 0, ids: new Set() });
+  const glitchTimer = useRef<number | null>(null);
+  // ⚠️ 这个 0ms 回调也必须被追踪（2026-10-10 审查 low）：否则「放下 → 立刻切走页面」时它在卸载后才跑，
+  //   setGlitchIds 变成无用功，还会再挂一个 400ms 定时器，而那时卸载清理早已执行过，谁也清不掉它。
+  const flashKick = useRef<number | null>(null);
+  /**
+   * 播一次色散。
+   * @param nextIds 换位**后**按顺序的 id 数组（用它翻译序号→id，不读闭包状态，时序无关）
+   * @param changedNos 变化了的「序号」集合（1-based）
+   */
+  const flashIndex = (nextIds: readonly string[], changedNos: ReadonlySet<number>): void => {
+    if (changedNos.size === 0) return;
+    const ids = nextIds.filter((_id, i) => changedNos.has(i + 1));
+    if (ids.length === 0) return;
+    setGlitch((prev) => ({ seq: prev.seq + 1, ids: new Set(ids) }));
+    if (glitchTimer.current !== null) window.clearTimeout(glitchTimer.current);
+    glitchTimer.current = window.setTimeout(() => {
+      setGlitch((prev) => ({ seq: prev.seq, ids: new Set() }));
+      glitchTimer.current = null;
+    }, 400); // 与CSS 里 .34s + 余量对齐；提前清会截断动画
+  };
+
+  /**
+   * 算出「换位后哪些行的序号变了」：纯函数，**不读闭包状态**。
+   * @param prevIds 换位前按顺序的 id 数组
+   * @param nextIds 换位后按顺序的 id 数组
+   * @returns 变化了的「序号」集合（1-based）
+   */
+  const diffIndexBySwap = (prevIds: readonly string[], nextIds: readonly string[]): Set<number> => {
+    const beforeNo = new Map(prevIds.map((id, i) => [id, i + 1]));
+    const out = new Set<number>();
+    nextIds.forEach((id, i) => {
+      if (beforeNo.get(id) !== i + 1) out.add(i + 1);
+    });
+    return out;
+  };
+  /**
+   * 某组段（**按传入顺序**）的 id 列表。occurrence 就地现算，不依赖闭包里的 segOccurrence ——
+   *   闭包那份是**换位前**的，而重排会让同起止段的 occurrence 位置改变（两组相同段互换即会变），
+   *   拿旧值算出的 id 有可能与下一轮渲染真正用的 id 不一致 → glitch 匹配错行。
+   */
+  const idsOf = (arr: readonly EditSeg[]): string[] => {
+    const occ = buildOccurrences(arr);
+    return arr.map((s, i) => segKey(s, occ[i] ?? 0)); // ⚠️ 必须复用 segKey，别手写模板字符串（漂移 = dnd-kit 认错行）
+  };
+  // 卸载时清掉两个定时器，避免对已卸载组件 setState / 泄漏定时器
+  useEffect(() => () => {
+    if (glitchTimer.current !== null) window.clearTimeout(glitchTimer.current);
+    if (flashKick.current !== null) window.clearTimeout(flashKick.current);
+  }, []);
+
+  // 拖拽排序落定（spec D7）：dnd-kit 给的是「从哪条拖到哪条」（id 由 segKey 生成），
   //   所以先按同一个 key 反查下标、再用 arrayMove 搬运。
   //   必须走 setSegs —— 它内部 setDirty(true)，是「有未保存改动」的唯一来源（同 addSegment/removeSegment）。
-  // ⚠️ 反查必须用 segKey()（与 items / useSortable 同一份定义），别手写模板字符串：
+  // ⚠️ 反查必须用 segKeyAt()（与 items / useSortable 同一份定义），别手写模板字符串：
   //   两份写法漂移时 dnd-kit 静默认不出行，排序会落到错误的行上（2026-10-09 审查第 2 轮）。
   // ⚠️ 读的是闭包里的 segments：拖拽是单指手势，期间不会触发加段/删段，故不必用 ref 兜住。
   const onDragEnd = ({ active, over }: DragEndEvent): void => {
     if (over === null) return;
-    const from = segments.findIndex((s, i) => segKey(s, i) === active.id);
-    const to = segments.findIndex((s, i) => segKey(s, i) === over.id);
+    const from = segments.findIndex((_s, i) => segKeyAt(i) === active.id);
+    const to = segments.findIndex((_s, i) => segKeyAt(i) === over.id);
     if (from < 0 || to < 0 || from === to) return;
-    setSegs((prev) => arrayMove(prev, from, to));
+    // 序号色散（2026-10-09 用户定案）：**先算出换位后的数组**再落库。
+    //   为什么不在 setSegs 之后比：那一刻闭包里的 segments 还是换位前的旧值（setTimeout 也不保证），
+    //   而 diffIndexBySwap / flashIndex 都以「显式传入的换位后数组」为输入 → 时序无关、结果唯一。
+    const prevIds = idsOf(segments);
+    const nextArr = arrayMove(segments, from, to);
+    const nextIds = idsOf(nextArr);
+    const changed = diffIndexBySwap(prevIds, nextIds);
+    setSegs(() => nextArr);
     // spec D9「选中改为拖拽结束后才结算」：selected 存的是**下标**，arrayMove 之后同一个下标指向的是**另一段**，
     //   不结算就会「高亮乱跳」（spec D9 明令要避免的那种）。故选回**刚拖的那一行**（换位后的 to）。
     // ⚠️ 不必额外吞掉拖拽结束那一下 click：dnd-kit 在激活约束满足后会在**document capture 阶段**
@@ -860,6 +965,14 @@ export default function StudioDetailPage() {
     //   `documentListeners.add(EventName.Click, stopPropagation, { capture: true })`），
     //   capture 先于 target → 行onClick 不会触发，故不会把刚结算的选中覆盖掉。
     setSelected(to);
+    // ⚠️ 必须等下一轮渲染：色散要按**新顺序**里的 id 去匹配，所以得让 React 先提交 setSegs 那一轮。
+    //   handle 存进 ref 是为了卸载时能清掉它（2026-10-10 审查 low）：否则「放下→立刻切走页面」时
+    //   它在卸载后才跑，会再挂一个 400ms 定时器，而那时卸载清理早已执行过，那个定时器永远没人清。
+    if (flashKick.current !== null) window.clearTimeout(flashKick.current);
+    flashKick.current = window.setTimeout(() => {
+      flashIndex(nextIds, changed);
+      flashKick.current = null;
+    }, 0);
     logFe('info', `拖拽排序 project=${projectId} 第 ${from + 1} 段 → 第 ${to + 1} 段`);
   };
 
@@ -1538,19 +1651,24 @@ export default function StudioDetailPage() {
               collisionDetection={closestCenter}
               onDragEnd={onDragEnd}
             >
-              {/* ⚠️ items 与 onDragEnd 反查都必须用segKey()（从 SortableSegmentRow 导出），不要在这里手写模板字符串：
-                    两份写法一旦漂移，dnd-kit 会静默认不出行、排序落到错误的行上（2026-10-09 审查第 2 轮）。
-                    为什么 key 里带下标：纯起止时间会撞键（同一播放头打点两次 → 两段起止相同 → 拖错行，第 1 轮）。
-                    React 自己的 key 仍用 index（两回事）。 */}
-              <SortableContext items={segments.map((s, i) => segKey(s, i))} strategy={verticalListSortingStrategy}>
+              {/* ⚠️ items、每行的 React key、onDragEnd 反查，三者都用同一个 segKeyAt()（底层是 SortableSegmentRow 导出的 segKey），
+                    不要在任何一处手写模板字符串：两份写法一旦漂移，dnd-kit 会静默认不出行、排序落到错误的行上。
+                    为什么 id 里带 occurrence 而不是数组下标：纯起止时间会撞键（同一播放头打点两次 → 两段起止相同），
+                    而带数组下标会让**重排后每行 id 全变** → 库认为位置又变了（sortable.esm.js:313 itemsHaveChanged）
+                    → 放下瞬间多播一遍 1↔2 对调动画（用户 2026-10-09 实测报的现象，根因见 segKey 注释）。
+                    ⚠️ React 的 key 也必须是它：key={i} 在重排后会复用错的 DOM 节点，行内容与数据错位。 */}
+              <SortableContext items={segments.map((_s, i) => segKeyAt(i))} strategy={verticalListSortingStrategy}>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
                   {segments.map((s, i) => (
                     <SortableSegmentRow
-                      key={i}
+                      key={segKeyAt(i)}
                       index={i}
+                      occurrence={segOccurrence[i] ?? 0}
                       seg={s}
                       selected={selected === i}
                       readOnly={readOnly}
+                      glitchSeq={glitch.seq}
+                      glitch={glitch.ids.has(segKeyAt(i))}
                       onSelect={setSelected}
                       onDelete={removeSegment}
                       onLabelChange={setLabel}

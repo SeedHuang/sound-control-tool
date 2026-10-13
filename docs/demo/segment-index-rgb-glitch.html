@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>段序号框 · RGB 色散 Demo</title>
+<style>
+/* =====================================================================
+   段列表 —— 只有「序号框」做动画，行本身完全静止。
+   质感：RGB 色散（数字短暂拆成红蓝两层错开再合回）。
+   判据：只给「序号变了」的那些行加动画（相邻交换 2 个框；跨位移动 4 个框全动）。
+   色板/切角/字体栈取自 web/src/setup/theme.tsx + global.css。
+   ===================================================================== */
+:root {
+  --bg-layout:#0E0E17; --bg-elevated:#1A1A26;
+  --red:#F75049; --cyan:#5EF6FF; --green:#1DED83; --yellow:#F0B537;
+  --tp:#F0F0F0; --ts:rgba(255,255,255,.6); --tm:rgba(255,255,255,.4);
+  --bc:rgba(94,246,255,.3); --br:rgba(247,80,73,.5); --bw:rgba(255,255,255,.08);
+  --clip:polygon(12px 0,100% 0,100% calc(100% - 12px),calc(100% - 12px) 100%,0 100%,0 12px);
+}
+*{box-sizing:border-box}
+body{margin:0;padding:26px 22px 56px;background:var(--bg-layout);color:var(--tp);
+  font-family:'Rajdhani',-apple-system,'Segoe UI','Microsoft YaHei','PingFang SC',sans-serif;min-height:100vh}
+h1{font-size:20px;letter-spacing:.04em;margin:0 0 6px;font-weight:600}
+.sub{color:var(--tm);font-size:12px;line-height:1.9;margin-bottom:20px;max-width:920px}
+.sub b{color:var(--cyan);font-weight:500}
+
+.panel{border:1px solid var(--bw);background:rgba(22,22,22,.55);clip-path:var(--clip);max-width:760px}
+.panel > .bar{padding:11px 14px;border-bottom:1px solid var(--bw);display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
+.panel > .bar h2{margin:0;font-size:14px;font-weight:600;letter-spacing:.06em}
+.panel > .bar .tag{font-size:10px;color:#06121a;background:var(--cyan);padding:1px 7px}
+.panel > .bar .cnt{font-size:11px;color:var(--tm);margin-left:auto}
+.stage{padding:16px}
+.ctrl{display:flex;gap:8px;align-items:center;margin-bottom:14px;flex-wrap:wrap}
+button{font-family:inherit;font-size:12px;letter-spacing:.04em;background:var(--bg-elevated);color:var(--tp);
+  border:1px solid var(--bc);padding:5px 12px;cursor:pointer;clip-path:var(--clip);transition:background .15s,color .15s}
+button:hover{background:var(--cyan);color:#06121a}
+button.ghost{border-color:var(--bw);color:var(--ts)}
+.hint{font-size:11px;color:var(--tm)}
+
+.list{position:relative;display:flex;flex-direction:column;gap:6px}
+.row{display:flex;align-items:center;gap:8px;padding:6px 8px;min-height:42px;
+  background:transparent;border:1px solid var(--bw);font-size:13px}
+.row.sel{background:rgba(247,80,73,.15);border-color:var(--br)}
+.row .hnd{flex:0 0 24px;display:flex;align-items:center;justify-content:center;cursor:grab;
+  color:rgba(255,255,255,.4);user-select:none;touch-action:none;font-size:15px}
+.row .no{flex:0 0 48px;display:flex}
+
+/* ===== 序号框：动画主体 ===== */
+.no-box{
+  position:relative;display:inline-flex;align-items:center;justify-content:center;
+  min-width:24px;height:20px;padding:0 7px;background:var(--cyan);color:#06121a;
+  font-size:11px;font-weight:600;line-height:1;
+}
+/* 数字本体：色散时拆成红蓝两层 */
+.no-box .num{position:relative;z-index:2}
+.no-box .ghostnum{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;opacity:0}
+
+/* 色散动画：只作用在 .no-box 上，行不受影响 */
+.no-box.glitch .num{animation:numShift .34s steps(5) 1}
+.no-box.glitch .ghostnum.r{color:#F75049;animation:ghostR .34s steps(5) 1}
+.no-box.glitch .ghostnum.b{color:#5EF6FF;animation:ghostB .34s steps(5) 1}
+.no-box.glitch{animation:boxFlicker .34s steps(5) 1}
+
+@keyframes numShift{
+  0%  {transform:translate(0,0);filter:none}
+  25% {transform:translate(-1px,0);filter:brightness(1.4)}
+  55% {transform:translate(1px,0)}
+  100%{transform:translate(0,0);filter:none}
+}
+@keyframes ghostR{
+  0%  {opacity:0;transform:translate(0,0)}
+  20% {opacity:.95;transform:translate(-3px,0)}
+  60% {opacity:.5;transform:translate(2px,0)}
+  100%{opacity:0;transform:translate(0,0)}
+}
+@keyframes ghostB{
+  0%  {opacity:0;transform:translate(0,0)}
+  20% {opacity:.95;transform:translate(3px,0)}
+  60% {opacity:.5;transform:translate(-2px,0)}
+  100%{opacity:0;transform:translate(0,0)}
+}
+@keyframes boxFlicker{
+  0%  {background:var(--cyan);box-shadow:none}
+  30% {background:#9BF9FF;box-shadow:0 0 6px rgba(94,246,255,.7)}
+  70% {background:var(--cyan)}
+  100%{background:var(--cyan);box-shadow:none}
+}
+
+.row .span{flex:0 0 150px;font-family:'Rajdhani',Consolas,monospace;color:var(--cyan)}
+.row .dur{flex:0 0 90px;font-size:12px;color:var(--cyan);opacity:.75}
+.row .lbl{flex:1 1 auto;min-width:0}
+.row .lbl input{width:100%;background:transparent;border:1px solid var(--bw);color:var(--tp);
+  font-family:inherit;font-size:13px;padding:3px 7px;outline:none}
+.row .del{flex:0 0 36px;display:flex;justify-content:center}
+.row .del button{border:none;background:transparent;padding:0;font-size:14px;color:var(--red);clip-path:none}
+.row .del button:hover{background:transparent;color:#fff}
+
+.meta{padding:10px 14px 13px;font-size:11px;color:var(--tm);line-height:1.85;border-top:1px solid var(--bw)}
+.meta b{color:var(--cyan);font-weight:500}
+code{color:var(--yellow);font-family:Consolas,monospace}
+.row.dragging{opacity:.35}
+</style>
+</head>
+<body>
+
+<h1>段序号框 · RGB 色散 Demo</h1>
+<div class="sub">
+  <b>只有序号框（那个写着 1 / 2 的小块）做动画</b> —— 行本身完全静止：不滚动、不抖动、不被雪花吞。<br />
+  质感是<b>信号接收不良</b>下的 <b>RGB 色散</b>：数字短暂拆成红蓝两层错开，再合回来。<br />
+  动画判据：<b>只给「序号变了」的那些行加</b> —— 相邻交换是 2 个框，跨位移动（如末位→首位）是 4 个框全动。
+</div>
+
+<div class="panel">
+  <div class="bar">
+    <h2>剪辑点</h2>
+    <span class="tag">RGB 色散</span>
+    <span class="cnt" id="cnt">最近一次换位：—</span>
+  </div>
+  <div class="stage">
+    <div class="ctrl">
+      <button data-act="swap">交换 1 ↔ 2</button>
+      <button data-act="rot" class="ghost">末位移到首位</button>
+      <button data-act="swap23" class="ghost">交换 2 ↔ 3</button>
+      <span class="hint">也可直接上下拖 ⣿ 把手</span>
+    </div>
+    <div class="list" id="list"></div>
+  </div>
+  <div class="meta">
+    <b>怎么判谁要动</b>：换位前后逐行比对「序号」，只有序号变的那些行加动画 —— 不动的行连框都不会闪一下。<br />
+    拖拽时序：先落位（数字已经变了），再对变化了的框播一次色散。
+  </div>
+</div>
+
+<script>
+'use strict';
+const SEGS = [
+  { id:'a', start:525,  end:762,  label:'' },
+  { id:'b', start:850,  end:1043, label:'' },
+  { id:'c', start:1110, end:1230, label:'片头' },
+  { id:'d', start:1400, end:1560, label:'' },
+];
+const fmt = (s)=>String(Math.floor(s/60)).padStart(2,'0')+':'+String(Math.floor(s%60)).padStart(2,'0');
+
+const list = document.getElementById('list');
+const cnt  = document.getElementById('cnt');
+const data = SEGS.map(s=>({...s}));
+let sel = 0;
+const CACHE = new Map();
+
+function makeRow(s) {
+  const row = document.createElement('div');
+  row.className = 'row'; row.dataset.id = s.id;
+  row.innerHTML =
+    '<div class="hnd">⠿</div>' +
+    '<div class="no"><span class="no-box">' +
+        '<span class="ghostnum r"></span><span class="ghostnum b"></span><span class="num"></span>' +
+      '</span></div>' +
+    '<div class="span"></div><div class="dur"></div>' +
+    '<div class="lbl"><input placeholder="标签（可空）" /></div>' +
+    '<div class="del"><button title="删除这一段">🗑</button></div>';
+
+  row.querySelector('.hnd').addEventListener('pointerdown', (e)=>startDrag(e,row));
+  row.querySelector('.del button').addEventListener('click', ()=>{
+    const i = data.findIndex(x=>x.id===row.dataset.id);
+    if (i>=0){ data.splice(i,1); sel=null; render(); }
+  });
+  row.querySelector('input').addEventListener('input',(e)=>{
+    const s = data.find(x=>x.id===row.dataset.id); if (s) s.label = e.target.value;
+  });
+  row.addEventListener('click',(e)=>{
+    if (e.target.tagName==='INPUT'||e.target.tagName==='BUTTON') return;
+    sel = data.findIndex(x=>x.id===row.dataset.id); render();
+  });
+  return row;
+}
+
+/** 重渲染（节点复用）。返回每行的 [id, 序号] 快照，供动画判定用 */
+function render() {
+  for (const s of data) if (!CACHE.has(s.id)) CACHE.set(s.id, makeRow(s));
+  const keep = new Set(data.map(s=>s.id));
+  for (const [id,el] of CACHE) if (!keep.has(id)) { el.remove(); CACHE.delete(id); }
+  const snap = [];
+  data.forEach((s,i)=>{
+    const el = CACHE.get(s.id);
+    el.querySelector('.num').textContent = String(i+1);
+    const inp = el.querySelector('input');
+    if (document.activeElement !== inp) inp.value = s.label || '';
+    el.classList.toggle('sel', sel === i);
+    list.appendChild(el);
+    snap.push([s.id, i+1]);
+  });
+  return snap;
+}
+
+/**
+ * 换位 + 只给「序号变了」的行播色散。
+ * @param before 换位前的 [id, 序号] 快照
+ */
+function swapAnimate(mutate, label) {
+  const before = render();              // 先拿到当前快照
+  mutate();                             // 改数据 + 换序
+  const after = render();               // 重渲染，数字已就位
+
+  const beforeMap = new Map(before);
+  let hit = 0;
+  for (const [id, num] of after) {
+    if (beforeMap.get(id) === num) continue;   // 序号没变 -> 不动
+    hit++;
+    const box = CACHE.get(id).querySelector('.no-box');
+    box.querySelector('.ghostnum.r').textContent = num;
+    box.querySelector('.ghostnum.b').textContent = num;
+    box.classList.remove('glitch');
+    void box.offsetWidth;                      // reflow 让动画可重入
+    box.classList.add('glitch');
+  }
+  cnt.textContent = '最近一次换位：' + label + '（' + hit + ' 个框动了）';
+  setTimeout(()=>{ for (const [,el] of CACHE) el.querySelector('.no-box').classList.remove('glitch'); }, 400);
+}
+
+function startDrag(e,row) {
+  e.preventDefault();
+  const from = data.findIndex(s=>s.id===row.dataset.id);
+  const before = render();
+  row.classList.add('dragging');
+  let cur = from;
+  const onMove = (ev)=>{
+    const rows=[...list.children];
+    let to = from;
+    for (let k=0;k<rows.length;k++){ const b=rows[k].getBoundingClientRect(); if (ev.clientY>b.top+b.height/2) to=Math.max(to,k); }
+    to = Math.min(to, data.length-1);
+    if (to!==cur){ cur=to; data.splice(to,0,data.splice(from,1)[0]); sel=to; render(); }
+  };
+  const onUp = ()=>{
+    window.removeEventListener('pointermove',onMove); window.removeEventListener('pointerup',onUp);
+    list.querySelectorAll('.dragging').forEach(n=>n.classList.remove('dragging'));
+    if (cur!==from) {
+      // 拖拽过程已实时换序；此处对「序号变了」的框补一次色散
+      const beforeMap = new Map(before);
+      let hit = 0;
+      for (const s of data) {
+        const i = data.indexOf(s);
+        if (beforeMap.get(s.id) === i+1) continue;
+        hit++;
+        const box = CACHE.get(s.id).querySelector('.no-box');
+        box.querySelector('.ghostnum.r').textContent = i+1;
+        box.querySelector('.ghostnum.b').textContent = i+1;
+        box.classList.remove('glitch'); void box.offsetWidth; box.classList.add('glitch');
+      }
+      cnt.textContent = '最近一次换位：拖拽（第 '+(cur+1)+' 位）（'+hit+' 个框动了）';
+      setTimeout(()=>{ for (const [,el] of CACHE) el.querySelector('.no-box').classList.remove('glitch'); }, 400);
+    }
+  };
+  window.addEventListener('pointermove',onMove); window.addEventListener('pointerup',onUp);
+}
+
+render();
+document.querySelector('[data-act="swap"]').addEventListener('click', ()=>{
+  if (data.length<2) return;
+  swapAnimate(()=>{ data.unshift(data.splice(1,1)[0]); sel=0; }, '交换 1↔2');
+});
+document.querySelector('[data-act="swap23"]').addEventListener('click', ()=>{
+  if (data.length<3) return;
+  swapAnimate(()=>{ const p=data.splice(1,1)[0]; data.splice(1,0,data.splice(2,1)[0]); data.splice(2,0,p); sel=1; }, '交换 2↔3');
+});
+document.querySelector('[data-act="rot"]').addEventListener('click', ()=>{
+  if (data.length<2) return;
+  swapAnimate(()=>{ data.unshift(data.pop()); sel=0; }, '末位→首位');
+});
+</script>
+</body>
+</html>
