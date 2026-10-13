@@ -345,6 +345,11 @@ export default function StudioDetailPage() {
         // ⚠️ 半成品必须一并清掉（2026-10-13）：它不在 segments 里，不随 setSegments 走。
         //   不清 → 上一个作品的半成品起点会漏到这一个作品的轨道上（换作品后凭空多一条虚线块）。
         setPendingStart(null);
+        // 2026-10-13 review bug·low：换作品还要清**段播放态** + 暂停 <video>。
+        //   两个作品同资料时 previewSrc（importId + file_size + nonce）不变 → <video key> 不变、不重挂，
+        //   上一件的声音会继续放；playingSegIndexRef 仍指旧下标 → 新作品第 pi 段被区间判定误停/误循环。
+        setPlayingSeg(null);
+        videoRef.current?.pause();
         setDirty(false);
         // 换作品要重置素材侧的态：上一件的只读原因不能粘到新的一件上
         setSourceMissing(false);
@@ -629,7 +634,14 @@ export default function StudioDetailPage() {
   const playSegment = async (i: number): Promise<void> => {
     const v = videoRef.current;
     const seg = segmentsRef.current[i]; // 读 ref：见 segmentsRef 的注释
-    if (v === null || seg === undefined || readOnly) return;
+    // 2026-10-13 review bug·low：视频没就绪（元数据未到 / 本次加载失败，videoErrCode !== null 时轨道不渲染）
+    // → v === null，若静默 return，按钮可点却无反应（用户会以为坏了）。必须给可见反馈。
+    if (v === null) {
+      message.warning('视频还没就绪，无法播放这一段');
+      logFe('info', `段播放被拦下 project=${projectId} 第 ${i + 1} 段：视频不可用`);
+      return;
+    }
+    if (seg === undefined || readOnly) return;
     v.pause(); // 先停，避免两路声音重叠
     // ⚠️ 必须走 seekProgrammatically：直接写 currentTime 会触发 seeking →
     //   监听器把 playingSegIndex 设成 null → 区间判定立刻失效（循环不生效的根因之一）。
@@ -701,6 +713,10 @@ export default function StudioDetailPage() {
   // 行内的 SegTimeBox 只负责收集用户输入。三条改时间的路径（轨道拖边 / 框里敲 / 上下按钮）
   // 最终都经过 clampSegTime —— 这是「两边产出同一批数值」的保证。
   const setSegTime = (i: number, edge: 'start' | 'end', nextSec: number): void => {
+    // 2026-10-13 review bug·medium：duration 未就绪（元数据没到 / 加载失败后 duration 一直为 0，
+    // 段列表仍刻意可编辑）时不能夹——clampSegTime 里 maxSec=0 → end 恒被夹成 0，
+    // 若该段 start_sec > 0 就产出 start > end 的非法段，保存时被 parseSegments 拒。直接忽略改动。
+    if (duration <= 0) return;
     setSegs((prev) => prev.map((s, k) => {
       if (k !== i) return s;
       return edge === 'start'
@@ -1225,6 +1241,10 @@ const rowIds = useMemo(() => {
  *   只有 ref 为 false 时进来的 seeking 才是用户手动操作。
  */
 const programmaticSeekRef = useRef(false);
+// 2026-10-13 review bug·medium：seekProgrammatically 的兜底 timer handle——
+// 必须在 onSeeked 触发时取消，否则 timer 无条件清标记，seeked 监听就白加了
+// （主线程占满时 seeking 晚于 120ms 到达 → 标记已被清 → 自己的 seek 被当用户拖动）。
+const seekTimerRef = useRef<number | null>(null);
 
 /**
  * playingSegIndex 的**同步镜像**（2026-10-13 修循环不生效的第二个根因）。
@@ -1298,12 +1318,23 @@ useEffect(() => {
     // 不能只靠 seekProgrammatically 里的 120ms 固定超时——seeking 事件异步派发，
     // 主线程被重渲染/解码占满时可能晚于 120ms 到达，标记已被清 → 自己的 seek 被当
     // 用户手动拖动 → setPlayingSeg(null) → 恰好复现「循环不生效」。
-    const onSeeked = (): void => { programmaticSeekRef.current = false; };
+    // 2026-10-13 review bug·medium：seeked 到达时还要取消兜底 timer，别让它再清一次。
+    const onSeeked = (): void => {
+      programmaticSeekRef.current = false;
+      if (seekTimerRef.current !== null) {
+        clearTimeout(seekTimerRef.current);
+        seekTimerRef.current = null;
+      }
+    };
     v.addEventListener('seeking', onSeeking);
     v.addEventListener('seeked', onSeeked);
     return () => {
       v.removeEventListener('seeking', onSeeking);
       v.removeEventListener('seeked', onSeeked);
+      if (seekTimerRef.current !== null) {
+        clearTimeout(seekTimerRef.current);
+        seekTimerRef.current = null;
+      }
     };
   }, [previewSrc]);
 
@@ -1317,7 +1348,10 @@ useEffect(() => {
     // 标记在 seeked（seek 完成）时清（见上方监听）。这里只留兜底：
     // 极端情况下 seeked 不来（如目标时间与当前相同），延迟清掉标记，否则标记一直挂着，
     // 之后用户真的手动拖进度条也不响应了。
-    window.setTimeout(() => { programmaticSeekRef.current = false; }, 120);
+    // 2026-10-13 review bug·medium：先清旧 timer（连点/背靠背 seek 会残留多个 timer 互相清标记），
+    //   再存 handle 供 onSeeked 取消——timer 不再无条件清标记。
+    if (seekTimerRef.current !== null) clearTimeout(seekTimerRef.current);
+    seekTimerRef.current = window.setTimeout(() => { programmaticSeekRef.current = false; }, 120);
   };
 
   // 成品列表每条的播放地址（Important 2 修复轮 1）：**同样必须 useMemo 钉住**，理由与 previewSrc 完全相同 ——
@@ -1727,12 +1761,13 @@ useEffect(() => {
                 if (seg === undefined) return;
                 if (t < seg.end_sec) return;
                 // ⚠️ 这里**只夹不跳**：把越界的那点溢出吃掉。非循环路径到此为止。
-                //   循环路径在下面拨回起点 —— 若在这里也拨，两次 seek 会在同一 tick 里互相打架。
-                if (t > seg.end_sec) seekProgrammatically(v, seg.end_sec);
+                // 2026-10-13 review bug·low：夹回只放非循环分支——循环分支下面直接 seek start_sec，
+                //   若在这里也 seek end_sec，同一 handler 两次 seek 互相覆盖还多发一次 seeking/timer。
                 // ⚠️ 读 **loopEnabledRef** 而不是 state（见 loopEnabledRef 的注释）：
                 //   state 有「刚点开关但还没重渲染」的窗口，在窗口内这里读到旧值 false →
                 //   走「不循环」分支 → 播放头越过结束点继续走（用户 2026-10-13 实测报的现象）。
                 if (!loopEnabledRef.current) {
+                  if (t > seg.end_sec) seekProgrammatically(v, seg.end_sec);
                   v.pause();
                   setPlayingSeg(null); // 播完 → 解除行高亮
                   return;

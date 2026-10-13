@@ -52,8 +52,12 @@ function SegTimeBox({
   //   用 setTimeout(0) 而不是直接 focus()：直接调会早于 React 把新值渲染进 DOM，
   //   光标可能落在旧文本的末尾（表现为「焦点到了但位置不对」）。
   const step = (deltaSec: number): void => {
+    // 2026-10-13 review bug·medium：步进前先取正在敲的草稿——否则 ▴▾/方向键会把
+    //   未回车的内容直接丢掉（setDraft(null) 清空、从已提交的 value 步进），
+    //   用户刚敲的字凭空消失，数值从旧的已提交值跳（Firefox/Safari 点按钮不 blur 输入框也能踩到）。
+    const typed = draft === null ? null : parseTimeMs(draft);
     setDraft(null);
-    onCommit(value + deltaSec);
+    onCommit((typed ?? value) + deltaSec);
     focusingByStep.current = true;
     window.setTimeout(() => {
       inputRef.current?.focus();
@@ -182,6 +186,12 @@ export default function SortableSegmentRow({
   //   不必由父组件传 prop，也不必另加 activeId state —— segment-row.css 的 .is-dragging 规则由此变活。
   const { attributes, listeners, setNodeRef, setActivatorNodeRef, transform, transition, isDragging } = useSortable({ id: segId, disabled: readOnly });
 
+  // 2026-10-13 review style·low：播放按钮 Tooltip 文案提为变量，避免嵌套三元（项目规则禁）。
+  // readOnly 时 readOnlyMsg 由父页保证非空（readOnly = readOnlyMsg !== null），与删除按钮同款口径。
+  let playTitle: string | null;
+  if (readOnly) playTitle = readOnlyMsg;
+  else playTitle = playing ? '停止播放这一段' : '播放这一段';
+
   return (
     <div
       ref={setNodeRef}
@@ -280,7 +290,7 @@ export default function SortableSegmentRow({
           → <video> 没有源可播。判据是「有没有源可播」，不是「改不改数据」。与 playSegment 里的守卫同口径。
           ⚠️ readOnly 由父页 readOnly = readOnlyMsg !== null 推出 → readOnly 为真时 readOnlyMsg 必非空，
           `?? '资料不可用'` 是运行期死代码（2026-10-13 review maintainability·medium，与删除按钮同款口径）。 */}
-      <Tooltip title={readOnly ? readOnlyMsg : (playing ? '停止播放这一段' : '播放这一段')}>
+      <Tooltip title={playTitle}>
         {/* 包 span：antd Tooltip 对 disabled 按钮收不到鼠标事件（与下方删除按钮同款） */}
         <span className="sr-play sr-no-drag" style={{ display: 'flex' }}>
           <Button
