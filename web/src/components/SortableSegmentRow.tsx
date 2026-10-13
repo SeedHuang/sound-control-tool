@@ -31,8 +31,8 @@ function SegTimeBox({
   edge: 'start' | 'end';
   index: number;
   disabled: boolean;
-  /** 禁用原因（本仓约定 D13：禁用要给出可见原因）。有值且 disabled 时用 Tooltip 展示。 */
-  disabledReason?: string;
+  /** 禁用原因（本仓约定 D13：禁用要给出可见原因）。有值时用 Tooltip 展示。 */
+  disabledReason?: string | null;
   onSelect: () => void;
   onCommit: (sec: number) => void;
 }) {
@@ -204,9 +204,11 @@ export default function SortableSegmentRow({
   // 时间框禁用原因（D13）：**readOnly 优先于 timeDisabled**——readOnly（资料已删 / 无素材）时 duration 也常为 0，
   // 若只报 timeDisabled 的原因，会与页面 readOnlyMsg 黄条、播放/删除按钮（都报 readOnlyMsg）自相矛盾
   // （2026-10-13 第 5 轮 review bug·low）。单一本地变量，供两个 SegTimeBox 共用，避免同一判定两处漂移。
-  let timeBoxDisabledReason: string | undefined;
-  if (readOnly) timeBoxDisabledReason = readOnlyMsg ?? undefined;
-  else if (timeDisabled) timeBoxDisabledReason = timeDisabledMsg ?? undefined;
+  // ⚠️ readOnly ⇒ readOnlyMsg !== null（父页不变量），故这里直赋、不写 `?? undefined` 兜底（第 6 轮 review：
+  //   那个兜底不可达，还会让读者误以为 `readOnly && readOnlyMsg===null` 可能存在）。
+  let timeBoxDisabledReason: string | null = null;
+  if (readOnly) timeBoxDisabledReason = readOnlyMsg;
+  else if (timeDisabled) timeBoxDisabledReason = timeDisabledMsg;
 
   return (
     <div

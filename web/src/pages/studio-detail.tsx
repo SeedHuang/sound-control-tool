@@ -1070,9 +1070,10 @@ const rowIds = storedRowIds.length === segments.length
   ? storedRowIds
   : segments.map((_s, i) => storedRowIds[i] ?? `row-idx-${i}`);
 
-// 时间编辑器禁用原因单一来源（D13）：duration<=0 → 给原因；timeDisabled 由它推出，避免同一判定写两处漂移
-// （2026-10-13 第 5 轮 review maintainability·low，本仓「同一判定散在多处必然漂移」）。
-const timeEditDisabledMsg = duration <= 0 ? '视频还没加载出时长，暂时不能改时间' : null;
+// 时间编辑器禁用原因单一来源（D13）：**判定当唯一真值源，文案由它推出**
+//（不拿文案反推 timeDisabled——否则改文案会意外改变行为；2026-10-13 第 5/6 轮 review）。
+const timeEditDisabled = duration <= 0;
+const timeEditDisabledMsg = timeEditDisabled ? '视频还没加载出时长，暂时不能改时间' : null;
 
   // 取第 i 段的 dnd-kit id。**三处（items / React key / onDragEnd 反查）都必须走它**。
   //   为什么多这一层：segOccurrence[i] 在 noUncheckedIndexedAccess 下是 number | undefined
@@ -2087,7 +2088,7 @@ useEffect(() => {
                       seg={s}
                       selected={selected === i}
                       readOnly={readOnly}
-                      timeDisabled={timeEditDisabledMsg !== null}
+                      timeDisabled={timeEditDisabled}
                       timeDisabledMsg={timeEditDisabledMsg}
                       glitchSeq={glitch.seq}
                       glitch={glitch.ids.has(segKeyAt(i))}
