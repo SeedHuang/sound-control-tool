@@ -1,0 +1,9 @@
+{
+  "rules": [
+    {
+      "path": "**/*.{js,mjs,cjs,ts,tsx,jsx}",
+      "rule": "前后端同仓，不忽略前端检查；后端代码的 React 噪音走 A2 处置侧过滤。",
+      "merge_system_rule": true
+    }
+  ]
+}
